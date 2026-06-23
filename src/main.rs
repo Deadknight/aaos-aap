@@ -33,6 +33,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-probe" => native_probe(),
         "native-encoder-test" => native_encoder_test(args.collect()),
         "native-surface-encoder-test" => native_surface_encoder_test(args.collect()),
+        "native-display-probe" => native_display_probe(),
+        "native-display-active-probe" => native_display_active_probe(),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -64,6 +66,12 @@ Commands:
 
   native-surface-encoder-test [--size 320x240] [--bit-rate 1000000] [--fps 15] [--seconds 3] [--out PATH]
       Runs embedded C++ AMediaCodec input-surface encoder and draws EGL/GLES frames into the encoder surface.
+
+  native-display-probe
+      Probes Android private libgui/SurfaceComposerClient symbols needed for mirroring the AAOS display into the encoder surface.
+
+  native-display-active-probe
+      Actively calls a minimal subset of private SurfaceComposerClient APIs: getInternalDisplayToken, createDisplay, destroyDisplay.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -240,6 +248,20 @@ fn parse_u32(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
 
 fn native_probe() -> Result<(), Box<dyn std::error::Error>> {
     let report = native::probe().map_err(|err| format!("native probe failed: {err}"))?;
+    print!("{report}");
+    Ok(())
+}
+
+
+fn native_display_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let report = native::display_probe().map_err(|err| format!("native display probe failed: {err}"))?;
+    print!("{report}");
+    Ok(())
+}
+
+fn native_display_active_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let report = native::display_active_probe()
+        .map_err(|err| format!("native display active probe failed: {err}"))?;
     print!("{report}");
     Ok(())
 }

@@ -39,3 +39,12 @@ arda-senderd
 ## V7 step
 
 Add `native-surface-encoder-test`: AMediaCodec input-surface + EGL/GLES draw path. This verifies that a Surface-backed encoder can produce Annex-B H264 without `screenrecord`. It still draws synthetic frames; SurfaceFlinger/display capture is the next missing piece.
+
+
+## V8 native display probe
+
+Adds `native-display-probe`, a safe symbol/ABI check for Android 11 `libgui` display mirroring pieces: `SurfaceComposerClient::createDisplay`, `Transaction::setDisplaySurface`, `setDisplayProjection`, `setDisplayLayerStack`, `apply`, `getInternalDisplayToken`, and fallback `ScreenshotClient::capture` symbols. It does not yet call private constructors or route the screen into the encoder surface.
+
+## V9 checkpoint
+
+Native display active probe added. This validates whether the private `sp<IBinder>` and `String8` ABI calls are safe before attempting `Transaction::setDisplaySurface`.

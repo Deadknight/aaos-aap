@@ -200,3 +200,19 @@ adb shell /data/local/tmp/arda-senderd nal-info /sdcard/arda-native-surface-enco
 ```
 
 Expected key lines: `create input surface: OK`, `eglCreateWindowSurface: OK`, `eglSwapBuffers` without errors, `encoded_bytes > 0`, and NAL output containing SPS/PPS/IDR.
+
+
+## V8 native display probe
+
+Adds `native-display-probe`, a safe symbol/ABI check for Android 11 `libgui` display mirroring pieces: `SurfaceComposerClient::createDisplay`, `Transaction::setDisplaySurface`, `setDisplayProjection`, `setDisplayLayerStack`, `apply`, `getInternalDisplayToken`, and fallback `ScreenshotClient::capture` symbols. It does not yet call private constructors or route the screen into the encoder surface.
+
+## V9 native-display-active-probe
+
+`native-display-active-probe` calls the smallest private SurfaceComposerClient path before trying full display capture:
+
+- constructs `android::String8`
+- calls `SurfaceComposerClient::getInternalDisplayToken()`
+- calls `SurfaceComposerClient::createDisplay()`
+- calls `SurfaceComposerClient::destroyDisplay()`
+
+This is an active ABI test. It does not route the display into the encoder surface yet.

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -674,6 +675,243 @@ int native_surface_encoder_test_android(
 
 #endif // __ANDROID__
 
+#if defined(__ANDROID__)
+
+// Tiny ABI-compatible stand-in for android::sp<T>. On Android 11/aarch64,
+// sp<T> stores a single strong-reference pointer. We intentionally make this
+// type non-trivial so C++ uses the same indirect-return ABI as android::sp<T>
+// for functions such as SurfaceComposerClient::createDisplay(). We release the
+// reference manually via RefBase::decStrong after each private call.
+struct RawSp {
+    void* ptr;
+    RawSp() : ptr(nullptr) {}
+    RawSp(const RawSp& other) : ptr(other.ptr) {}
+    ~RawSp() {}
+};
+
+using String8CtorFn = void (*)(void* self, const char* value);
+using String8DtorFn = void (*)(void* self);
+using RefBaseDecStrongFn = void (*)(const void* self, const void* id);
+using SccGetInternalDisplayTokenFn = RawSp (*)();
+using SccCreateDisplayFn = RawSp (*)(const void* name, bool secure);
+using SccDestroyDisplayFn = void (*)(const RawSp& display);
+
+void release_raw_sp(Buffer* report, const char* label, RawSp* sp, RefBaseDecStrongFn dec_strong) {
+    (void)dec_strong;
+    if (!sp || !sp->ptr) {
+        append(report, "release %-28s skipped/null\n", label ? label : "(null)");
+        return;
+    }
+
+    // Do NOT call RefBase::decStrong directly here. The value in sp<T> is a T*
+    // (for example IBinder*), while RefBase may be a base subobject with a
+    // different address because of multiple inheritance. Calling decStrong on
+    // the unadjusted pointer can SIGBUS/SIGSEGV on Android's private ABI.
+    // This active probe is short-lived, so intentionally leaking these temporary
+    // strong refs is safer than crashing. Later capture code should either keep
+    // the display token for the whole process lifetime or use a real C++ build
+    // against matching platform headers.
+    append(report, "release %-28s skipped/private-sp-leak ptr=%p\n", label ? label : "(null)", sp->ptr);
+    sp->ptr = nullptr;
+}
+
+void* must_sym(Buffer* report, void* handle, const char* label, const char* symbol) {
+    if (!handle) {
+        append(report, "  %-36s FAIL no-handle\n", label);
+        return nullptr;
+    }
+    dlerror();
+    void* sym = dlsym(handle, symbol);
+    const char* err = dlerror();
+    if (sym) {
+        append(report, "  %-36s OK\n", label);
+    } else {
+        append(report, "  %-36s FAIL %s\n", label, err ? err : "not found");
+    }
+    return sym;
+}
+
+static const char* kDisplayActiveLogPath = "/data/local/tmp/arda-display-active-probe.log";
+
+void log_file_reset() {
+    FILE* f = fopen(kDisplayActiveLogPath, "wb");
+    if (f) fclose(f);
+}
+
+void log_file_append(const char* fmt, ...) {
+    FILE* f = fopen(kDisplayActiveLogPath, "ab");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+
+void append_file_to_report(Buffer* report, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        append(report, "could not read child log %s errno=%d %s\n", path, errno, strerror(errno));
+        return;
+    }
+    char buf[1024];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
+        buf[n] = '\0';
+        append(report, "%s", buf);
+    }
+    fclose(f);
+}
+
+int native_display_active_probe_android_child(Buffer* report) {
+    append(report, "arda native display active probe child\n");
+    log_file_append("arda native display active probe child\n");
+    append(report, "pid=%ld uid=%ld euid=%ld\n\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+    log_file_append("pid=%ld uid=%ld euid=%ld\n\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+
+    void* libgui = dlopen("libgui.so", RTLD_NOW | RTLD_LOCAL);
+    void* libutils = dlopen("libutils.so", RTLD_NOW | RTLD_LOCAL);
+    append(report, "dlopen:\n");
+    log_file_append("dlopen...\n");
+    append(report, "  %-36s %s\n", "libgui.so", libgui ? "OK" : "FAIL");
+    append(report, "  %-36s %s\n\n", "libutils.so", libutils ? "OK" : "FAIL");
+    if (!libgui || !libutils) {
+        if (libgui) dlclose(libgui);
+        if (libutils) dlclose(libutils);
+        return -1;
+    }
+
+    append(report, "resolve private ABI calls:\n");
+    log_file_append("resolve private ABI calls...\n");
+    auto string8_ctor = reinterpret_cast<String8CtorFn>(must_sym(report, libutils, "String8(char const*)", "_ZN7android7String8C1EPKc"));
+    auto string8_dtor = reinterpret_cast<String8DtorFn>(must_sym(report, libutils, "~String8", "_ZN7android7String8D1Ev"));
+    auto dec_strong = reinterpret_cast<RefBaseDecStrongFn>(must_sym(report, libutils, "RefBase::decStrong", "_ZNK7android7RefBase9decStrongEPKv"));
+    auto get_internal = reinterpret_cast<SccGetInternalDisplayTokenFn>(must_sym(report, libgui, "getInternalDisplayToken", "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv"));
+    auto create_display = reinterpret_cast<SccCreateDisplayFn>(must_sym(report, libgui, "createDisplay", "_ZN7android21SurfaceComposerClient13createDisplayERKNS_7String8Eb"));
+    auto destroy_display = reinterpret_cast<SccDestroyDisplayFn>(must_sym(report, libgui, "destroyDisplay", "_ZN7android21SurfaceComposerClient14destroyDisplayERKNS_2spINS_7IBinderEEE"));
+
+    if (!string8_ctor || !string8_dtor || !get_internal || !create_display || !destroy_display) {
+        append(report, "\nFAIL: missing required symbol; not calling private API.\n");
+        dlclose(libgui);
+        dlclose(libutils);
+        return -2;
+    }
+
+    append(report, "\nactive calls:\n");
+    log_file_append("active calls...\n");
+
+    RawSp internal_display;
+    RawSp virtual_display;
+
+    // String8 is one pointer on this Android branch, but keep extra room so the
+    // private constructor can safely initialize its real object layout if needed.
+    alignas(16) unsigned char name_storage[64];
+    memset(name_storage, 0, sizeof(name_storage));
+
+    bool name_constructed = false;
+    log_file_append("before String8 ctor\n");
+    string8_ctor(name_storage, "arda-native-display-probe");
+    log_file_append("after String8 ctor\n");
+    name_constructed = true;
+    append(report, "  String8 ctor                      OK\n");
+
+    log_file_append("before getInternalDisplayToken\n");
+    internal_display = get_internal();
+    log_file_append("after getInternalDisplayToken ptr=%p\n", internal_display.ptr);
+    append(report, "  getInternalDisplayToken           ptr=%p %s\n", internal_display.ptr, internal_display.ptr ? "OK" : "NULL");
+
+    log_file_append("before createDisplay secure=false\n");
+    virtual_display = create_display(name_storage, false);
+    log_file_append("after createDisplay ptr=%p\n", virtual_display.ptr);
+    append(report, "  createDisplay secure=false        ptr=%p %s\n", virtual_display.ptr, virtual_display.ptr ? "OK" : "NULL");
+
+    if (virtual_display.ptr) {
+        log_file_append("before destroyDisplay\n");
+        destroy_display(virtual_display);
+        log_file_append("after destroyDisplay\n");
+        append(report, "  destroyDisplay                    OK\n");
+    } else {
+        append(report, "  destroyDisplay                    skipped/null\n");
+    }
+
+    log_file_append("before release virtual display skip-safe\n");
+    release_raw_sp(report, "virtual display", &virtual_display, dec_strong);
+    log_file_append("after release virtual display skip-safe\n");
+    log_file_append("before release internal display skip-safe\n");
+    release_raw_sp(report, "internal display", &internal_display, dec_strong);
+    log_file_append("after release internal display skip-safe\n");
+
+    if (name_constructed) {
+        log_file_append("before String8 dtor\n");
+        string8_dtor(name_storage);
+        log_file_append("after String8 dtor\n");
+        append(report, "  String8 dtor                      OK\n");
+    }
+
+    dlclose(libgui);
+    dlclose(libutils);
+
+    append(report, "\nmeaning:\n");
+    append(report, "  If this did not crash and createDisplay returned OK, the private sp<String8>/IBinder ABI is callable.\n");
+    append(report, "  Next step can attempt Transaction::setDisplaySurface against the MediaCodec input surface. This probe intentionally skips direct decStrong on private sp<T> pointers to avoid pointer-adjustment crashes.\n");
+
+    return virtual_display.ptr == nullptr ? 0 : 0;
+}
+
+
+int native_display_active_probe_android(Buffer* report) {
+    append(report, "arda native display active probe parent\n");
+    append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+    append(report, "child_log=%s\n\n", kDisplayActiveLogPath);
+
+    log_file_reset();
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        append(report, "fork: FAIL errno=%d %s\n", errno, strerror(errno));
+        return -50;
+    }
+
+    if (pid == 0) {
+        char child_buf[32 * 1024];
+        child_buf[0] = '\0';
+        Buffer child_report{child_buf, sizeof(child_buf), 0};
+        int rc = native_display_active_probe_android_child(&child_report);
+        log_file_append("\nchild returned rc=%d\n", rc);
+        _exit(rc == 0 ? 0 : 100);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited < 0) {
+        append(report, "waitpid: FAIL errno=%d %s\n", errno, strerror(errno));
+        append(report, "\nchild log so far:\n");
+        append_file_to_report(report, kDisplayActiveLogPath);
+        return -51;
+    }
+
+    append(report, "child_status_raw=%d\n", status);
+    if (WIFEXITED(status)) {
+        append(report, "child_exited code=%d\n", WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        append(report, "child_signaled signal=%d\n", WTERMSIG(status));
+    }
+
+    append(report, "\nchild log:\n");
+    append_file_to_report(report, kDisplayActiveLogPath);
+
+    append(report, "\nmeaning:\n");
+    append(report, "  Parent wrapper prevents an empty adb output if a private ABI call crashes.\n");
+    append(report, "  The child log shows the last completed step before any crash/abort. v9c also skips direct RefBase::decStrong release calls.\n");
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -52;
+}
+
+#endif // __ANDROID__
+
 } // namespace
 
 extern "C" int arda_native_probe(char* out, size_t out_len) {
@@ -723,6 +961,73 @@ extern "C" int arda_native_probe(char* out, size_t out_len) {
     append(&b, "  libgui/libbinder/libui OK => private SurfaceFlinger-style capture may be reachable, but headers/symbols still need matching.\n");
 
     return 0;
+}
+
+
+extern "C" int arda_native_display_probe(char* out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+    Buffer b{out, out_len, 0};
+
+    append(&b, "arda native display probe\n");
+    append(&b, "pid=%ld uid=%ld euid=%ld\n\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+
+    append(&b, "dlopen display/capture libraries:\n");
+    probe_library(&b, "libgui.so");
+    probe_library(&b, "libbinder.so");
+    probe_library(&b, "libui.so");
+    probe_library(&b, "libutils.so");
+    probe_library(&b, "libnativewindow.so");
+    probe_library(&b, "libsurfaceflinger_client.so");
+
+    append(&b, "\nlibgui SurfaceComposerClient display symbols:\n");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClientC1Ev");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClientC2Ev");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClientD1Ev");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClientD2Ev");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient13createDisplayERKNS_7String8Eb");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient14destroyDisplayERKNS_2spINS_7IBinderEEE");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient20getInternalDisplayIdEv");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenEm");
+
+    append(&b, "\nlibgui Transaction display-routing symbols:\n");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction17setDisplaySurfaceERKNS_2spINS_7IBinderEEERKNS2_INS_22IGraphicBufferProducerEEE");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction20setDisplayProjectionERKNS_2spINS_7IBinderEEENS_2ui8RotationERKNS_4RectESB_");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction20setDisplayLayerStackERKNS_2spINS_7IBinderEEEj");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction14setDisplaySizeERKNS_2spINS_7IBinderEEEjj");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction5applyEb");
+
+    append(&b, "\nlibgui surface/mirror/capture symbols:\n");
+    probe_symbol(&b, "libgui.so", "_ZNK7android14SurfaceControl25getIGraphicBufferProducerEv");
+    probe_symbol(&b, "libgui.so", "_ZNK7android14SurfaceControl10getSurfaceEv");
+    probe_symbol(&b, "libgui.so", "_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEb");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE");
+    probe_symbol(&b, "libgui.so", "_ZN7android16ScreenshotClient7captureERKNS_2spINS_7IBinderEEENS_8hardware8graphics6common4V1_29DataspaceENS9_11PixelFormatERKNS_4RectEjjbNS_2ui8RotationEbPNS1_INS_13GraphicBufferEEERb");
+    probe_symbol(&b, "libgui.so", "_ZN7android16ScreenshotClient7captureERKNS_2spINS_7IBinderEEENS_8hardware8graphics6common4V1_29DataspaceENS9_11PixelFormatERKNS_4RectEjjbNS_2ui8RotationEPNS1_INS_13GraphicBufferEEE");
+    probe_symbol(&b, "libgui.so", "_ZN7android16ScreenshotClient7captureEmPNS_8hardware8graphics6common4V1_29DataspaceEPNS_2spINS_13GraphicBufferEEE");
+
+    append(&b, "\nmeaning:\n");
+    append(&b, "  createDisplay + setDisplaySurface + apply => virtual-display to encoder surface path is symbolically present.\n");
+    append(&b, "  getInternalDisplayToken + ScreenshotClient capture => fallback screenshot path is also symbolically present.\n");
+    append(&b, "  This command only checks ABI/symbol reachability; it does not yet call private constructors.\n");
+
+    return 0;
+}
+
+
+
+extern "C" int arda_native_display_active_probe(char* out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+    Buffer b{out, out_len, 0};
+#if defined(__ANDROID__)
+    return native_display_active_probe_android(&b);
+#else
+    append(&b, "native display active probe is only available on Android targets\n");
+    return -99;
+#endif
 }
 
 extern "C" int arda_native_encoder_test(

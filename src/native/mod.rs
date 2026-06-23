@@ -24,6 +24,8 @@ extern "C" {
         report: *mut c_char,
         report_len: usize,
     ) -> c_int;
+    fn arda_native_display_probe(out: *mut c_char, out_len: usize) -> c_int;
+    fn arda_native_display_active_probe(out: *mut c_char, out_len: usize) -> c_int;
 }
 
 #[cfg(target_os = "android")]
@@ -126,4 +128,40 @@ pub fn surface_encoder_test(
     _seconds: i32,
 ) -> Result<String, String> {
     Err("native surface encoder test is only linked for Android targets".to_string())
+}
+
+
+#[cfg(target_os = "android")]
+pub fn display_probe() -> Result<String, String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let rc = unsafe { arda_native_display_probe(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    let cstr = CStr::from_bytes_until_nul(&buf).map_err(|err| err.to_string())?;
+    let text = cstr.to_string_lossy().into_owned();
+    if rc != 0 {
+        return Err(format!("arda_native_display_probe failed rc={rc}\n{text}"));
+    }
+    Ok(text)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn display_probe() -> Result<String, String> {
+    Ok("native display probe is only linked for Android targets".to_string())
+}
+
+
+#[cfg(target_os = "android")]
+pub fn display_active_probe() -> Result<String, String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let rc = unsafe { arda_native_display_active_probe(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    let cstr = CStr::from_bytes_until_nul(&buf).map_err(|err| err.to_string())?;
+    let text = cstr.to_string_lossy().into_owned();
+    if rc != 0 {
+        return Err(format!("arda_native_display_active_probe failed rc={rc}\n{text}"));
+    }
+    Ok(text)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn display_active_probe() -> Result<String, String> {
+    Ok("native display active probe is only linked for Android targets".to_string())
 }

@@ -1,0 +1,24 @@
+# Intentionally built as linux/amd64 from scripts/docker-build.sh.
+# Android NDK linux.zip provides linux-x86_64 toolchains, so Apple Silicon
+# hosts must not build this image as linux/arm64.
+FROM rust:1.85-bookworm
+
+ARG NDK_VERSION=r26d
+ARG ANDROID_API=23
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}
+ENV PATH=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates xz-utils file \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -L -o /tmp/android-ndk.zip https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip \
+    && unzip -q /tmp/android-ndk.zip -d /opt \
+    && rm /tmp/android-ndk.zip
+
+RUN rustup target add aarch64-linux-android armv7-linux-androideabi
+
+WORKDIR /work
+
+CMD ["bash", "scripts/docker-build-android.sh"]

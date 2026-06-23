@@ -34,3 +34,8 @@ arda-senderd
 - `/dev/uinput` exists.
 - USB mouse appeared as kernel input events, so the input stack is alive.
 - `/config/usb_gadget` and `/sys/class/udc` are currently empty; USB gadget comes later.
+
+
+## V7 step
+
+Add `native-surface-encoder-test`: AMediaCodec input-surface + EGL/GLES draw path. This verifies that a Surface-backed encoder can produce Annex-B H264 without `screenrecord`. It still draws synthetic frames; SurfaceFlinger/display capture is the next missing piece.

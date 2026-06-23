@@ -6,8 +6,13 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
 
 #if defined(__ANDROID__)
+#include <android/native_window.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #endif
@@ -71,6 +76,7 @@ void probe_symbol(Buffer* b, const char* lib, const char* symbol) {
 // Android OMX color constants. Public NDK headers do not consistently expose these
 // names across API levels, but the integer values are stable.
 constexpr int32_t COLOR_FormatYUV420Flexible = 0x7F420888;
+constexpr int32_t COLOR_FormatSurface = 0x7F000789;
 constexpr int64_t kDequeueTimeoutUs = 100000;
 
 // Some Android NDK API levels expose the old SYNC_FRAME/key-frame flag
@@ -297,6 +303,375 @@ int native_encoder_test_android(
     return encoded_bytes > 0 ? 0 : -13;
 }
 
+
+struct NativeWindowOwner {
+    ANativeWindow* window = nullptr;
+    ~NativeWindowOwner() {
+        if (window) {
+            ANativeWindow_release(window);
+        }
+    }
+};
+
+struct EglOwner {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+
+    ~EglOwner() {
+        if (display != EGL_NO_DISPLAY) {
+            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+            if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+            eglTerminate(display);
+        }
+    }
+};
+
+typedef EGLBoolean (*EglPresentationTimeAndroidFn)(EGLDisplay display, EGLSurface surface, khronos_stime_nanoseconds_t time);
+
+// These functions exist on this AAOS runtime, but the public NDK headers mark them
+// as introduced in API 26. We build with API 23 for now, so calling them directly
+// fails at compile time. Resolve them dynamically instead.
+typedef media_status_t (*AMediaCodecCreateInputSurfaceFn)(AMediaCodec* codec, ANativeWindow** window);
+typedef media_status_t (*AMediaCodecSignalEndOfInputStreamFn)(AMediaCodec* codec);
+
+struct MediaNdkRuntimeApi {
+    void* handle = nullptr;
+    AMediaCodecCreateInputSurfaceFn create_input_surface = nullptr;
+    AMediaCodecSignalEndOfInputStreamFn signal_end_of_input_stream = nullptr;
+};
+
+MediaNdkRuntimeApi load_media_ndk_runtime_api(Buffer* report) {
+    MediaNdkRuntimeApi api;
+    dlerror();
+    api.handle = dlopen("libmediandk.so", RTLD_NOW | RTLD_LOCAL);
+    const char* open_err = dlerror();
+    if (!api.handle) {
+        append(report, "dlopen libmediandk.so for API26 symbols: FAIL %s\n", open_err ? open_err : "unknown");
+        return api;
+    }
+
+    api.create_input_surface = reinterpret_cast<AMediaCodecCreateInputSurfaceFn>(
+        dlsym(api.handle, "AMediaCodec_createInputSurface")
+    );
+    api.signal_end_of_input_stream = reinterpret_cast<AMediaCodecSignalEndOfInputStreamFn>(
+        dlsym(api.handle, "AMediaCodec_signalEndOfInputStream")
+    );
+
+    append(report, "runtime AMediaCodec_createInputSurface: %s\n", api.create_input_surface ? "OK" : "missing");
+    append(report, "runtime AMediaCodec_signalEndOfInputStream: %s\n", api.signal_end_of_input_stream ? "OK" : "missing");
+    return api;
+}
+
+int drain_codec_output_to_file(
+    AMediaCodec* codec,
+    FILE* out,
+    Buffer* report,
+    bool wait_for_buffer,
+    bool* output_eos_seen,
+    int* output_buffers,
+    int* codec_config_buffers,
+    int* key_buffers,
+    size_t* encoded_bytes
+) {
+    const int64_t timeout = wait_for_buffer ? kDequeueTimeoutUs : 0;
+    while (true) {
+        AMediaCodecBufferInfo info;
+        memset(&info, 0, sizeof(info));
+        ssize_t out_index = AMediaCodec_dequeueOutputBuffer(codec, &info, timeout);
+
+        if (out_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+            return 0;
+        }
+        if (out_index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            AMediaFormat* output_format = AMediaCodec_getOutputFormat(codec);
+            const char* fmt_str = output_format ? AMediaFormat_toString(output_format) : nullptr;
+            append(report, "output format changed: %s\n", fmt_str ? fmt_str : "(null)");
+            if (output_format) AMediaFormat_delete(output_format);
+            continue;
+        }
+        if (out_index < 0) {
+            append(report, "dequeue output: info=%zd\n", out_index);
+            continue;
+        }
+
+        size_t cap = 0;
+        uint8_t* out_buf = AMediaCodec_getOutputBuffer(codec, static_cast<size_t>(out_index), &cap);
+        if (out_buf && info.size > 0 && static_cast<size_t>(info.offset + info.size) <= cap) {
+            const uint8_t* start = out_buf + info.offset;
+            size_t written = fwrite(start, 1, static_cast<size_t>(info.size), out);
+            if (written != static_cast<size_t>(info.size)) {
+                append(report, "fwrite: short write errno=%d %s\n", errno, strerror(errno));
+                AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(out_index), false);
+                return -1;
+            }
+            *encoded_bytes += written;
+            (*output_buffers)++;
+            if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) (*codec_config_buffers)++;
+            if (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) (*key_buffers)++;
+        }
+
+        if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+            *output_eos_seen = true;
+        }
+        AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(out_index), false);
+
+        if (!wait_for_buffer) {
+            // Non-blocking drain mode: keep draining immediately available buffers, then return.
+            continue;
+        }
+        if (*output_eos_seen) return 0;
+    }
+}
+
+int setup_egl_for_window(ANativeWindow* window, int width, int height, EglOwner* egl, Buffer* report) {
+    egl->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl->display == EGL_NO_DISPLAY) {
+        append(report, "eglGetDisplay: FAIL err=0x%x\n", eglGetError());
+        return -1;
+    }
+    if (!eglInitialize(egl->display, nullptr, nullptr)) {
+        append(report, "eglInitialize: FAIL err=0x%x\n", eglGetError());
+        return -2;
+    }
+    append(report, "eglInitialize: OK\n");
+
+    const EGLint config_attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config = nullptr;
+    EGLint num_configs = 0;
+    if (!eglChooseConfig(egl->display, config_attribs, &config, 1, &num_configs) || num_configs <= 0) {
+        append(report, "eglChooseConfig: FAIL err=0x%x num=%d\n", eglGetError(), static_cast<int>(num_configs));
+        return -3;
+    }
+    append(report, "eglChooseConfig: OK\n");
+
+    const EGLint context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    egl->context = eglCreateContext(egl->display, config, EGL_NO_CONTEXT, context_attribs);
+    if (egl->context == EGL_NO_CONTEXT) {
+        append(report, "eglCreateContext: FAIL err=0x%x\n", eglGetError());
+        return -4;
+    }
+    append(report, "eglCreateContext: OK\n");
+
+    egl->surface = eglCreateWindowSurface(egl->display, config, window, nullptr);
+    if (egl->surface == EGL_NO_SURFACE) {
+        append(report, "eglCreateWindowSurface: FAIL err=0x%x\n", eglGetError());
+        return -5;
+    }
+    append(report, "eglCreateWindowSurface: OK\n");
+
+    if (!eglMakeCurrent(egl->display, egl->surface, egl->surface, egl->context)) {
+        append(report, "eglMakeCurrent: FAIL err=0x%x\n", eglGetError());
+        return -6;
+    }
+    append(report, "eglMakeCurrent: OK\n");
+
+    glViewport(0, 0, width, height);
+    GLenum glerr = glGetError();
+    if (glerr != GL_NO_ERROR) {
+        append(report, "glViewport: glError=0x%x\n", glerr);
+    }
+    return 0;
+}
+
+int native_surface_encoder_test_android(
+    const char* out_path,
+    int width,
+    int height,
+    int bit_rate,
+    int fps,
+    int seconds,
+    Buffer* report
+) {
+    append(report, "arda native surface encoder test\n");
+    append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+    append(report, "size=%dx%d bit_rate=%d fps=%d seconds=%d\n", width, height, bit_rate, fps, seconds);
+    append(report, "out=%s\n\n", out_path ? out_path : "(null)");
+
+    if (!out_path || out_path[0] == '\0') {
+        append(report, "FAIL: missing output path\n");
+        return -1;
+    }
+    if (width <= 0 || height <= 0 || bit_rate <= 0 || fps <= 0 || seconds <= 0) {
+        append(report, "FAIL: invalid numeric argument\n");
+        return -2;
+    }
+
+    FILE* out = fopen(out_path, "wb");
+    if (!out) {
+        append(report, "FAIL: fopen(%s) errno=%d %s\n", out_path, errno, strerror(errno));
+        return -3;
+    }
+
+    CodecOwner owner;
+    owner.codec = AMediaCodec_createEncoderByType("video/avc");
+    if (!owner.codec) {
+        append(report, "create encoder: FAIL\n");
+        fclose(out);
+        return -4;
+    }
+    append(report, "create encoder: OK\n");
+
+    owner.format = AMediaFormat_new();
+    if (!owner.format) {
+        append(report, "create format: FAIL\n");
+        fclose(out);
+        return -5;
+    }
+    append(report, "create format: OK\n");
+
+    AMediaFormat_setString(owner.format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_WIDTH, width);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_COLOR_FORMAT, COLOR_FormatSurface);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_BIT_RATE, bit_rate);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
+
+    media_status_t st = AMediaCodec_configure(
+        owner.codec,
+        owner.format,
+        nullptr,
+        nullptr,
+        AMEDIACODEC_CONFIGURE_FLAG_ENCODE
+    );
+    if (st != AMEDIA_OK) {
+        append(report, "configure surface encoder: FAIL status=%d\n", static_cast<int>(st));
+        fclose(out);
+        return -6;
+    }
+    append(report, "configure surface encoder: OK\n");
+
+    MediaNdkRuntimeApi media_api = load_media_ndk_runtime_api(report);
+    if (!media_api.create_input_surface || !media_api.signal_end_of_input_stream) {
+        append(report, "FAIL: required surface encoder runtime symbols are missing\n");
+        fclose(out);
+        return -7;
+    }
+
+    NativeWindowOwner window_owner;
+    st = media_api.create_input_surface(owner.codec, &window_owner.window);
+    if (st != AMEDIA_OK || !window_owner.window) {
+        append(report, "create input surface: FAIL status=%d window=%p\n", static_cast<int>(st), window_owner.window);
+        fclose(out);
+        return -8;
+    }
+    append(report, "create input surface: OK window=%p\n", window_owner.window);
+
+    EglOwner egl;
+    int egl_status = setup_egl_for_window(window_owner.window, width, height, &egl, report);
+    if (egl_status != 0) {
+        fclose(out);
+        return -20 + egl_status;
+    }
+
+    st = AMediaCodec_start(owner.codec);
+    if (st != AMEDIA_OK) {
+        append(report, "start: FAIL status=%d\n", static_cast<int>(st));
+        fclose(out);
+        return -8;
+    }
+    append(report, "start: OK\n");
+
+    void* egl_handle = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+    EglPresentationTimeAndroidFn presentation_time = nullptr;
+    if (egl_handle) {
+        presentation_time = reinterpret_cast<EglPresentationTimeAndroidFn>(dlsym(egl_handle, "eglPresentationTimeANDROID"));
+    }
+    append(report, "eglPresentationTimeANDROID: %s\n", presentation_time ? "OK" : "missing/nonfatal");
+
+    const int total_frames = fps * seconds;
+    int frames_rendered = 0;
+    bool output_eos_seen = false;
+    size_t encoded_bytes = 0;
+    int output_buffers = 0;
+    int codec_config_buffers = 0;
+    int key_buffers = 0;
+
+    for (int frame = 0; frame < total_frames; frame++) {
+        float r = static_cast<float>((frame * 37) % 255) / 255.0f;
+        float g = static_cast<float>((frame * 73) % 255) / 255.0f;
+        float bl = static_cast<float>((frame * 17) % 255) / 255.0f;
+        glClearColor(r, g, bl, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        GLenum glerr = glGetError();
+        if (glerr != GL_NO_ERROR) {
+            append(report, "glClear frame=%d glError=0x%x\n", frame, glerr);
+            fclose(out);
+            return -9;
+        }
+
+        if (presentation_time) {
+            const khronos_stime_nanoseconds_t pts_ns = static_cast<khronos_stime_nanoseconds_t>(frame) * 1000000000LL / static_cast<khronos_stime_nanoseconds_t>(fps);
+            presentation_time(egl.display, egl.surface, pts_ns);
+        }
+
+        if (!eglSwapBuffers(egl.display, egl.surface)) {
+            append(report, "eglSwapBuffers frame=%d FAIL err=0x%x\n", frame, eglGetError());
+            fclose(out);
+            return -10;
+        }
+        frames_rendered++;
+
+        int drain_status = drain_codec_output_to_file(
+            owner.codec, out, report, false, &output_eos_seen,
+            &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
+        );
+        if (drain_status != 0) {
+            fclose(out);
+            return -11;
+        }
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 1000000000L / fps;
+        nanosleep(&ts, nullptr);
+    }
+
+    st = media_api.signal_end_of_input_stream(owner.codec);
+    if (st != AMEDIA_OK) {
+        append(report, "signalEndOfInputStream: FAIL status=%d\n", static_cast<int>(st));
+        fclose(out);
+        return -12;
+    }
+    append(report, "signalEndOfInputStream: OK\n");
+
+    int wait_loops = 0;
+    while (!output_eos_seen && wait_loops < 200) {
+        int drain_status = drain_codec_output_to_file(
+            owner.codec, out, report, true, &output_eos_seen,
+            &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
+        );
+        if (drain_status != 0) {
+            fclose(out);
+            return -13;
+        }
+        wait_loops++;
+    }
+
+    fflush(out);
+    fclose(out);
+    if (egl_handle) dlclose(egl_handle);
+
+    append(report, "\nresult:\n");
+    append(report, "  frames_rendered=%d\n", frames_rendered);
+    append(report, "  output_buffers=%d\n", output_buffers);
+    append(report, "  codec_config_buffers=%d\n", codec_config_buffers);
+    append(report, "  key_buffers=%d\n", key_buffers);
+    append(report, "  encoded_bytes=%zu\n", encoded_bytes);
+    append(report, "  output_eos_seen=%s\n", output_eos_seen ? "yes" : "no");
+
+    return encoded_bytes > 0 ? 0 : -14;
+}
+
 #endif // __ANDROID__
 
 } // namespace
@@ -325,6 +700,9 @@ extern "C" int arda_native_probe(char* out, size_t out_len) {
     probe_library(&b, "libbinder.so");
     probe_library(&b, "libutils.so");
     probe_library(&b, "libandroid_runtime.so");
+    probe_library(&b, "libEGL.so");
+    probe_library(&b, "libGLESv2.so");
+    probe_library(&b, "libandroid.so");
 
     append(&b, "\npublic NDK MediaCodec symbols in libmediandk.so:\n");
     probe_symbol(&b, "libmediandk.so", "AMediaCodec_createEncoderByType");
@@ -337,6 +715,8 @@ extern "C" int arda_native_probe(char* out, size_t out_len) {
     probe_symbol(&b, "libmediandk.so", "AMediaFormat_new");
     probe_symbol(&b, "libmediandk.so", "AMediaFormat_setString");
     probe_symbol(&b, "libmediandk.so", "AMediaFormat_setInt32");
+    probe_symbol(&b, "libmediandk.so", "AMediaCodec_signalEndOfInputStream");
+    probe_symbol(&b, "libEGL.so", "eglPresentationTimeANDROID");
 
     append(&b, "\nmeaning:\n");
     append(&b, "  libmediandk OK + AMediaCodec_createInputSurface OK => encoder-surface path is available.\n");
@@ -362,6 +742,28 @@ extern "C" int arda_native_encoder_test(
     return native_encoder_test_android(out_path, width, height, bit_rate, fps, seconds, &b);
 #else
     append(&b, "native encoder test is only available on Android targets\n");
+    return -99;
+#endif
+}
+
+
+extern "C" int arda_native_surface_encoder_test(
+    const char* out_path,
+    int width,
+    int height,
+    int bit_rate,
+    int fps,
+    int seconds,
+    char* report,
+    size_t report_len
+) {
+    if (!report || report_len == 0) return -1;
+    report[0] = '\0';
+    Buffer b{report, report_len, 0};
+#if defined(__ANDROID__)
+    return native_surface_encoder_test_android(out_path, width, height, bit_rate, fps, seconds, &b);
+#else
+    append(&b, "native surface encoder test is only available on Android targets\n");
     return -99;
 #endif
 }

@@ -32,6 +32,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "nal-info" => nal_info(args.collect()),
         "native-probe" => native_probe(),
         "native-encoder-test" => native_encoder_test(args.collect()),
+        "native-surface-encoder-test" => native_surface_encoder_test(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -60,6 +61,9 @@ Commands:
 
   native-encoder-test [--size 320x240] [--bit-rate 1000000] [--fps 15] [--seconds 3] [--out PATH]
       Runs embedded C++ AMediaCodec H264 encoder with dummy black YUV frames and writes encoded H264 to PATH.
+
+  native-surface-encoder-test [--size 320x240] [--bit-rate 1000000] [--fps 15] [--seconds 3] [--out PATH]
+      Runs embedded C++ AMediaCodec input-surface encoder and draws EGL/GLES frames into the encoder surface.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -261,6 +265,24 @@ fn native_encoder_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         args.seconds,
     )
     .map_err(|err| format!("native encoder test failed: {err}"))?;
+    print!("{report}");
+    Ok(())
+}
+
+fn native_surface_encoder_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = parse_native_encoder_args(argv)?;
+    if args.out == "/sdcard/arda-native-encoder-test.h264" {
+        args.out = String::from("/sdcard/arda-native-surface-encoder-test.h264");
+    }
+    let report = native::surface_encoder_test(
+        &args.out,
+        args.width,
+        args.height,
+        args.bit_rate,
+        args.fps,
+        args.seconds,
+    )
+    .map_err(|err| format!("native surface encoder test failed: {err}"))?;
     print!("{report}");
     Ok(())
 }

@@ -177,3 +177,26 @@ adb pull /sdcard/arda-native-encoder-test.h264 ./arda-native-encoder-test.h264
 file arda-native-encoder-test.h264
 xxd -l 64 arda-native-encoder-test.h264
 ```
+
+## V7 native surface encoder smoke test
+
+After `native-encoder-test` passes, run the input-surface path. This does not capture the AAOS screen yet; it creates an AMediaCodec H264 encoder input surface, attaches EGL/GLES to it, draws changing color frames, and writes the encoded H264 stream.
+
+```bash
+adb push target/aarch64-linux-android/release/arda-senderd /data/local/tmp/arda-senderd
+adb shell chmod 755 /data/local/tmp/arda-senderd
+
+adb shell /data/local/tmp/arda-senderd native-surface-encoder-test \
+  --size 320x240 \
+  --bit-rate 1000000 \
+  --fps 15 \
+  --seconds 3 \
+  --out /sdcard/arda-native-surface-encoder-test.h264
+
+adb pull /sdcard/arda-native-surface-encoder-test.h264 ./arda-native-surface-encoder-test.h264
+file arda-native-surface-encoder-test.h264
+xxd -l 64 arda-native-surface-encoder-test.h264
+adb shell /data/local/tmp/arda-senderd nal-info /sdcard/arda-native-surface-encoder-test.h264
+```
+
+Expected key lines: `create input surface: OK`, `eglCreateWindowSurface: OK`, `eglSwapBuffers` without errors, `encoded_bytes > 0`, and NAL output containing SPS/PPS/IDR.

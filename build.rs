@@ -47,6 +47,9 @@ fn main() {
     // uses public NDK AMediaCodec/AMediaFormat APIs from libmediandk.
     println!("cargo:rustc-link-arg={}", obj.display());
     println!("cargo:rustc-link-lib=mediandk");
+    println!("cargo:rustc-link-lib=EGL");
+    println!("cargo:rustc-link-lib=GLESv2");
+    println!("cargo:rustc-link-lib=android");
     println!("cargo:rustc-link-lib=dl");
 }
 

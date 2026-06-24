@@ -43,6 +43,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "aap-version-session" => aap_version_session(args.collect()),
         "aap-ssl-frame-probe" => aap_ssl_frame_probe(args.collect()),
         "aap-tls-handshake-probe" => aap_tls_handshake_probe(args.collect()),
+        "aap-tls-plain-probe" => aap_tls_plain_probe(args.collect()),
+        "aap-proto-smoke" => aap_proto_smoke(),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -105,6 +107,9 @@ Commands:
 
   aap-tls-handshake-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 64]
       Runs phone-like AAP VERSION_RESPONSE, then TLS server handshake over MESSAGE_ENCAPSULATED_SSL using md_cert/md_key. Peer cert is accepted.
+
+  aap-tls-plain-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 128]
+      Runs VERSION + TLS, then keeps reading encrypted post-TLS AA frames and logs decrypted plaintext messages.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -1010,6 +1015,33 @@ struct AapTlsHandshakeProbeArgs {
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_aap_tls_handshake_probe_args(argv)?;
     aap::tls_handshake_probe(aap::TlsHandshakeProbeConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+        max_frames: args.max_frames,
+        response_major: args.response_major,
+        response_minor: args.response_minor,
+        response_status: args.response_status,
+        keys_path: args.keys,
+    })?;
+    Ok(())
+}
+
+fn aap_proto_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    aap::proto_smoke()?;
+    Ok(())
+}
+
+fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = parse_aap_tls_handshake_probe_args(argv)?;
+    if args.dump == Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log")) {
+        args.dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tls-plain.log"));
+    }
+    if args.max_frames == 64 {
+        args.max_frames = 128;
+    }
+    aap::tls_plain_probe(aap::TlsHandshakeProbeConfig {
         addr: args.addr,
         dump_path: args.dump,
         timeout_ms: args.timeout_ms,

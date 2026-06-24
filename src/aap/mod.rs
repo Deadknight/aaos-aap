@@ -11,6 +11,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+pub mod proto;
 mod tls;
 
 #[derive(Debug, Clone)]
@@ -418,18 +419,11 @@ fn control_hint(frame: &AapFrame) -> Option<String> {
         return None;
     }
     let id = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-    let name = match id {
-        0x0001 => "MESSAGE_VERSION_REQUEST",
-        0x0002 => "MESSAGE_VERSION_RESPONSE",
-        0x0003 => "MESSAGE_ENCAPSULATED_SSL",
-        0x0005 => "MESSAGE_SERVICE_DISCOVERY_REQUEST",
-        0x0006 => "MESSAGE_SERVICE_DISCOVERY_RESPONSE",
-        0x0007 => "MESSAGE_CHANNEL_OPEN_REQUEST",
-        0x0008 => "MESSAGE_CHANNEL_OPEN_RESPONSE",
-        0x001a => "MESSAGE_SERVICE_DISCOVERY_UPDATE",
-        _ => "UNKNOWN_CONTROL",
-    };
+    let body = &frame.payload[2..];
+    let name = proto::control_message_name(id);
 
+    // VERSION_REQUEST/RESPONSE and ENCAPSULATED_SSL are fixed-size/control
+    // wrappers, not protobuf message bodies.
     if id == 0x0001 && frame.payload.len() >= 6 {
         let major = u16::from_be_bytes([frame.payload[2], frame.payload[3]]);
         let minor = u16::from_be_bytes([frame.payload[4], frame.payload[5]]);
@@ -442,9 +436,13 @@ fn control_hint(frame: &AapFrame) -> Option<String> {
         return Some(format!("{name} {major}.{minor} status={status}"));
     }
     if id == 0x0003 {
-        return Some(format!("{name} tls_bytes={}", frame.payload.len().saturating_sub(2)));
+        return Some(format!("{name} tls_bytes={}", body.len()));
     }
-    Some(format!("{name} id=0x{id:04x}"))
+
+    if let Some(decoded) = proto::describe_control_body(id, body) {
+        return Some(decoded);
+    }
+    Some(format!("{name} id=0x{id:04x} proto_body_len={}", body.len()))
 }
 
 
@@ -1077,6 +1075,286 @@ pub fn tls_handshake_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     let elapsed = started.elapsed();
     println!("summary: frames={frames} rx_ssl_frames={ssl_frames} tx_ssl_frames={tx_ssl_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
     log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={ssl_frames} tx_ssl_frames={tx_ssl_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    Ok(())
+}
+
+
+
+// ---------------------------------------------------------------------------
+// AAP TLS plaintext probe
+// ---------------------------------------------------------------------------
+
+/// Runs the same VERSION + TLS handshake as `tls_handshake_probe`, but keeps
+/// the connection open afterwards and decrypts post-handshake encrypted AAP
+/// frames. This is the first probe after DHU reports SSL success: it should let
+/// us see the next plaintext control message, usually SERVICE_DISCOVERY_REQUEST.
+pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
+    println!("arda aap tls plain probe");
+    println!("addr={}", config.addr);
+    println!("timeout_ms={}", config.timeout_ms);
+    println!("max_bytes={}", config.max_bytes);
+    println!("max_frames={}", config.max_frames);
+    println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
+    println!("keys={}", config.keys_path.display());
+    if let Some(path) = &config.dump_path {
+        println!("dump={}", path.display());
+    } else {
+        println!("dump=none");
+    }
+    println!();
+
+    let listener = TcpListener::bind(&config.addr)?;
+    println!("listening on {}", listener.local_addr()?);
+    println!("waiting for one client...");
+
+    let (mut stream, peer) = listener.accept()?;
+    println!("client connected: {peer}");
+    stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+
+    let mut dump: Option<Box<dyn Write>> = match &config.dump_path {
+        Some(path) => Some(Box::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        )),
+        None => None,
+    };
+
+    log_line(&mut dump, "arda aap tls plain probe")?;
+    log_line(&mut dump, &format!("local={}", listener.local_addr()?))?;
+    log_line(&mut dump, &format!("peer={peer}"))?;
+    log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
+    log_line(&mut dump, &format!("keys={}", config.keys_path.display()))?;
+    log_line(&mut dump, "role=phone-like TCP server + TLS server using md_cert/md_key; peer cert accepted")?;
+    log_line(&mut dump, "post_handshake=decrypt encrypted AA frames and log plaintext only")?;
+    log_line(&mut dump, "")?;
+
+    let started = Instant::now();
+    let mut reader = FrameReader::new(config.max_bytes);
+
+    let version = match reader.read_frame(&mut stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before version request")),
+        Err(err) => return Err(err),
+    };
+
+    println!("rx version candidate:");
+    describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "rx version candidate:")?;
+        describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, dump)?;
+        dump.flush()?;
+    }
+
+    let Some((req_major, req_minor)) = parse_version_request(&version) else {
+        log_line(&mut dump, "not a valid MESSAGE_VERSION_REQUEST; closing")?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected MESSAGE_VERSION_REQUEST on control channel"));
+    };
+
+    println!("version request: {}.{}", req_major, req_minor);
+    log_line(&mut dump, &format!("version request: {}.{}", req_major, req_minor))?;
+
+    let response_payload = build_version_response(config.response_major, config.response_minor, config.response_status);
+    let response_frame = AapFrame {
+        channel: 0,
+        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: response_payload,
+    };
+    write_frame(&mut stream, &response_frame)?;
+    stream.flush()?;
+
+    println!("tx version response:");
+    describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "tx version response:")?;
+        describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, dump)?;
+        dump.flush()?;
+    }
+
+    let mut tls = tls::AapTlsServer::new_phone_like(&config.keys_path)?;
+    println!("tls server ready: {}", tls.state_string());
+    log_line(&mut dump, &format!("tls server ready: {}", tls.state_string()))?;
+
+    let mut frames = 1usize;
+    let mut bytes = HEADER_LENGTH + version.payload.len() + HEADER_LENGTH + response_frame.payload.len();
+    let mut rx_ssl_frames = 0usize;
+    let mut tx_ssl_frames = 0usize;
+    let mut encrypted_frames = 0usize;
+    let mut decrypted_frames = 0usize;
+    let mut decrypted_bytes = 0usize;
+    let mut handshake_done_logged = false;
+
+    while frames < config.max_frames {
+        let frame = match reader.read_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                println!("client disconnected after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("client disconnected after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                println!("read timeout after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("read timeout after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        frames += 1;
+        bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
+        println!("rx frame:");
+        describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
+        if let Some(dump) = dump.as_mut() {
+            writeln!(dump, "rx frame:")?;
+            describe_frame(frames, bytes, peer, &frame, dump)?;
+            dump.flush()?;
+        }
+
+        if tls.is_handshaking() {
+            let Some(tls_bytes) = ssl_payload_bytes(&frame) else {
+                let line = "non MESSAGE_ENCAPSULATED_SSL frame while TLS is still handshaking; ignoring";
+                println!("{line}");
+                log_line(&mut dump, line)?;
+                continue;
+            };
+
+            rx_ssl_frames += 1;
+            let hint = tls_record_hint(tls_bytes);
+            println!("rx ssl handshake frame #{rx_ssl_frames}: tls_bytes={} {hint}", tls_bytes.len());
+            log_line(&mut dump, &format!("rx ssl handshake frame #{rx_ssl_frames}: tls_bytes={} {hint}", tls_bytes.len()))?;
+
+            let step = tls.feed_tls(tls_bytes)?;
+            log_tls_step(&mut dump, &step)?;
+
+            if !step.plaintext.is_empty() {
+                decrypted_bytes += step.plaintext.len();
+                decrypted_frames += 1;
+                log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &step.plaintext)?;
+            }
+
+            if !step.outgoing_tls.is_empty() {
+                tx_ssl_frames += 1;
+                let tx_frame = build_ssl_frame(&step.outgoing_tls);
+                write_frame(&mut stream, &tx_frame)?;
+                stream.flush()?;
+                println!("tx ssl handshake frame #{tx_ssl_frames}: tls_bytes={}", step.outgoing_tls.len());
+                log_line(&mut dump, &format!("tx ssl handshake frame #{tx_ssl_frames}: tls_bytes={} {}", step.outgoing_tls.len(), tls_record_hint(&step.outgoing_tls)))?;
+            }
+
+            if !tls.is_handshaking() && !handshake_done_logged {
+                handshake_done_logged = true;
+                println!("tls handshake complete: cipher={}", tls.cipher_suite());
+                log_line(&mut dump, &format!("tls handshake complete: cipher={}", tls.cipher_suite()))?;
+                println!("waiting for encrypted post-TLS AA frames...");
+                log_line(&mut dump, "waiting for encrypted post-TLS AA frames...")?;
+            }
+            continue;
+        }
+
+        if (frame.flags & FLAG_ENCRYPTED) == 0 {
+            let line = "post-TLS frame is not marked encrypted; logging plaintext as-is";
+            println!("{line}");
+            log_line(&mut dump, line)?;
+            decrypted_frames += 1;
+            decrypted_bytes += frame.payload.len();
+            log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &frame.payload)?;
+            continue;
+        }
+
+        encrypted_frames += 1;
+        println!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload));
+        log_line(&mut dump, &format!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload)))?;
+
+        let step = tls.feed_tls(&frame.payload)?;
+        log_tls_step(&mut dump, &step)?;
+
+        if !step.plaintext.is_empty() {
+            decrypted_frames += 1;
+            decrypted_bytes += step.plaintext.len();
+            log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &step.plaintext)?;
+        } else {
+            log_line(&mut dump, "decrypted plaintext bytes=0")?;
+        }
+
+        // Any post-handshake outgoing TLS records here are protocol-level records
+        // generated by rustls, not an AA application response yet. Send them back
+        // on the same AA channel only if rustls produced something.
+        if !step.outgoing_tls.is_empty() {
+            tx_ssl_frames += 1;
+            let tx_frame = AapFrame {
+                channel: frame.channel,
+                flags: (frame.flags | FLAG_ENCRYPTED) & !FLAG_CONTROL,
+                final_length: None,
+                payload: step.outgoing_tls,
+            };
+            write_frame(&mut stream, &tx_frame)?;
+            stream.flush()?;
+            println!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={}", tx_frame.payload.len());
+            log_line(&mut dump, &format!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={} {}", tx_frame.payload.len(), tls_record_hint(&tx_frame.payload)))?;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    Ok(())
+}
+
+fn log_tls_step(dump: &mut Option<Box<dyn Write>>, step: &tls::TlsServerStep) -> io::Result<()> {
+    let line = format!(
+        "tls step: state='{}' handshaking={} cipher={} outgoing_tls={} plaintext={}",
+        step.state,
+        step.still_handshaking,
+        step.cipher_suite,
+        step.outgoing_tls.len(),
+        step.plaintext.len()
+    );
+    println!("{line}");
+    log_line(dump, &line)
+}
+
+fn log_decrypted_payload(
+    dump: &mut Option<Box<dyn Write>>,
+    peer: SocketAddr,
+    channel: u8,
+    flags: u8,
+    index: usize,
+    plaintext: &[u8],
+) -> io::Result<()> {
+    let pseudo = AapFrame {
+        channel,
+        flags: flags & !FLAG_ENCRYPTED,
+        final_length: None,
+        payload: plaintext.to_vec(),
+    };
+    let hint = control_hint(&pseudo).map(|h| format!(" {h}")).unwrap_or_default();
+    println!("decrypted AA payload #{index}: channel=0x{channel:02x} bytes={}{}", plaintext.len(), hint);
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "decrypted AA payload #{index}: channel=0x{channel:02x} bytes={}{}", plaintext.len(), hint)?;
+        describe_frame(index, 0, peer, &pseudo, dump)?;
+        dump.flush()?;
+    }
+    Ok(())
+}
+
+
+
+// ---------------------------------------------------------------------------
+// AAP proto smoke probe
+// ---------------------------------------------------------------------------
+
+pub fn proto_smoke() -> io::Result<()> {
+    println!("arda aap proto smoke");
+    println!("{}", proto::smoke_summary());
+    println!("generated module: OUT_DIR/protos/mod.rs");
+    println!("next: build ServiceDiscoveryRequest/Response and ChannelOpen messages via proto structs");
     Ok(())
 }
 

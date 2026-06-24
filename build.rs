@@ -3,6 +3,26 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    generate_protos();
+    build_native_cpp();
+}
+
+fn generate_protos() {
+    println!("cargo:rerun-if-changed=proto/protos.proto");
+    println!("cargo:rerun-if-changed=proto/ev.proto");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing")).join("protos");
+    std::fs::create_dir_all(&out_dir).expect("create OUT_DIR/protos");
+
+    protobuf_codegen::Codegen::new()
+        .pure()
+        .out_dir(&out_dir)
+        .include("proto")
+        .inputs(["proto/protos.proto", "proto/ev.proto"])
+        .run_from_script();
+}
+
+fn build_native_cpp() {
     println!("cargo:rerun-if-changed=native/arda_native_probe.cpp");
 
     let target = env::var("TARGET").unwrap_or_default();
@@ -43,8 +63,6 @@ fn main() {
         panic!("C++ native probe compile failed with {status}");
     }
 
-    // Link the C++ object directly into the Rust binary. The encoder smoke test
-    // uses public NDK AMediaCodec/AMediaFormat APIs from libmediandk.
     println!("cargo:rustc-link-arg={}", obj.display());
     println!("cargo:rustc-link-lib=mediandk");
     println!("cargo:rustc-link-lib=EGL");

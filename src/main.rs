@@ -36,6 +36,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-display-probe" => native_display_probe(),
         "native-display-active-probe" => native_display_active_probe(),
         "native-display-capture-test" => native_display_capture_test(args.collect()),
+        "native-capture" => native_capture(args.collect()),
         "input-test" => input_test(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
@@ -78,6 +79,9 @@ Commands:
   native-display-capture-test [--size 1280x720] [--bit-rate 6000000] [--fps 30] [--seconds 10] [--out PATH|-]
       Routes a private SurfaceComposerClient virtual display into the MediaCodec input surface and writes encoded H264 to PATH or stdout.
 
+  native-capture [--size 1280x720] [--bit-rate 6000000] [--fps 30] [--seconds 0] [--out -|PATH]
+      Production-style native display capture. Use --seconds 0 to run until the process is killed. Stdout mode is binary-clean raw H264.
+
   input-test [--size 1280x720] tap X Y [--duration-ms 80]
   input-test [--size 1280x720] swipe X1 Y1 X2 Y2 [--duration-ms 300] [--steps 20]
       Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
@@ -85,9 +89,9 @@ Commands:
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
 
-Live from Mac:
-  adb exec-out /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 180 --out - \
-    | mpv --demuxer=lavf --demuxer-lavf-format=h264 --profile=low-latency --untimed -
+Live native capture from Mac:
+  adb exec-out /data/local/tmp/arda-senderd native-capture --size 1280x720 --bit-rate 6000000 --fps 30 --seconds 0 --out - \
+    | mpv --demuxer=lavf --demuxer-lavf-format=h264 --no-correct-pts --container-fps-override=30 --profile=low-latency -
 "#
     );
 }
@@ -339,6 +343,24 @@ fn native_display_capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+fn native_capture(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_native_capture_args(argv)?;
+    let output_is_stdout = args.out == "-";
+    let report = native::display_capture_test(
+        &args.out,
+        args.width,
+        args.height,
+        args.bit_rate,
+        args.fps,
+        args.seconds,
+    )
+    .map_err(|err| format!("native capture failed: {err}"))?;
+    if !output_is_stdout {
+        print!("{report}");
+    }
+    Ok(())
+}
+
 fn parse_native_encoder_args(argv: Vec<String>) -> Result<NativeEncoderArgs, Box<dyn std::error::Error>> {
     let mut width = 320i32;
     let mut height = 240i32;
@@ -389,6 +411,68 @@ fn parse_native_encoder_args(argv: Vec<String>) -> Result<NativeEncoderArgs, Box
     }
     if seconds <= 0 || seconds > 1800 {
         return Err("--seconds must be 1..1800".into());
+    }
+
+    Ok(NativeEncoderArgs {
+        width,
+        height,
+        bit_rate,
+        fps,
+        seconds,
+        out,
+    })
+}
+
+fn parse_native_capture_args(argv: Vec<String>) -> Result<NativeEncoderArgs, Box<dyn std::error::Error>> {
+    let mut width = 1280i32;
+    let mut height = 720i32;
+    let mut bit_rate = 6_000_000i32;
+    let mut fps = 30i32;
+    let mut seconds = 0i32;
+    let mut out = String::from("-");
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--size" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--size requires value")?;
+                let (w, h) = parse_size_i32(value)?;
+                width = w;
+                height = h;
+            }
+            "--bit-rate" | "--bitrate" => {
+                i += 1;
+                bit_rate = argv.get(i).ok_or("--bit-rate requires value")?.parse::<i32>()?;
+            }
+            "--fps" => {
+                i += 1;
+                fps = argv.get(i).ok_or("--fps requires value")?.parse::<i32>()?;
+            }
+            "--seconds" | "--time-limit" => {
+                i += 1;
+                seconds = argv.get(i).ok_or("--seconds requires value")?.parse::<i32>()?;
+            }
+            "--out" | "-o" => {
+                i += 1;
+                out = argv.get(i).ok_or("--out requires value")?.clone();
+            }
+            other => return Err(format!("unknown native-capture arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if width <= 0 || height <= 0 {
+        return Err("--size must be positive WIDTHxHEIGHT".into());
+    }
+    if bit_rate <= 0 {
+        return Err("--bit-rate must be positive".into());
+    }
+    if fps <= 0 || fps > 60 {
+        return Err("--fps must be 1..60".into());
+    }
+    if seconds < 0 || seconds > 24 * 60 * 60 {
+        return Err("--seconds must be 0..86400; 0 means run until killed".into());
     }
 
     Ok(NativeEncoderArgs {

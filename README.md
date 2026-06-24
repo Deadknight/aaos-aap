@@ -253,3 +253,23 @@ adb shell su 0 /data/local/tmp/arda-senderd input-test --size 1280x720 swipe 200
 
 - `input-test` now accepts `--duration-ms` and `--steps` either before or after the action coordinates.
 - `swipe` default duration is now 300 ms; `tap` default remains 80 ms.
+
+## Native live capture command
+
+After v13, prefer `native-capture` for screenrecord-free live capture:
+
+```bash
+adb exec-out /data/local/tmp/arda-senderd native-capture \
+  --size 1280x720 \
+  --bit-rate 6000000 \
+  --fps 30 \
+  --seconds 0 \
+  --out - \
+  | mpv --demuxer=lavf \
+        --demuxer-lavf-format=h264 \
+        --no-correct-pts \
+        --container-fps-override=30 \
+        --profile=low-latency -
+```
+
+Use `--seconds 0` for continuous capture. Use a positive value for finite file tests.

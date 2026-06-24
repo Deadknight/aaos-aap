@@ -76,3 +76,10 @@ adb shell su 0 /data/local/tmp/arda-senderd input-test --size 1280x720 swipe 200
 
 - `input-test` now accepts `--duration-ms` and `--steps` either before or after the action coordinates.
 - `swipe` default duration is now 300 ms; `tap` default remains 80 ms.
+
+## v13 - Native capture command
+
+- Added `native-capture` as a production-style alias around the working native display capture pipeline.
+- `native-capture --out -` is binary-clean raw Annex-B H264 for `adb exec-out | mpv`.
+- `native-capture --seconds 0` means run until the process is killed; this removes the old finite-test-only behavior for live work.
+- Transaction setter logging now treats setters as returning `Transaction&`/pointer-like values instead of fake `status_t` values.

@@ -958,10 +958,10 @@ struct Rect32 {
 
 using SurfaceGetIGBPFn = RawSp (*)(const void* surface);
 using TxnClearFn = void (*)(void* txn);
-using TxnSetDisplaySurfaceFn = int32_t (*)(void* txn, const RawSp& display, const RawSp& producer);
-using TxnSetDisplayProjectionFn = int32_t (*)(void* txn, const RawSp& display, int32_t rotation, const Rect32& layer_stack_rect, const Rect32& display_rect);
-using TxnSetDisplayLayerStackFn = int32_t (*)(void* txn, const RawSp& display, uint32_t layer_stack);
-using TxnSetDisplaySizeFn = int32_t (*)(void* txn, const RawSp& display, uint32_t width, uint32_t height);
+using TxnSetDisplaySurfaceFn = void* (*)(void* txn, const RawSp& display, const RawSp& producer);
+using TxnSetDisplayProjectionFn = void* (*)(void* txn, const RawSp& display, int32_t rotation, const Rect32& layer_stack_rect, const Rect32& display_rect);
+using TxnSetDisplayLayerStackFn = void* (*)(void* txn, const RawSp& display, uint32_t layer_stack);
+using TxnSetDisplaySizeFn = void* (*)(void* txn, const RawSp& display, uint32_t width, uint32_t height);
 using TxnApplyFn = void (*)(void* txn, bool synchronous);
 using SortedVectorImplCtorFn = void (*)(void* vector_this, size_t item_size, uint32_t flags);
 
@@ -1044,8 +1044,8 @@ int native_display_capture_test_android_child(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture test child v11-native-live\n");
-    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture test child v11-native-live\n");
+    append(report, "arda native display capture child v13-native-capture\n");
+    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture child v13-native-capture\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "size=%dx%d bit_rate=%d fps=%d seconds=%d\n", width, height, bit_rate, fps, seconds);
     append(report, "out=%s\n\n", out_path ? out_path : "(null)");
@@ -1055,9 +1055,14 @@ int native_display_capture_test_android_child(
         append(report, "FAIL: missing output path\n");
         return -1;
     }
-    if (width <= 0 || height <= 0 || bit_rate <= 0 || fps <= 0 || seconds <= 0) {
+    if (width <= 0 || height <= 0 || bit_rate <= 0 || fps <= 0 || seconds < 0) {
         append(report, "FAIL: invalid numeric argument\n");
         return -2;
+    }
+    const bool run_forever = seconds == 0;
+    if (run_forever) {
+        append(report, "duration: run until killed\n");
+        log_file_append_path(kDisplayCaptureLogPath, "duration: run until killed\n");
     }
 
     bool output_is_stdout = false;
@@ -1244,24 +1249,24 @@ int native_display_capture_test_android_child(
     const uint32_t layer_stack = 0;
 
     log_file_append_path(kDisplayCaptureLogPath, "before setDisplaySurface\n");
-    int32_t set_surface_status = txn_set_surface(txn, virtual_display, producer);
-    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySurface status=%d\n", set_surface_status);
-    append(report, "setDisplaySurface: status=%d %s\n", set_surface_status, set_surface_status == 0 ? "OK" : "NONZERO");
+    void* set_surface_return = txn_set_surface(txn, virtual_display, producer);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySurface return=%p\n", set_surface_return);
+    append(report, "setDisplaySurface: called return=%p\n", set_surface_return);
 
     log_file_append_path(kDisplayCaptureLogPath, "before setDisplayProjection\n");
-    int32_t set_projection_status = txn_set_projection(txn, virtual_display, 0, source_rect, display_rect);
-    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayProjection status=%d\n", set_projection_status);
-    append(report, "setDisplayProjection: status=%d source=%dx%d dest=%dx%d\n", set_projection_status, width, height, width, height);
+    void* set_projection_return = txn_set_projection(txn, virtual_display, 0, source_rect, display_rect);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayProjection return=%p\n", set_projection_return);
+    append(report, "setDisplayProjection: called return=%p source=%dx%d dest=%dx%d\n", set_projection_return, width, height, width, height);
 
     log_file_append_path(kDisplayCaptureLogPath, "before setDisplayLayerStack\n");
-    int32_t set_layer_stack_status = txn_set_layer_stack(txn, virtual_display, layer_stack);
-    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayLayerStack status=%d\n", set_layer_stack_status);
-    append(report, "setDisplayLayerStack: status=%d layer_stack=%u\n", set_layer_stack_status, layer_stack);
+    void* set_layer_stack_return = txn_set_layer_stack(txn, virtual_display, layer_stack);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayLayerStack return=%p\n", set_layer_stack_return);
+    append(report, "setDisplayLayerStack: called return=%p layer_stack=%u\n", set_layer_stack_return, layer_stack);
 
     log_file_append_path(kDisplayCaptureLogPath, "before setDisplaySize\n");
-    int32_t set_size_status = txn_set_size(txn, virtual_display, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySize status=%d\n", set_size_status);
-    append(report, "setDisplaySize: status=%d\n", set_size_status);
+    void* set_size_return = txn_set_size(txn, virtual_display, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySize return=%p\n", set_size_return);
+    append(report, "setDisplaySize: called return=%p\n", set_size_return);
 
     log_file_append_path(kDisplayCaptureLogPath, "before Transaction::apply\n");
     txn_apply(txn, false);
@@ -1273,8 +1278,8 @@ int native_display_capture_test_android_child(
     int output_buffers = 0;
     int codec_config_buffers = 0;
     int key_buffers = 0;
-    const int drain_loops = fps * seconds * 4;
-    for (int i = 0; i < drain_loops; i++) {
+    const int drain_loops = run_forever ? -1 : fps * seconds * 4;
+    for (int i = 0; run_forever || i < drain_loops; i++) {
         int drain_status = drain_codec_output_to_file(
             owner.codec, out, report, false, &output_eos_seen,
             &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
@@ -1349,7 +1354,7 @@ int native_display_capture_test_android(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture test parent v11-native-live\n");
+    append(report, "arda native display capture parent v13-native-capture\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "child_log=%s\n\n", kDisplayCaptureLogPath);
 

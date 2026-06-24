@@ -78,6 +78,40 @@ void probe_symbol(Buffer* b, const char* lib, const char* symbol) {
 // names across API levels, but the integer values are stable.
 constexpr int32_t COLOR_FormatYUV420Flexible = 0x7F420888;
 constexpr int32_t COLOR_FormatSurface = 0x7F000789;
+
+
+bool is_stdout_output_path(const char* out_path) {
+    return out_path && strcmp(out_path, "-") == 0;
+}
+
+FILE* open_output_path_or_stdout(const char* out_path, Buffer* report, bool* output_is_stdout) {
+    if (output_is_stdout) *output_is_stdout = is_stdout_output_path(out_path);
+    if (is_stdout_output_path(out_path)) {
+        int fd = dup(STDOUT_FILENO);
+        if (fd < 0) {
+            append(report, "FAIL: dup(stdout) errno=%d %s\n", errno, strerror(errno));
+            return nullptr;
+        }
+        FILE* f = fdopen(fd, "wb");
+        if (!f) {
+            append(report, "FAIL: fdopen(stdout dup) errno=%d %s\n", errno, strerror(errno));
+            close(fd);
+            return nullptr;
+        }
+        return f;
+    }
+    FILE* f = fopen(out_path, "wb");
+    if (!f) {
+        append(report, "FAIL: fopen(%s) errno=%d %s\n", out_path, errno, strerror(errno));
+    }
+    return f;
+}
+
+void close_output_stream(FILE* out) {
+    if (!out) return;
+    fflush(out);
+    fclose(out);
+}
 constexpr int64_t kDequeueTimeoutUs = 100000;
 
 // Some Android NDK API levels expose the old SYNC_FRAME/key-frame flag
@@ -1010,8 +1044,8 @@ int native_display_capture_test_android_child(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture test child v10d-transaction-init\n");
-    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture test child v10d-transaction-init\n");
+    append(report, "arda native display capture test child v11-native-live\n");
+    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture test child v11-native-live\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "size=%dx%d bit_rate=%d fps=%d seconds=%d\n", width, height, bit_rate, fps, seconds);
     append(report, "out=%s\n\n", out_path ? out_path : "(null)");
@@ -1026,10 +1060,13 @@ int native_display_capture_test_android_child(
         return -2;
     }
 
-    FILE* out = fopen(out_path, "wb");
+    bool output_is_stdout = false;
+    FILE* out = open_output_path_or_stdout(out_path, report, &output_is_stdout);
     if (!out) {
-        append(report, "FAIL: fopen(%s) errno=%d %s\n", out_path, errno, strerror(errno));
         return -3;
+    }
+    if (output_is_stdout) {
+        append(report, "output: stdout binary-clean mode\n");
     }
 
     log_file_append_path(kDisplayCaptureLogPath, "before codec create/configure\n");
@@ -1037,7 +1074,7 @@ int native_display_capture_test_android_child(
     owner.codec = AMediaCodec_createEncoderByType("video/avc");
     if (!owner.codec) {
         append(report, "create encoder: FAIL\n");
-        fclose(out);
+        close_output_stream(out);
         return -4;
     }
     append(report, "create encoder: OK\n");
@@ -1045,7 +1082,7 @@ int native_display_capture_test_android_child(
     owner.format = AMediaFormat_new();
     if (!owner.format) {
         append(report, "create format: FAIL\n");
-        fclose(out);
+        close_output_stream(out);
         return -5;
     }
     append(report, "create format: OK\n");
@@ -1067,7 +1104,7 @@ int native_display_capture_test_android_child(
     );
     if (st != AMEDIA_OK) {
         append(report, "configure surface encoder: FAIL status=%d\n", static_cast<int>(st));
-        fclose(out);
+        close_output_stream(out);
         return -6;
     }
     append(report, "configure surface encoder: OK\n");
@@ -1075,7 +1112,7 @@ int native_display_capture_test_android_child(
     MediaNdkRuntimeApi media_api = load_media_ndk_runtime_api(report);
     if (!media_api.create_input_surface || !media_api.signal_end_of_input_stream) {
         append(report, "FAIL: required MediaCodec surface runtime symbols are missing\n");
-        fclose(out);
+        close_output_stream(out);
         return -7;
     }
 
@@ -1085,7 +1122,7 @@ int native_display_capture_test_android_child(
     log_file_append_path(kDisplayCaptureLogPath, "after create input surface status=%d window=%p\n", static_cast<int>(st), window_owner.window);
     if (st != AMEDIA_OK || !window_owner.window) {
         append(report, "create input surface: FAIL status=%d window=%p\n", static_cast<int>(st), window_owner.window);
-        fclose(out);
+        close_output_stream(out);
         return -8;
     }
     append(report, "create input surface: OK window=%p\n", window_owner.window);
@@ -1094,7 +1131,7 @@ int native_display_capture_test_android_child(
     void* libutils = dlopen("libutils.so", RTLD_NOW | RTLD_LOCAL);
     if (!libgui || !libutils) {
         append(report, "dlopen private libs: FAIL libgui=%p libutils=%p\n", libgui, libutils);
-        fclose(out);
+        close_output_stream(out);
         if (libgui) dlclose(libgui);
         if (libutils) dlclose(libutils);
         return -9;
@@ -1120,7 +1157,7 @@ int native_display_capture_test_android_child(
     if (!string8_ctor || !string8_dtor || !create_display || !destroy_display || !surface_get_igbp ||
         !txn_vtable || !display_vector_vtable || !sorted_vector_ctor || !txn_set_surface || !txn_set_projection || !txn_set_layer_stack || !txn_set_size || !txn_apply) {
         append(report, "\nFAIL: missing required private symbol; not attempting display route.\n");
-        fclose(out);
+        close_output_stream(out);
         dlclose(libgui);
         dlclose(libutils);
         return -10;
@@ -1131,7 +1168,7 @@ int native_display_capture_test_android_child(
     log_file_append_path(kDisplayCaptureLogPath, "after AMediaCodec_start status=%d\n", static_cast<int>(st));
     if (st != AMEDIA_OK) {
         append(report, "start: FAIL status=%d\n", static_cast<int>(st));
-        fclose(out);
+        close_output_stream(out);
         dlclose(libgui);
         dlclose(libutils);
         return -11;
@@ -1154,7 +1191,7 @@ int native_display_capture_test_android_child(
     log_file_append_path(kDisplayCaptureLogPath, "after createDisplay ptr=%p\n", virtual_display.ptr);
     append(report, "createDisplay: ptr=%p %s\n", virtual_display.ptr, virtual_display.ptr ? "OK" : "NULL");
     if (!virtual_display.ptr) {
-        fclose(out);
+        close_output_stream(out);
         if (name_constructed) string8_dtor(name_storage);
         dlclose(libgui);
         dlclose(libutils);
@@ -1182,7 +1219,7 @@ int native_display_capture_test_android_child(
     append(report, "Surface::getIGraphicBufferProducer: ptr=%p %s\n", producer.ptr, producer.ptr ? "OK" : "NULL");
     if (!producer.ptr) {
         destroy_display(virtual_display);
-        fclose(out);
+        close_output_stream(out);
         if (name_constructed) string8_dtor(name_storage);
         dlclose(libgui);
         dlclose(libutils);
@@ -1243,7 +1280,7 @@ int native_display_capture_test_android_child(
             &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
         );
         if (drain_status != 0) {
-            fclose(out);
+            close_output_stream(out);
             return -14;
         }
         struct timespec ts;
@@ -1269,7 +1306,7 @@ int native_display_capture_test_android_child(
                 &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
             );
             if (drain_status != 0) {
-                fclose(out);
+                close_output_stream(out);
                 return -15;
             }
             wait_loops++;
@@ -1279,7 +1316,7 @@ int native_display_capture_test_android_child(
     }
 
     fflush(out);
-    fclose(out);
+    close_output_stream(out);
 
     log_file_append_path(kDisplayCaptureLogPath, "before cleanup skip-safe refs\n");
     release_raw_sp(report, "producer", &producer, nullptr);
@@ -1312,7 +1349,7 @@ int native_display_capture_test_android(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture test parent v10d-transaction-init\n");
+    append(report, "arda native display capture test parent v11-native-live\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "child_log=%s\n\n", kDisplayCaptureLogPath);
 

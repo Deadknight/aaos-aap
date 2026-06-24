@@ -53,3 +53,11 @@ Native display active probe added. This validates whether the private `sp<IBinde
 ## v10c-surface-offset
 
 If native-display-capture-test logs do not show the v10c marker or `Surface this adjustment`, the patched native file did not make it into the built binary.
+
+
+## V11
+
+- Added binary-clean stdout support for `native-display-capture-test --out -`.
+- This allows live native display capture without `screenrecord`:
+  `SurfaceComposer virtual display -> MediaCodec input surface -> H264 stdout -> mpv`.
+- Native reports are suppressed from stdout in live mode; use `/data/local/tmp/arda-display-capture-test.log` for diagnostics.

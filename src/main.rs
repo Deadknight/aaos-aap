@@ -74,8 +74,8 @@ Commands:
   native-display-active-probe
       Actively calls a minimal subset of private SurfaceComposerClient APIs: getInternalDisplayToken, createDisplay, destroyDisplay.
 
-  native-display-capture-test [--size 320x240] [--bit-rate 1000000] [--fps 15] [--seconds 3] [--out PATH]
-      Attempts to route a private SurfaceComposerClient virtual display into the MediaCodec input surface and writes encoded H264 to PATH.
+  native-display-capture-test [--size 1280x720] [--bit-rate 6000000] [--fps 30] [--seconds 10] [--out PATH|-]
+      Routes a private SurfaceComposerClient virtual display into the MediaCodec input surface and writes encoded H264 to PATH or stdout.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -318,6 +318,7 @@ fn native_display_capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::err
     if args.out == "/sdcard/arda-native-encoder-test.h264" {
         args.out = String::from("/sdcard/arda-native-display-capture-test.h264");
     }
+    let output_is_stdout = args.out == "-";
     let report = native::display_capture_test(
         &args.out,
         args.width,
@@ -327,7 +328,9 @@ fn native_display_capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::err
         args.seconds,
     )
     .map_err(|err| format!("native display capture test failed: {err}"))?;
-    print!("{report}");
+    if !output_is_stdout {
+        print!("{report}");
+    }
     Ok(())
 }
 
@@ -379,8 +382,8 @@ fn parse_native_encoder_args(argv: Vec<String>) -> Result<NativeEncoderArgs, Box
     if fps <= 0 || fps > 60 {
         return Err("--fps must be 1..60".into());
     }
-    if seconds <= 0 || seconds > 30 {
-        return Err("--seconds must be 1..30 for native encoder smoke test".into());
+    if seconds <= 0 || seconds > 1800 {
+        return Err("--seconds must be 1..1800".into());
     }
 
     Ok(NativeEncoderArgs {

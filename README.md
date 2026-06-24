@@ -221,3 +221,20 @@ This is an active ABI test. It does not route the display into the encoder surfa
 ## v10c
 
 Adds an explicit v10c marker to native-display-capture-test logs and keeps the ANativeWindow -> Surface pointer adjustment before getIGraphicBufferProducer.
+
+
+## V11 native display live stdout
+
+`native-display-capture-test` now supports `--out -` for binary-clean stdout. In this mode Rust does not print the native report to stdout; diagnostics stay in `/data/local/tmp/arda-display-capture-test.log`.
+
+Live native display stream:
+
+```bash
+adb exec-out /data/local/tmp/arda-senderd native-display-capture-test   --size 1280x720   --bit-rate 6000000   --fps 30   --seconds 180   --out -   | mpv --demuxer=lavf         --demuxer-lavf-format=h264         --no-correct-pts         --container-fps-override=30         --profile=low-latency -
+```
+
+If the live pipe fails, read:
+
+```bash
+adb shell cat /data/local/tmp/arda-display-capture-test.log
+```

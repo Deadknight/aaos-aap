@@ -40,6 +40,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "input-test" => input_test(args.collect()),
         "aap-tcp-probe" => aap_tcp_probe(args.collect()),
         "aap-frame-probe" => aap_frame_probe(args.collect()),
+        "aap-version-session" => aap_version_session(args.collect()),
+        "aap-ssl-frame-probe" => aap_ssl_frame_probe(args.collect()),
+        "aap-tls-handshake-probe" => aap_tls_handshake_probe(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -93,6 +96,15 @@ Commands:
 
   aap-frame-probe [--addr 0.0.0.0:5277] [--dump PATH] [--timeout-ms 60000] [--max-frames 256]
       AAP frame probe: parses AA channel/flags/length/final_length framing and names plaintext control messages.
+
+  aap-version-session [--addr 0.0.0.0:5277] [--dump PATH] [--response 1.7] [--status 0]
+      Accepts one AAP TCP client, reads plaintext VERSION_REQUEST, replies with VERSION_RESPONSE, then closes.
+
+  aap-ssl-frame-probe [--addr 0.0.0.0:5277] [--dump PATH] [--response 1.7] [--max-frames 8]
+      Accepts one AAP TCP client, replies to VERSION_REQUEST, then reads MESSAGE_ENCAPSULATED_SSL frames and prints TLS record hints.
+
+  aap-tls-handshake-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 64]
+      Runs phone-like AAP VERSION_RESPONSE, then TLS server handshake over MESSAGE_ENCAPSULATED_SSL using md_cert/md_key. Peer cert is accepted.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -761,6 +773,345 @@ fn parse_aap_frame_probe_args(argv: Vec<String>) -> Result<AapFrameProbeArgs, Bo
         timeout_ms,
         max_bytes,
         max_frames,
+    })
+}
+
+
+#[derive(Debug)]
+struct AapVersionSessionArgs {
+    addr: String,
+    dump: Option<PathBuf>,
+    timeout_ms: u64,
+    max_bytes: usize,
+    response_major: u16,
+    response_minor: u16,
+    response_status: u16,
+}
+
+fn aap_version_session(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aap_version_session_args(argv)?;
+    aap::version_session(aap::VersionSessionConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+        response_major: args.response_major,
+        response_minor: args.response_minor,
+        response_status: args.response_status,
+    })?;
+    Ok(())
+}
+
+fn parse_aap_version_session_args(argv: Vec<String>) -> Result<AapVersionSessionArgs, Box<dyn std::error::Error>> {
+    let mut addr = String::from("0.0.0.0:5277");
+    let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-version.log"));
+    let mut timeout_ms = 60_000u64;
+    let mut max_bytes = 1024usize * 1024usize;
+    let mut response_major = 1u16;
+    let mut response_minor = 7u16;
+    let mut response_status = 0u16;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--addr" | "--listen" => {
+                i += 1;
+                addr = argv.get(i).ok_or("--addr requires value")?.clone();
+            }
+            "--dump" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--dump requires value")?;
+                dump = if value == "-" || value == "none" {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
+            }
+            "--max-bytes" => {
+                i += 1;
+                max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
+            }
+            "--response" | "--version" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--response requires value like 1.7")?;
+                let Some((major, minor)) = value.split_once('.') else {
+                    return Err("--response must look like MAJOR.MINOR".into());
+                };
+                response_major = major.parse::<u16>()?;
+                response_minor = minor.parse::<u16>()?;
+            }
+            "--status" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--status requires value")?;
+                response_status = if let Some(hex) = value.strip_prefix("0x") {
+                    u16::from_str_radix(hex, 16)?
+                } else {
+                    value.parse::<u16>()?
+                };
+            }
+            other => return Err(format!("unknown aap-version-session arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT".into());
+    }
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".into());
+    }
+    if max_bytes == 0 {
+        return Err("--max-bytes must be positive".into());
+    }
+
+    Ok(AapVersionSessionArgs {
+        addr,
+        dump,
+        timeout_ms,
+        max_bytes,
+        response_major,
+        response_minor,
+        response_status,
+    })
+}
+
+
+#[derive(Debug)]
+struct AapSslFrameProbeArgs {
+    addr: String,
+    dump: Option<PathBuf>,
+    timeout_ms: u64,
+    max_bytes: usize,
+    max_frames: usize,
+    response_major: u16,
+    response_minor: u16,
+    response_status: u16,
+}
+
+fn aap_ssl_frame_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aap_ssl_frame_probe_args(argv)?;
+    aap::ssl_frame_probe(aap::SslFrameProbeConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+        max_frames: args.max_frames,
+        response_major: args.response_major,
+        response_minor: args.response_minor,
+        response_status: args.response_status,
+    })?;
+    Ok(())
+}
+
+fn parse_aap_ssl_frame_probe_args(argv: Vec<String>) -> Result<AapSslFrameProbeArgs, Box<dyn std::error::Error>> {
+    let mut addr = String::from("0.0.0.0:5277");
+    let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-ssl-frame.log"));
+    let mut timeout_ms = 60_000u64;
+    let mut max_bytes = 4usize * 1024usize * 1024usize;
+    let mut max_frames = 8usize;
+    let mut response_major = 1u16;
+    let mut response_minor = 7u16;
+    let mut response_status = 0u16;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--addr" | "--listen" => {
+                i += 1;
+                addr = argv.get(i).ok_or("--addr requires value")?.clone();
+            }
+            "--dump" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--dump requires value")?;
+                dump = if value == "-" || value == "none" {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
+            }
+            "--max-bytes" => {
+                i += 1;
+                max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
+            }
+            "--max-frames" => {
+                i += 1;
+                max_frames = argv.get(i).ok_or("--max-frames requires value")?.parse::<usize>()?;
+            }
+            "--response" | "--version" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--response requires value like 1.7")?;
+                let Some((major, minor)) = value.split_once('.') else {
+                    return Err("--response must look like MAJOR.MINOR".into());
+                };
+                response_major = major.parse::<u16>()?;
+                response_minor = minor.parse::<u16>()?;
+            }
+            "--status" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--status requires value")?;
+                response_status = if let Some(hex) = value.strip_prefix("0x") {
+                    u16::from_str_radix(hex, 16)?
+                } else {
+                    value.parse::<u16>()?
+                };
+            }
+            other => return Err(format!("unknown aap-ssl-frame-probe arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT".into());
+    }
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".into());
+    }
+    if max_bytes == 0 {
+        return Err("--max-bytes must be positive".into());
+    }
+    if max_frames == 0 {
+        return Err("--max-frames must be positive".into());
+    }
+
+    Ok(AapSslFrameProbeArgs {
+        addr,
+        dump,
+        timeout_ms,
+        max_bytes,
+        max_frames,
+        response_major,
+        response_minor,
+        response_status,
+    })
+}
+
+
+#[derive(Debug)]
+struct AapTlsHandshakeProbeArgs {
+    addr: String,
+    dump: Option<PathBuf>,
+    timeout_ms: u64,
+    max_bytes: usize,
+    max_frames: usize,
+    response_major: u16,
+    response_minor: u16,
+    response_status: u16,
+    keys: PathBuf,
+}
+
+fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aap_tls_handshake_probe_args(argv)?;
+    aap::tls_handshake_probe(aap::TlsHandshakeProbeConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+        max_frames: args.max_frames,
+        response_major: args.response_major,
+        response_minor: args.response_minor,
+        response_status: args.response_status,
+        keys_path: args.keys,
+    })?;
+    Ok(())
+}
+
+fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandshakeProbeArgs, Box<dyn std::error::Error>> {
+    let mut addr = String::from("0.0.0.0:5277");
+    let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log"));
+    let mut timeout_ms = 60_000u64;
+    let mut max_bytes = 4usize * 1024usize * 1024usize;
+    let mut max_frames = 64usize;
+    let mut response_major = 1u16;
+    let mut response_minor = 7u16;
+    let mut response_status = 0u16;
+    let mut keys = PathBuf::from("/data/local/tmp/arda-certs");
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--addr" | "--listen" => {
+                i += 1;
+                addr = argv.get(i).ok_or("--addr requires value")?.clone();
+            }
+            "--dump" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--dump requires value")?;
+                dump = if value == "-" || value == "none" {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+            }
+            "--keys" | "--keys-path" => {
+                i += 1;
+                keys = PathBuf::from(argv.get(i).ok_or("--keys requires directory path")?);
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
+            }
+            "--max-bytes" => {
+                i += 1;
+                max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
+            }
+            "--max-frames" => {
+                i += 1;
+                max_frames = argv.get(i).ok_or("--max-frames requires value")?.parse::<usize>()?;
+            }
+            "--response" | "--version" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--response requires value like 1.7")?;
+                let Some((major, minor)) = value.split_once('.') else {
+                    return Err("--response must look like MAJOR.MINOR".into());
+                };
+                response_major = major.parse::<u16>()?;
+                response_minor = minor.parse::<u16>()?;
+            }
+            "--status" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--status requires value")?;
+                response_status = if let Some(hex) = value.strip_prefix("0x") {
+                    u16::from_str_radix(hex, 16)?
+                } else {
+                    value.parse::<u16>()?
+                };
+            }
+            other => return Err(format!("unknown aap-tls-handshake-probe arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT".into());
+    }
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".into());
+    }
+    if max_bytes == 0 {
+        return Err("--max-bytes must be positive".into());
+    }
+    if max_frames == 0 {
+        return Err("--max-frames must be positive".into());
+    }
+
+    Ok(AapTlsHandshakeProbeArgs {
+        addr,
+        dump,
+        timeout_ms,
+        max_bytes,
+        max_frames,
+        response_major,
+        response_minor,
+        response_status,
+        keys,
     })
 }
 

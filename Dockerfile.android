@@ -10,7 +10,7 @@ ENV ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}
 ENV PATH=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl unzip ca-certificates xz-utils file \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates xz-utils file build-essential cmake perl pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -L -o /tmp/android-ndk.zip https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip \

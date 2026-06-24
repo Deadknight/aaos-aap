@@ -11,6 +11,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod tls;
+
 #[derive(Debug, Clone)]
 pub struct TcpProbeConfig {
     pub addr: String,
@@ -443,4 +445,649 @@ fn control_hint(frame: &AapFrame) -> Option<String> {
         return Some(format!("{name} tls_bytes={}", frame.payload.len().saturating_sub(2)));
     }
     Some(format!("{name} id=0x{id:04x}"))
+}
+
+
+// ---------------------------------------------------------------------------
+// AAP plaintext version session
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct VersionSessionConfig {
+    pub addr: String,
+    pub dump_path: Option<PathBuf>,
+    pub timeout_ms: u64,
+    pub max_bytes: usize,
+    pub response_major: u16,
+    pub response_minor: u16,
+    pub response_status: u16,
+}
+
+impl Default for VersionSessionConfig {
+    fn default() -> Self {
+        Self {
+            addr: "0.0.0.0:5277".to_string(),
+            dump_path: Some(PathBuf::from("/data/local/tmp/arda-aap-version.log")),
+            timeout_ms: 60_000,
+            max_bytes: 1024 * 1024,
+            response_major: 1,
+            response_minor: 7,
+            response_status: 0,
+        }
+    }
+}
+
+pub fn version_session(config: VersionSessionConfig) -> io::Result<()> {
+    println!("arda aap version session");
+    println!("addr={}", config.addr);
+    println!("timeout_ms={}", config.timeout_ms);
+    println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
+    if let Some(path) = &config.dump_path {
+        println!("dump={}", path.display());
+    } else {
+        println!("dump=none");
+    }
+    println!();
+
+    let listener = TcpListener::bind(&config.addr)?;
+    println!("listening on {}", listener.local_addr()?);
+    println!("waiting for one client...");
+
+    let (mut stream, peer) = listener.accept()?;
+    println!("client connected: {peer}");
+    stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+
+    let mut dump: Option<Box<dyn Write>> = match &config.dump_path {
+        Some(path) => Some(Box::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        )),
+        None => None,
+    };
+
+    log_line(&mut dump, "arda aap version session")?;
+    log_line(&mut dump, &format!("local={}", listener.local_addr()?))?;
+    log_line(&mut dump, &format!("peer={peer}"))?;
+    log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
+    log_line(&mut dump, "")?;
+
+    let started = Instant::now();
+    let mut reader = FrameReader::new(config.max_bytes);
+    let frame = match reader.read_frame(&mut stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before version request")),
+        Err(err) => return Err(err),
+    };
+
+    println!("rx version candidate:");
+    describe_frame(1, HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 }, peer, &frame, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "rx version candidate:")?;
+        describe_frame(1, HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 }, peer, &frame, dump)?;
+        dump.flush()?;
+    }
+
+    let Some((req_major, req_minor)) = parse_version_request(&frame) else {
+        log_line(&mut dump, "not a valid MESSAGE_VERSION_REQUEST; closing")?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected MESSAGE_VERSION_REQUEST on control channel"));
+    };
+
+    println!("version request: {}.{}", req_major, req_minor);
+    log_line(&mut dump, &format!("version request: {}.{}", req_major, req_minor))?;
+
+    let response = build_version_response(config.response_major, config.response_minor, config.response_status);
+    let out_frame = AapFrame {
+        channel: 0,
+        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: response,
+    };
+    write_frame(&mut stream, &out_frame)?;
+    stream.flush()?;
+
+    let wire_len = HEADER_LENGTH + out_frame.payload.len();
+    println!("tx version response:");
+    describe_frame(1, wire_len, peer, &out_frame, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "tx version response:")?;
+        describe_frame(1, wire_len, peer, &out_frame, dump)?;
+        dump.flush()?;
+    }
+
+    let elapsed = started.elapsed();
+    println!("summary: version_response_sent elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: version_response_sent elapsed_ms={}", elapsed.as_millis()))?;
+    Ok(())
+}
+
+fn parse_version_request(frame: &AapFrame) -> Option<(u16, u16)> {
+    if frame.channel != 0 || frame.payload.len() != 6 {
+        return None;
+    }
+    let id = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+    if id != 0x0001 {
+        return None;
+    }
+    let major = u16::from_be_bytes([frame.payload[2], frame.payload[3]]);
+    let minor = u16::from_be_bytes([frame.payload[4], frame.payload[5]]);
+    Some((major, minor))
+}
+
+fn build_version_response(major: u16, minor: u16, status: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&0x0002u16.to_be_bytes());
+    payload.extend_from_slice(&major.to_be_bytes());
+    payload.extend_from_slice(&minor.to_be_bytes());
+    payload.extend_from_slice(&status.to_be_bytes());
+    payload
+}
+
+fn write_frame(stream: &mut TcpStream, frame: &AapFrame) -> io::Result<()> {
+    if frame.payload.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payload too large for single AAP frame: {}", frame.payload.len()),
+        ));
+    }
+    let payload_len = frame.payload.len() as u16;
+    let mut header = [0u8; 8];
+    header[0] = frame.channel;
+    header[1] = frame.flags;
+    header[2..4].copy_from_slice(&payload_len.to_be_bytes());
+    if let Some(final_len) = frame.final_length {
+        header[4..8].copy_from_slice(&final_len.to_be_bytes());
+        stream.write_all(&header[..8])?;
+    } else {
+        stream.write_all(&header[..4])?;
+    }
+    stream.write_all(&frame.payload)?;
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// AAP plaintext version + SSL frame probe
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SslFrameProbeConfig {
+    pub addr: String,
+    pub dump_path: Option<PathBuf>,
+    pub timeout_ms: u64,
+    pub max_bytes: usize,
+    pub max_frames: usize,
+    pub response_major: u16,
+    pub response_minor: u16,
+    pub response_status: u16,
+}
+
+impl Default for SslFrameProbeConfig {
+    fn default() -> Self {
+        Self {
+            addr: "0.0.0.0:5277".to_string(),
+            dump_path: Some(PathBuf::from("/data/local/tmp/arda-aap-ssl-frame.log")),
+            timeout_ms: 60_000,
+            max_bytes: 4 * 1024 * 1024,
+            max_frames: 8,
+            response_major: 1,
+            response_minor: 7,
+            response_status: 0,
+        }
+    }
+}
+
+pub fn ssl_frame_probe(config: SslFrameProbeConfig) -> io::Result<()> {
+    println!("arda aap ssl frame probe");
+    println!("addr={}", config.addr);
+    println!("timeout_ms={}", config.timeout_ms);
+    println!("max_bytes={}", config.max_bytes);
+    println!("max_frames={}", config.max_frames);
+    println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
+    if let Some(path) = &config.dump_path {
+        println!("dump={}", path.display());
+    } else {
+        println!("dump=none");
+    }
+    println!();
+
+    let listener = TcpListener::bind(&config.addr)?;
+    println!("listening on {}", listener.local_addr()?);
+    println!("waiting for one client...");
+
+    let (mut stream, peer) = listener.accept()?;
+    println!("client connected: {peer}");
+    stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+
+    let mut dump: Option<Box<dyn Write>> = match &config.dump_path {
+        Some(path) => Some(Box::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        )),
+        None => None,
+    };
+
+    log_line(&mut dump, "arda aap ssl frame probe")?;
+    log_line(&mut dump, &format!("local={}", listener.local_addr()?))?;
+    log_line(&mut dump, &format!("peer={peer}"))?;
+    log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
+    log_line(&mut dump, "note=TLS cert verification is intentionally not part of this probe; it only captures MESSAGE_ENCAPSULATED_SSL bytes")?;
+    log_line(&mut dump, "")?;
+
+    let started = Instant::now();
+    let mut reader = FrameReader::new(config.max_bytes);
+
+    let version = match reader.read_frame(&mut stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before version request")),
+        Err(err) => return Err(err),
+    };
+
+    println!("rx version candidate:");
+    describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "rx version candidate:")?;
+        describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, dump)?;
+        dump.flush()?;
+    }
+
+    let Some((req_major, req_minor)) = parse_version_request(&version) else {
+        log_line(&mut dump, "not a valid MESSAGE_VERSION_REQUEST; closing")?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected MESSAGE_VERSION_REQUEST on control channel"));
+    };
+
+    println!("version request: {}.{}", req_major, req_minor);
+    log_line(&mut dump, &format!("version request: {}.{}", req_major, req_minor))?;
+
+    let response_payload = build_version_response(config.response_major, config.response_minor, config.response_status);
+    let response_frame = AapFrame {
+        channel: 0,
+        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: response_payload,
+    };
+    write_frame(&mut stream, &response_frame)?;
+    stream.flush()?;
+
+    println!("tx version response:");
+    describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "tx version response:")?;
+        describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, dump)?;
+        dump.flush()?;
+    }
+
+    println!("waiting for MESSAGE_ENCAPSULATED_SSL frames...");
+    log_line(&mut dump, "waiting for MESSAGE_ENCAPSULATED_SSL frames...")?;
+
+    let mut frames = 1usize;
+    let mut bytes = HEADER_LENGTH + version.payload.len() + HEADER_LENGTH + response_frame.payload.len();
+    let mut ssl_frames = 0usize;
+    while frames < config.max_frames {
+        let frame = match reader.read_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                println!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                println!("read timeout after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("read timeout after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        frames += 1;
+        bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
+        println!("rx post-version frame:");
+        describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
+        if let Some(dump) = dump.as_mut() {
+            writeln!(dump, "rx post-version frame:")?;
+            describe_frame(frames, bytes, peer, &frame, dump)?;
+        }
+
+        if let Some(tls_bytes) = ssl_payload_bytes(&frame) {
+            ssl_frames += 1;
+            let hint = tls_record_hint(tls_bytes);
+            println!("ssl frame #{ssl_frames}: tls_bytes={} {hint}", tls_bytes.len());
+            if let Some(dump) = dump.as_mut() {
+                writeln!(dump, "ssl frame #{ssl_frames}: tls_bytes={} {hint}", tls_bytes.len())?;
+                let dump_len = tls_bytes.len().min(256);
+                if dump_len > 0 {
+                    print_hex_dump(0, &tls_bytes[..dump_len], dump)?;
+                    if tls_bytes.len() > dump_len {
+                        writeln!(dump, "... tls bytes truncated for display: {} / {} bytes", dump_len, tls_bytes.len())?;
+                    }
+                }
+                dump.flush()?;
+            }
+            // This is a probe: one SSL frame is enough to prove post-version encapsulation.
+            break;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    println!("summary: frames={frames} ssl_frames={ssl_frames} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} ssl_frames={ssl_frames} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    Ok(())
+}
+
+fn ssl_payload_bytes(frame: &AapFrame) -> Option<&[u8]> {
+    if frame.channel != 0 || frame.payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+    if id != 0x0003 {
+        return None;
+    }
+    Some(&frame.payload[2..])
+}
+
+fn tls_record_hint(data: &[u8]) -> String {
+    if data.len() < 5 {
+        return "tls_hint=too_short".to_string();
+    }
+    let content_type = data[0];
+    let major = data[1];
+    let minor = data[2];
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    let content_name = match content_type {
+        0x14 => "change_cipher_spec",
+        0x15 => "alert",
+        0x16 => "handshake",
+        0x17 => "application_data",
+        _ => "unknown",
+    };
+    let mut s = format!(
+        "tls_record type=0x{content_type:02x}({content_name}) version={major:02x}.{minor:02x} record_len={record_len}"
+    );
+    if content_type == 0x16 && data.len() >= 9 {
+        let hs_type = data[5];
+        let hs_len = ((data[6] as usize) << 16) | ((data[7] as usize) << 8) | (data[8] as usize);
+        let hs_name = match hs_type {
+            0x01 => "client_hello",
+            0x02 => "server_hello",
+            0x0b => "certificate",
+            0x0c => "server_key_exchange",
+            0x0d => "certificate_request",
+            0x0e => "server_hello_done",
+            0x10 => "client_key_exchange",
+            0x14 => "finished",
+            _ => "unknown_handshake",
+        };
+        s.push_str(&format!(" handshake=0x{hs_type:02x}({hs_name}) handshake_len={hs_len}"));
+    }
+    if data.len() < 5 + record_len {
+        s.push_str(&format!(" note=incomplete_record_have={} need={}", data.len(), 5 + record_len));
+    }
+    s
+}
+
+
+// ---------------------------------------------------------------------------
+// AAP plaintext version + TLS handshake probe
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct TlsHandshakeProbeConfig {
+    pub addr: String,
+    pub dump_path: Option<PathBuf>,
+    pub timeout_ms: u64,
+    pub max_bytes: usize,
+    pub max_frames: usize,
+    pub response_major: u16,
+    pub response_minor: u16,
+    pub response_status: u16,
+    pub keys_path: PathBuf,
+}
+
+impl Default for TlsHandshakeProbeConfig {
+    fn default() -> Self {
+        Self {
+            addr: "0.0.0.0:5277".to_string(),
+            dump_path: Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log")),
+            timeout_ms: 60_000,
+            max_bytes: 4 * 1024 * 1024,
+            max_frames: 64,
+            response_major: 1,
+            response_minor: 7,
+            response_status: 0,
+            keys_path: PathBuf::from("/data/local/tmp/arda-certs"),
+        }
+    }
+}
+
+pub fn tls_handshake_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
+    println!("arda aap tls handshake probe");
+    println!("addr={}", config.addr);
+    println!("timeout_ms={}", config.timeout_ms);
+    println!("max_bytes={}", config.max_bytes);
+    println!("max_frames={}", config.max_frames);
+    println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
+    println!("keys={}", config.keys_path.display());
+    if let Some(path) = &config.dump_path {
+        println!("dump={}", path.display());
+    } else {
+        println!("dump=none");
+    }
+    println!();
+
+    let listener = TcpListener::bind(&config.addr)?;
+    println!("listening on {}", listener.local_addr()?);
+    println!("waiting for one client...");
+
+    let (mut stream, peer) = listener.accept()?;
+    println!("client connected: {peer}");
+    stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
+
+    let mut dump: Option<Box<dyn Write>> = match &config.dump_path {
+        Some(path) => Some(Box::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        )),
+        None => None,
+    };
+
+    log_line(&mut dump, "arda aap tls handshake probe")?;
+    log_line(&mut dump, &format!("local={}", listener.local_addr()?))?;
+    log_line(&mut dump, &format!("peer={peer}"))?;
+    log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
+    log_line(&mut dump, &format!("keys={}", config.keys_path.display()))?;
+    log_line(&mut dump, "role=phone-like TCP server + TLS server using md_cert/md_key; peer cert accepted")?;
+    log_line(&mut dump, "")?;
+
+    let started = Instant::now();
+    let mut reader = FrameReader::new(config.max_bytes);
+
+    let version = match reader.read_frame(&mut stream) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before version request")),
+        Err(err) => return Err(err),
+    };
+
+    println!("rx version candidate:");
+    describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "rx version candidate:")?;
+        describe_frame(1, HEADER_LENGTH + version.payload.len() + if version.final_length.is_some() { 4 } else { 0 }, peer, &version, dump)?;
+        dump.flush()?;
+    }
+
+    let Some((req_major, req_minor)) = parse_version_request(&version) else {
+        log_line(&mut dump, "not a valid MESSAGE_VERSION_REQUEST; closing")?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected MESSAGE_VERSION_REQUEST on control channel"));
+    };
+
+    println!("version request: {}.{}", req_major, req_minor);
+    log_line(&mut dump, &format!("version request: {}.{}", req_major, req_minor))?;
+
+    let response_payload = build_version_response(config.response_major, config.response_minor, config.response_status);
+    let response_frame = AapFrame {
+        channel: 0,
+        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: response_payload,
+    };
+    write_frame(&mut stream, &response_frame)?;
+    stream.flush()?;
+
+    println!("tx version response:");
+    describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, &mut io::stdout())?;
+    if let Some(dump) = dump.as_mut() {
+        writeln!(dump, "tx version response:")?;
+        describe_frame(1, HEADER_LENGTH + response_frame.payload.len(), peer, &response_frame, dump)?;
+        dump.flush()?;
+    }
+
+    let mut tls = tls::AapTlsServer::new_phone_like(&config.keys_path)?;
+    println!("tls server ready: {}", tls.state_string());
+    log_line(&mut dump, &format!("tls server ready: {}", tls.state_string()))?;
+
+    let mut frames = 1usize;
+    let mut bytes = HEADER_LENGTH + version.payload.len() + HEADER_LENGTH + response_frame.payload.len();
+    let mut ssl_frames = 0usize;
+    let mut tx_ssl_frames = 0usize;
+    let mut decrypted_bytes = 0usize;
+
+    while frames < config.max_frames {
+        let frame = match reader.read_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                println!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                println!("read timeout after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
+                log_line(&mut dump, &format!("read timeout after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        frames += 1;
+        bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
+        println!("rx tls-stage frame:");
+        describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
+        if let Some(dump) = dump.as_mut() {
+            writeln!(dump, "rx tls-stage frame:")?;
+            describe_frame(frames, bytes, peer, &frame, dump)?;
+        }
+
+        let Some(tls_bytes) = ssl_payload_bytes(&frame) else {
+            let line = "non MESSAGE_ENCAPSULATED_SSL frame during TLS probe; ignoring";
+            println!("{line}");
+            log_line(&mut dump, line)?;
+            continue;
+        };
+
+        ssl_frames += 1;
+        let hint = tls_record_hint(tls_bytes);
+        println!("rx ssl frame #{ssl_frames}: tls_bytes={} {hint}", tls_bytes.len());
+        if let Some(dump) = dump.as_mut() {
+            writeln!(dump, "rx ssl frame #{ssl_frames}: tls_bytes={} {hint}", tls_bytes.len())?;
+            let dump_len = tls_bytes.len().min(256);
+            if dump_len > 0 {
+                print_hex_dump(0, &tls_bytes[..dump_len], dump)?;
+                if tls_bytes.len() > dump_len {
+                    writeln!(dump, "... tls bytes truncated for display: {} / {} bytes", dump_len, tls_bytes.len())?;
+                }
+            }
+            dump.flush()?;
+        }
+
+        let step = match tls.feed_tls(tls_bytes) {
+            Ok(step) => step,
+            Err(err) => {
+                println!("tls process error: {err}");
+                log_line(&mut dump, &format!("tls process error: {err}"))?;
+                return Err(err);
+            }
+        };
+
+        println!(
+            "tls step: state='{}' handshaking={} cipher={} outgoing_tls={} plaintext={}",
+            step.state,
+            step.still_handshaking,
+            step.cipher_suite,
+            step.outgoing_tls.len(),
+            step.plaintext.len()
+        );
+        log_line(
+            &mut dump,
+            &format!(
+                "tls step: state='{}' handshaking={} cipher={} outgoing_tls={} plaintext={}",
+                step.state,
+                step.still_handshaking,
+                step.cipher_suite,
+                step.outgoing_tls.len(),
+                step.plaintext.len()
+            ),
+        )?;
+
+        if !step.plaintext.is_empty() {
+            decrypted_bytes += step.plaintext.len();
+            println!("decrypted plaintext bytes={}", step.plaintext.len());
+            if let Some(dump) = dump.as_mut() {
+                writeln!(dump, "decrypted plaintext bytes={}", step.plaintext.len())?;
+                print_hex_dump(0, &step.plaintext[..step.plaintext.len().min(256)], dump)?;
+                dump.flush()?;
+            }
+        }
+
+        if !step.outgoing_tls.is_empty() {
+            tx_ssl_frames += 1;
+            let tx_frame = build_ssl_frame(&step.outgoing_tls);
+            write_frame(&mut stream, &tx_frame)?;
+            stream.flush()?;
+            println!("tx ssl frame #{tx_ssl_frames}: tls_bytes={}", step.outgoing_tls.len());
+            if let Some(dump) = dump.as_mut() {
+                writeln!(dump, "tx ssl frame #{tx_ssl_frames}: tls_bytes={} {}", step.outgoing_tls.len(), tls_record_hint(&step.outgoing_tls))?;
+                print_hex_dump(0, &step.outgoing_tls[..step.outgoing_tls.len().min(256)], dump)?;
+                dump.flush()?;
+            }
+        }
+
+        if !tls.is_handshaking() {
+            println!("tls handshake complete: cipher={}", tls.cipher_suite());
+            log_line(&mut dump, &format!("tls handshake complete: cipher={}", tls.cipher_suite()))?;
+            break;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    println!("summary: frames={frames} rx_ssl_frames={ssl_frames} tx_ssl_frames={tx_ssl_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={ssl_frames} tx_ssl_frames={tx_ssl_frames} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    Ok(())
+}
+
+fn build_ssl_frame(tls_bytes: &[u8]) -> AapFrame {
+    let mut payload = Vec::with_capacity(2 + tls_bytes.len());
+    payload.extend_from_slice(&0x0003u16.to_be_bytes());
+    payload.extend_from_slice(tls_bytes);
+    AapFrame {
+        channel: 0,
+        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    }
 }

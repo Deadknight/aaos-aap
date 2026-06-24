@@ -10,10 +10,14 @@ FEATURES="${FEATURES:-}"
 
 if [[ "$TARGET" == "aarch64-linux-android" ]]; then
   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="aarch64-linux-android${ANDROID_API}-clang"
+  export CC_aarch64_linux_android="aarch64-linux-android${ANDROID_API}-clang"
   export CXX_aarch64_linux_android="aarch64-linux-android${ANDROID_API}-clang++"
+  export AR_aarch64_linux_android="llvm-ar"
 elif [[ "$TARGET" == "armv7-linux-androideabi" ]]; then
   export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="armv7a-linux-androideabi${ANDROID_API}-clang"
+  export CC_armv7_linux_androideabi="armv7a-linux-androideabi${ANDROID_API}-clang"
   export CXX_armv7_linux_androideabi="armv7a-linux-androideabi${ANDROID_API}-clang++"
+  export AR_armv7_linux_androideabi="llvm-ar"
 fi
 
 echo "Building Rust + embedded native C++ probe for $TARGET (ANDROID_API=$ANDROID_API)"

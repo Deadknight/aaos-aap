@@ -216,3 +216,8 @@ Adds `native-display-probe`, a safe symbol/ABI check for Android 11 `libgui` dis
 - calls `SurfaceComposerClient::destroyDisplay()`
 
 This is an active ABI test. It does not route the display into the encoder surface yet.
+
+
+## v10c
+
+Adds an explicit v10c marker to native-display-capture-test logs and keeps the ANativeWindow -> Surface pointer adjustment before getIGraphicBufferProducer.

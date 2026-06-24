@@ -48,3 +48,8 @@ Adds `native-display-probe`, a safe symbol/ABI check for Android 11 `libgui` dis
 ## V9 checkpoint
 
 Native display active probe added. This validates whether the private `sp<IBinder>` and `String8` ABI calls are safe before attempting `Transaction::setDisplaySurface`.
+
+
+## v10c-surface-offset
+
+If native-display-capture-test logs do not show the v10c marker or `Surface this adjustment`, the patched native file did not make it into the built binary.

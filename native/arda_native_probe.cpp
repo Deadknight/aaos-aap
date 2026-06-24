@@ -910,6 +910,457 @@ int native_display_active_probe_android(Buffer* report) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -52;
 }
 
+
+
+// Active display-capture attempt: route a private SurfaceComposerClient virtual display
+// into the MediaCodec input surface. This is intentionally still a crash-contained
+// probe because it calls private Android C++ ABI without platform headers.
+struct Rect32 {
+    int32_t left;
+    int32_t top;
+    int32_t right;
+    int32_t bottom;
+};
+
+using SurfaceGetIGBPFn = RawSp (*)(const void* surface);
+using TxnClearFn = void (*)(void* txn);
+using TxnSetDisplaySurfaceFn = int32_t (*)(void* txn, const RawSp& display, const RawSp& producer);
+using TxnSetDisplayProjectionFn = int32_t (*)(void* txn, const RawSp& display, int32_t rotation, const Rect32& layer_stack_rect, const Rect32& display_rect);
+using TxnSetDisplayLayerStackFn = int32_t (*)(void* txn, const RawSp& display, uint32_t layer_stack);
+using TxnSetDisplaySizeFn = int32_t (*)(void* txn, const RawSp& display, uint32_t width, uint32_t height);
+using TxnApplyFn = void (*)(void* txn, bool synchronous);
+using SortedVectorImplCtorFn = void (*)(void* vector_this, size_t item_size, uint32_t flags);
+
+static const char* kDisplayCaptureLogPath = "/data/local/tmp/arda-display-capture-test.log";
+
+void log_file_reset_path(const char* path) {
+    FILE* f = fopen(path, "wb");
+    if (f) fclose(f);
+}
+
+void log_file_append_path(const char* path, const char* fmt, ...) {
+    FILE* f = fopen(path, "ab");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+
+void init_raw_transaction_v10d(
+    void* storage,
+    size_t storage_len,
+    void* transaction_vtable_symbol,
+    void* display_vector_vtable_symbol,
+    SortedVectorImplCtorFn sorted_vector_ctor,
+    Buffer* report
+) {
+    memset(storage, 0, storage_len);
+    auto* base = reinterpret_cast<unsigned char*>(storage);
+
+    if (transaction_vtable_symbol) {
+        void* vptr = reinterpret_cast<void**>(transaction_vtable_symbol) + 2;
+        *reinterpret_cast<void**>(base) = vptr;
+        append(report, "  transaction vptr patched          vtable=%p vptr=%p\n", transaction_vtable_symbol, vptr);
+    } else {
+        append(report, "  transaction vptr patched          skipped/no-vtable\n");
+    }
+
+    // This mirrors the exported Transaction copy-ctor prologue from this device's
+    // libgui.so. The earlier raw-zero object let Transaction::clear() return, but
+    // Transaction::setDisplaySurface() aborted when getDisplayState() tried to add
+    // into an unconstructed SortedVector<DisplayState>.
+    // Relevant observed offsets on Snapp AAOS 11 / libgui.so:
+    //   +0x30 SortedVector<DisplayState>
+    //   +0x58 callback hash table area
+    //   +0x78 float default alpha-ish value 1.0f
+    //   +0x90 desired present time default -1
+    *reinterpret_cast<float*>(base + 0x28) = 1.0f;
+
+    if (sorted_vector_ctor) {
+        sorted_vector_ctor(base + 0x30, 0x48, 0);
+        append(report, "  SortedVectorImpl ctor @+0x30      item_size=0x48 flags=0 OK\n");
+    } else {
+        append(report, "  SortedVectorImpl ctor @+0x30      missing, using zero fallback\n");
+    }
+
+    if (display_vector_vtable_symbol) {
+        void* display_vptr = reinterpret_cast<void**>(display_vector_vtable_symbol) + 2;
+        *reinterpret_cast<void**>(base + 0x30) = display_vptr;
+        append(report, "  DisplayState vector vptr patched  vtable=%p vptr=%p\n", display_vector_vtable_symbol, display_vptr);
+    } else {
+        append(report, "  DisplayState vector vptr patched  skipped/no-vtable\n");
+    }
+
+    *reinterpret_cast<float*>(base + 0x78) = 1.0f;
+    *reinterpret_cast<uint64_t*>(base + 0x90) = UINT64_MAX;
+
+    append(report, "  transaction init mode             v10d mirrored copy-ctor prologue\n");
+}
+
+int native_display_capture_test_android_child(
+    const char* out_path,
+    int width,
+    int height,
+    int bit_rate,
+    int fps,
+    int seconds,
+    Buffer* report
+) {
+    append(report, "arda native display capture test child v10d-transaction-init\n");
+    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture test child v10d-transaction-init\n");
+    append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+    append(report, "size=%dx%d bit_rate=%d fps=%d seconds=%d\n", width, height, bit_rate, fps, seconds);
+    append(report, "out=%s\n\n", out_path ? out_path : "(null)");
+    log_file_append_path(kDisplayCaptureLogPath, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+
+    if (!out_path || out_path[0] == '\0') {
+        append(report, "FAIL: missing output path\n");
+        return -1;
+    }
+    if (width <= 0 || height <= 0 || bit_rate <= 0 || fps <= 0 || seconds <= 0) {
+        append(report, "FAIL: invalid numeric argument\n");
+        return -2;
+    }
+
+    FILE* out = fopen(out_path, "wb");
+    if (!out) {
+        append(report, "FAIL: fopen(%s) errno=%d %s\n", out_path, errno, strerror(errno));
+        return -3;
+    }
+
+    log_file_append_path(kDisplayCaptureLogPath, "before codec create/configure\n");
+    CodecOwner owner;
+    owner.codec = AMediaCodec_createEncoderByType("video/avc");
+    if (!owner.codec) {
+        append(report, "create encoder: FAIL\n");
+        fclose(out);
+        return -4;
+    }
+    append(report, "create encoder: OK\n");
+
+    owner.format = AMediaFormat_new();
+    if (!owner.format) {
+        append(report, "create format: FAIL\n");
+        fclose(out);
+        return -5;
+    }
+    append(report, "create format: OK\n");
+
+    AMediaFormat_setString(owner.format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_WIDTH, width);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_COLOR_FORMAT, COLOR_FormatSurface);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_BIT_RATE, bit_rate);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
+    AMediaFormat_setInt32(owner.format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
+
+    media_status_t st = AMediaCodec_configure(
+        owner.codec,
+        owner.format,
+        nullptr,
+        nullptr,
+        AMEDIACODEC_CONFIGURE_FLAG_ENCODE
+    );
+    if (st != AMEDIA_OK) {
+        append(report, "configure surface encoder: FAIL status=%d\n", static_cast<int>(st));
+        fclose(out);
+        return -6;
+    }
+    append(report, "configure surface encoder: OK\n");
+
+    MediaNdkRuntimeApi media_api = load_media_ndk_runtime_api(report);
+    if (!media_api.create_input_surface || !media_api.signal_end_of_input_stream) {
+        append(report, "FAIL: required MediaCodec surface runtime symbols are missing\n");
+        fclose(out);
+        return -7;
+    }
+
+    NativeWindowOwner window_owner;
+    log_file_append_path(kDisplayCaptureLogPath, "before create input surface\n");
+    st = media_api.create_input_surface(owner.codec, &window_owner.window);
+    log_file_append_path(kDisplayCaptureLogPath, "after create input surface status=%d window=%p\n", static_cast<int>(st), window_owner.window);
+    if (st != AMEDIA_OK || !window_owner.window) {
+        append(report, "create input surface: FAIL status=%d window=%p\n", static_cast<int>(st), window_owner.window);
+        fclose(out);
+        return -8;
+    }
+    append(report, "create input surface: OK window=%p\n", window_owner.window);
+
+    void* libgui = dlopen("libgui.so", RTLD_NOW | RTLD_LOCAL);
+    void* libutils = dlopen("libutils.so", RTLD_NOW | RTLD_LOCAL);
+    if (!libgui || !libutils) {
+        append(report, "dlopen private libs: FAIL libgui=%p libutils=%p\n", libgui, libutils);
+        fclose(out);
+        if (libgui) dlclose(libgui);
+        if (libutils) dlclose(libutils);
+        return -9;
+    }
+    append(report, "dlopen private libs: OK\n");
+
+    append(report, "resolve private display routing ABI:\n");
+    auto string8_ctor = reinterpret_cast<String8CtorFn>(must_sym(report, libutils, "String8(char const*)", "_ZN7android7String8C1EPKc"));
+    auto string8_dtor = reinterpret_cast<String8DtorFn>(must_sym(report, libutils, "~String8", "_ZN7android7String8D1Ev"));
+    auto create_display = reinterpret_cast<SccCreateDisplayFn>(must_sym(report, libgui, "createDisplay", "_ZN7android21SurfaceComposerClient13createDisplayERKNS_7String8Eb"));
+    auto destroy_display = reinterpret_cast<SccDestroyDisplayFn>(must_sym(report, libgui, "destroyDisplay", "_ZN7android21SurfaceComposerClient14destroyDisplayERKNS_2spINS_7IBinderEEE"));
+    auto surface_get_igbp = reinterpret_cast<SurfaceGetIGBPFn>(must_sym(report, libgui, "Surface::getIGBP", "_ZNK7android7Surface25getIGraphicBufferProducerEv"));
+    void* txn_vtable = must_sym(report, libgui, "Transaction vtable", "_ZTVN7android21SurfaceComposerClient11TransactionE");
+    void* display_vector_vtable = must_sym(report, libgui, "SortedVector<DisplayState> vtable", "_ZTVN7android12SortedVectorINS_12DisplayStateEEE");
+    auto sorted_vector_ctor = reinterpret_cast<SortedVectorImplCtorFn>(must_sym(report, libutils, "SortedVectorImpl(size, flags)", "_ZN7android16SortedVectorImplC2Emj"));
+    auto txn_clear = reinterpret_cast<TxnClearFn>(must_sym(report, libgui, "Transaction::clear", "_ZN7android21SurfaceComposerClient11Transaction5clearEv"));
+    auto txn_set_surface = reinterpret_cast<TxnSetDisplaySurfaceFn>(must_sym(report, libgui, "Transaction::setDisplaySurface", "_ZN7android21SurfaceComposerClient11Transaction17setDisplaySurfaceERKNS_2spINS_7IBinderEEERKNS2_INS_22IGraphicBufferProducerEEE"));
+    auto txn_set_projection = reinterpret_cast<TxnSetDisplayProjectionFn>(must_sym(report, libgui, "Transaction::setDisplayProjection", "_ZN7android21SurfaceComposerClient11Transaction20setDisplayProjectionERKNS_2spINS_7IBinderEEENS_2ui8RotationERKNS_4RectESB_"));
+    auto txn_set_layer_stack = reinterpret_cast<TxnSetDisplayLayerStackFn>(must_sym(report, libgui, "Transaction::setDisplayLayerStack", "_ZN7android21SurfaceComposerClient11Transaction20setDisplayLayerStackERKNS_2spINS_7IBinderEEEj"));
+    auto txn_set_size = reinterpret_cast<TxnSetDisplaySizeFn>(must_sym(report, libgui, "Transaction::setDisplaySize", "_ZN7android21SurfaceComposerClient11Transaction14setDisplaySizeERKNS_2spINS_7IBinderEEEjj"));
+    auto txn_apply = reinterpret_cast<TxnApplyFn>(must_sym(report, libgui, "Transaction::apply", "_ZN7android21SurfaceComposerClient11Transaction5applyEb"));
+
+    if (!string8_ctor || !string8_dtor || !create_display || !destroy_display || !surface_get_igbp ||
+        !txn_vtable || !display_vector_vtable || !sorted_vector_ctor || !txn_set_surface || !txn_set_projection || !txn_set_layer_stack || !txn_set_size || !txn_apply) {
+        append(report, "\nFAIL: missing required private symbol; not attempting display route.\n");
+        fclose(out);
+        dlclose(libgui);
+        dlclose(libutils);
+        return -10;
+    }
+
+    log_file_append_path(kDisplayCaptureLogPath, "before AMediaCodec_start\n");
+    st = AMediaCodec_start(owner.codec);
+    log_file_append_path(kDisplayCaptureLogPath, "after AMediaCodec_start status=%d\n", static_cast<int>(st));
+    if (st != AMEDIA_OK) {
+        append(report, "start: FAIL status=%d\n", static_cast<int>(st));
+        fclose(out);
+        dlclose(libgui);
+        dlclose(libutils);
+        return -11;
+    }
+    append(report, "start: OK\n");
+
+    RawSp virtual_display;
+    RawSp producer;
+    alignas(16) unsigned char name_storage[64];
+    memset(name_storage, 0, sizeof(name_storage));
+    bool name_constructed = false;
+
+    log_file_append_path(kDisplayCaptureLogPath, "before String8 ctor\n");
+    string8_ctor(name_storage, "arda-native-display-capture");
+    log_file_append_path(kDisplayCaptureLogPath, "after String8 ctor\n");
+    name_constructed = true;
+
+    log_file_append_path(kDisplayCaptureLogPath, "before createDisplay\n");
+    virtual_display = create_display(name_storage, false);
+    log_file_append_path(kDisplayCaptureLogPath, "after createDisplay ptr=%p\n", virtual_display.ptr);
+    append(report, "createDisplay: ptr=%p %s\n", virtual_display.ptr, virtual_display.ptr ? "OK" : "NULL");
+    if (!virtual_display.ptr) {
+        fclose(out);
+        if (name_constructed) string8_dtor(name_storage);
+        dlclose(libgui);
+        dlclose(libutils);
+        return -12;
+    }
+
+    // AMediaCodec_createInputSurface returns an ANativeWindow* that points to the
+    // ANativeWindow base subobject inside android::Surface. On this Android 11
+    // libmediandk build, disassembly shows the returned pointer is Surface+0x10:
+    //   new Surface(...) -> *outWindow = surface_object + 0x10
+    // Calling android::Surface::getIGraphicBufferProducer() with the raw
+    // ANativeWindow* crashes. Adjust back to the owning Surface object first.
+    const uintptr_t native_window_to_surface_delta = 0x10;
+    void* surface_this = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(window_owner.window) - native_window_to_surface_delta
+    );
+    append(report, "Surface this adjustment: window=%p surface_this=%p delta=0x%zx\n",
+           window_owner.window, surface_this, static_cast<size_t>(native_window_to_surface_delta));
+
+    log_file_append_path(kDisplayCaptureLogPath,
+        "before Surface::getIGraphicBufferProducer window=%p surface_this=%p delta=0x%zx\n",
+        window_owner.window, surface_this, static_cast<size_t>(native_window_to_surface_delta));
+    producer = surface_get_igbp(reinterpret_cast<const void*>(surface_this));
+    log_file_append_path(kDisplayCaptureLogPath, "after Surface::getIGraphicBufferProducer ptr=%p\n", producer.ptr);
+    append(report, "Surface::getIGraphicBufferProducer: ptr=%p %s\n", producer.ptr, producer.ptr ? "OK" : "NULL");
+    if (!producer.ptr) {
+        destroy_display(virtual_display);
+        fclose(out);
+        if (name_constructed) string8_dtor(name_storage);
+        dlclose(libgui);
+        dlclose(libutils);
+        return -13;
+    }
+
+    alignas(16) unsigned char txn_storage[16384];
+    init_raw_transaction_v10d(txn_storage, sizeof(txn_storage), txn_vtable, display_vector_vtable, sorted_vector_ctor, report);
+    void* txn = txn_storage;
+
+    log_file_append_path(kDisplayCaptureLogPath, "after Transaction v10d init\n");
+
+    if (txn_clear) {
+        log_file_append_path(kDisplayCaptureLogPath, "before Transaction::clear\n");
+        txn_clear(txn);
+        log_file_append_path(kDisplayCaptureLogPath, "after Transaction::clear\n");
+        append(report, "Transaction::clear: OK\n");
+    }
+
+    Rect32 source_rect{0, 0, width, height};
+    Rect32 display_rect{0, 0, width, height};
+    const uint32_t layer_stack = 0;
+
+    log_file_append_path(kDisplayCaptureLogPath, "before setDisplaySurface\n");
+    int32_t set_surface_status = txn_set_surface(txn, virtual_display, producer);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySurface status=%d\n", set_surface_status);
+    append(report, "setDisplaySurface: status=%d %s\n", set_surface_status, set_surface_status == 0 ? "OK" : "NONZERO");
+
+    log_file_append_path(kDisplayCaptureLogPath, "before setDisplayProjection\n");
+    int32_t set_projection_status = txn_set_projection(txn, virtual_display, 0, source_rect, display_rect);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayProjection status=%d\n", set_projection_status);
+    append(report, "setDisplayProjection: status=%d source=%dx%d dest=%dx%d\n", set_projection_status, width, height, width, height);
+
+    log_file_append_path(kDisplayCaptureLogPath, "before setDisplayLayerStack\n");
+    int32_t set_layer_stack_status = txn_set_layer_stack(txn, virtual_display, layer_stack);
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplayLayerStack status=%d\n", set_layer_stack_status);
+    append(report, "setDisplayLayerStack: status=%d layer_stack=%u\n", set_layer_stack_status, layer_stack);
+
+    log_file_append_path(kDisplayCaptureLogPath, "before setDisplaySize\n");
+    int32_t set_size_status = txn_set_size(txn, virtual_display, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    log_file_append_path(kDisplayCaptureLogPath, "after setDisplaySize status=%d\n", set_size_status);
+    append(report, "setDisplaySize: status=%d\n", set_size_status);
+
+    log_file_append_path(kDisplayCaptureLogPath, "before Transaction::apply\n");
+    txn_apply(txn, false);
+    log_file_append_path(kDisplayCaptureLogPath, "after Transaction::apply\n");
+    append(report, "Transaction::apply: OK\n");
+
+    bool output_eos_seen = false;
+    size_t encoded_bytes = 0;
+    int output_buffers = 0;
+    int codec_config_buffers = 0;
+    int key_buffers = 0;
+    const int drain_loops = fps * seconds * 4;
+    for (int i = 0; i < drain_loops; i++) {
+        int drain_status = drain_codec_output_to_file(
+            owner.codec, out, report, false, &output_eos_seen,
+            &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
+        );
+        if (drain_status != 0) {
+            fclose(out);
+            return -14;
+        }
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 250000000L / fps; // 4 drain polls per frame period.
+        nanosleep(&ts, nullptr);
+    }
+
+    log_file_append_path(kDisplayCaptureLogPath, "before destroyDisplay\n");
+    destroy_display(virtual_display);
+    log_file_append_path(kDisplayCaptureLogPath, "after destroyDisplay\n");
+    append(report, "destroyDisplay: OK\n");
+
+    log_file_append_path(kDisplayCaptureLogPath, "before signalEndOfInputStream\n");
+    st = media_api.signal_end_of_input_stream(owner.codec);
+    log_file_append_path(kDisplayCaptureLogPath, "after signalEndOfInputStream status=%d\n", static_cast<int>(st));
+    if (st == AMEDIA_OK) {
+        append(report, "signalEndOfInputStream: OK\n");
+        int wait_loops = 0;
+        while (!output_eos_seen && wait_loops < 200) {
+            int drain_status = drain_codec_output_to_file(
+                owner.codec, out, report, true, &output_eos_seen,
+                &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
+            );
+            if (drain_status != 0) {
+                fclose(out);
+                return -15;
+            }
+            wait_loops++;
+        }
+    } else {
+        append(report, "signalEndOfInputStream: FAIL/nonfatal status=%d\n", static_cast<int>(st));
+    }
+
+    fflush(out);
+    fclose(out);
+
+    log_file_append_path(kDisplayCaptureLogPath, "before cleanup skip-safe refs\n");
+    release_raw_sp(report, "producer", &producer, nullptr);
+    release_raw_sp(report, "virtual display", &virtual_display, nullptr);
+    if (name_constructed) {
+        string8_dtor(name_storage);
+    }
+    log_file_append_path(kDisplayCaptureLogPath, "after cleanup\n");
+
+    dlclose(libgui);
+    dlclose(libutils);
+
+    append(report, "\nresult:\n");
+    append(report, "  output_buffers=%d\n", output_buffers);
+    append(report, "  codec_config_buffers=%d\n", codec_config_buffers);
+    append(report, "  key_buffers=%d\n", key_buffers);
+    append(report, "  encoded_bytes=%zu\n", encoded_bytes);
+    append(report, "  output_eos_seen=%s\n", output_eos_seen ? "yes" : "no");
+    append(report, "  child_log=%s\n", kDisplayCaptureLogPath);
+
+    return encoded_bytes > 0 ? 0 : -16;
+}
+
+int native_display_capture_test_android(
+    const char* out_path,
+    int width,
+    int height,
+    int bit_rate,
+    int fps,
+    int seconds,
+    Buffer* report
+) {
+    append(report, "arda native display capture test parent v10d-transaction-init\n");
+    append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
+    append(report, "child_log=%s\n\n", kDisplayCaptureLogPath);
+
+    log_file_reset_path(kDisplayCaptureLogPath);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        append(report, "fork: FAIL errno=%d %s\n", errno, strerror(errno));
+        return -60;
+    }
+
+    if (pid == 0) {
+        char child_buf[64 * 1024];
+        child_buf[0] = '\0';
+        Buffer child_report{child_buf, sizeof(child_buf), 0};
+        int rc = native_display_capture_test_android_child(out_path, width, height, bit_rate, fps, seconds, &child_report);
+        log_file_append_path(kDisplayCaptureLogPath, "\nchild report:\n%s\n", child_buf);
+        log_file_append_path(kDisplayCaptureLogPath, "\nchild returned rc=%d\n", rc);
+        _exit(rc == 0 ? 0 : 100);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited < 0) {
+        append(report, "waitpid: FAIL errno=%d %s\n", errno, strerror(errno));
+        append(report, "\nchild log so far:\n");
+        append_file_to_report(report, kDisplayCaptureLogPath);
+        return -61;
+    }
+
+    append(report, "child_status_raw=%d\n", status);
+    if (WIFEXITED(status)) {
+        append(report, "child_exited code=%d\n", WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        append(report, "child_signaled signal=%d\n", WTERMSIG(status));
+    }
+
+    append(report, "\nchild log:\n");
+    append_file_to_report(report, kDisplayCaptureLogPath);
+
+    append(report, "\nmeaning:\n");
+    append(report, "  This attempts actual virtual-display routing into the MediaCodec input surface.\n");
+    append(report, "  If it crashes, the child log shows the last private ABI call completed.\n");
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -62;
+}
+
 #endif // __ANDROID__
 
 } // namespace
@@ -1001,6 +1452,9 @@ extern "C" int arda_native_display_probe(char* out, size_t out_len) {
 
     append(&b, "\nlibgui surface/mirror/capture symbols:\n");
     probe_symbol(&b, "libgui.so", "_ZNK7android14SurfaceControl25getIGraphicBufferProducerEv");
+    probe_symbol(&b, "libgui.so", "_ZNK7android7Surface25getIGraphicBufferProducerEv");
+    probe_symbol(&b, "libgui.so", "_ZTVN7android21SurfaceComposerClient11TransactionE");
+    probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient11Transaction5clearEv");
     probe_symbol(&b, "libgui.so", "_ZNK7android14SurfaceControl10getSurfaceEv");
     probe_symbol(&b, "libgui.so", "_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEb");
     probe_symbol(&b, "libgui.so", "_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE");
@@ -1026,6 +1480,29 @@ extern "C" int arda_native_display_active_probe(char* out, size_t out_len) {
     return native_display_active_probe_android(&b);
 #else
     append(&b, "native display active probe is only available on Android targets\n");
+    return -99;
+#endif
+}
+
+
+
+extern "C" int arda_native_display_capture_test(
+    const char* out_path,
+    int width,
+    int height,
+    int bit_rate,
+    int fps,
+    int seconds,
+    char* report,
+    size_t report_len
+) {
+    if (!report || report_len == 0) return -1;
+    report[0] = '\0';
+    Buffer b{report, report_len, 0};
+#if defined(__ANDROID__)
+    return native_display_capture_test_android(out_path, width, height, bit_rate, fps, seconds, &b);
+#else
+    append(&b, "native display capture test is only available on Android targets\n");
     return -99;
 #endif
 }

@@ -35,6 +35,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-surface-encoder-test" => native_surface_encoder_test(args.collect()),
         "native-display-probe" => native_display_probe(),
         "native-display-active-probe" => native_display_active_probe(),
+        "native-display-capture-test" => native_display_capture_test(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -72,6 +73,9 @@ Commands:
 
   native-display-active-probe
       Actively calls a minimal subset of private SurfaceComposerClient APIs: getInternalDisplayToken, createDisplay, destroyDisplay.
+
+  native-display-capture-test [--size 320x240] [--bit-rate 1000000] [--fps 15] [--seconds 3] [--out PATH]
+      Attempts to route a private SurfaceComposerClient virtual display into the MediaCodec input surface and writes encoded H264 to PATH.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -305,6 +309,24 @@ fn native_surface_encoder_test(argv: Vec<String>) -> Result<(), Box<dyn std::err
         args.seconds,
     )
     .map_err(|err| format!("native surface encoder test failed: {err}"))?;
+    print!("{report}");
+    Ok(())
+}
+
+fn native_display_capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = parse_native_encoder_args(argv)?;
+    if args.out == "/sdcard/arda-native-encoder-test.h264" {
+        args.out = String::from("/sdcard/arda-native-display-capture-test.h264");
+    }
+    let report = native::display_capture_test(
+        &args.out,
+        args.width,
+        args.height,
+        args.bit_rate,
+        args.fps,
+        args.seconds,
+    )
+    .map_err(|err| format!("native display capture test failed: {err}"))?;
     print!("{report}");
     Ok(())
 }

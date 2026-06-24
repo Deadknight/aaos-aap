@@ -61,3 +61,18 @@ If native-display-capture-test logs do not show the v10c marker or `Surface this
 - This allows live native display capture without `screenrecord`:
   `SurfaceComposer virtual display -> MediaCodec input surface -> H264 stdout -> mpv`.
 - Native reports are suppressed from stdout in live mode; use `/data/local/tmp/arda-display-capture-test.log` for diagnostics.
+
+
+## v12 input test
+
+Adds `input-test` using `/dev/uinput` temporary virtual direct touchscreen. Test with root:
+
+```bash
+adb shell su 0 /data/local/tmp/arda-senderd input-test --size 1280x720 tap 300 300
+adb shell su 0 /data/local/tmp/arda-senderd input-test --size 1280x720 swipe 200 500 900 500 --duration-ms 300 --steps 20
+```
+
+### v12b input parser fix
+
+- `input-test` now accepts `--duration-ms` and `--steps` either before or after the action coordinates.
+- `swipe` default duration is now 300 ms; `tap` default remains 80 ms.

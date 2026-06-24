@@ -36,6 +36,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-display-probe" => native_display_probe(),
         "native-display-active-probe" => native_display_active_probe(),
         "native-display-capture-test" => native_display_capture_test(args.collect()),
+        "input-test" => input_test(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -76,6 +77,10 @@ Commands:
 
   native-display-capture-test [--size 1280x720] [--bit-rate 6000000] [--fps 30] [--seconds 10] [--out PATH|-]
       Routes a private SurfaceComposerClient virtual display into the MediaCodec input surface and writes encoded H264 to PATH or stdout.
+
+  input-test [--size 1280x720] tap X Y [--duration-ms 80]
+  input-test [--size 1280x720] swipe X1 Y1 X2 Y2 [--duration-ms 300] [--steps 20]
+      Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -401,6 +406,113 @@ fn parse_size_i32(s: &str) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         return Err("size must look like WIDTHxHEIGHT".into());
     };
     Ok((w.parse::<i32>()?, h.parse::<i32>()?))
+}
+
+fn input_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = parse_input_test_args(argv)?;
+    let report = input::run_input_test(config)?;
+    print!("{report}");
+    Ok(())
+}
+
+fn parse_input_test_args(argv: Vec<String>) -> Result<input::InputTestConfig, Box<dyn std::error::Error>> {
+    let mut width = 1280i32;
+    let mut height = 720i32;
+    let mut duration_override: Option<u64> = None;
+    let mut steps = 20u32;
+
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--size" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--size requires value")?;
+                let parsed = parse_size_i32(value)?;
+                width = parsed.0;
+                height = parsed.1;
+                i += 1;
+            }
+            "--duration-ms" => {
+                i += 1;
+                duration_override = Some(argv.get(i).ok_or("--duration-ms requires value")?.parse::<u64>()?);
+                i += 1;
+            }
+            "--steps" => {
+                i += 1;
+                steps = argv.get(i).ok_or("--steps requires value")?.parse::<u32>()?;
+                i += 1;
+            }
+            "tap" | "swipe" => break,
+            other => return Err(format!("unknown input-test arg before action: {other}").into()),
+        }
+    }
+
+    let action_name = argv.get(i).map(String::as_str).ok_or("input-test requires action: tap or swipe")?;
+
+    let action = match action_name {
+        "tap" => {
+            let x = argv.get(i + 1).ok_or("tap requires X")?.parse::<i32>()?;
+            let y = argv.get(i + 2).ok_or("tap requires Y")?.parse::<i32>()?;
+            let mut j = i + 3;
+            while j < argv.len() {
+                match argv[j].as_str() {
+                    "--duration-ms" => {
+                        j += 1;
+                        duration_override = Some(argv.get(j).ok_or("--duration-ms requires value")?.parse::<u64>()?);
+                    }
+                    other => return Err(format!("unknown tap arg after coordinates: {other}").into()),
+                }
+                j += 1;
+            }
+            input::InputAction::Tap { x, y, duration_ms: duration_override.unwrap_or(80) }
+        }
+        "swipe" => {
+            let x1 = argv.get(i + 1).ok_or("swipe requires X1")?.parse::<i32>()?;
+            let y1 = argv.get(i + 2).ok_or("swipe requires Y1")?.parse::<i32>()?;
+            let x2 = argv.get(i + 3).ok_or("swipe requires X2")?.parse::<i32>()?;
+            let y2 = argv.get(i + 4).ok_or("swipe requires Y2")?.parse::<i32>()?;
+            let mut j = i + 5;
+            while j < argv.len() {
+                match argv[j].as_str() {
+                    "--duration-ms" => {
+                        j += 1;
+                        duration_override = Some(argv.get(j).ok_or("--duration-ms requires value")?.parse::<u64>()?);
+                    }
+                    "--steps" => {
+                        j += 1;
+                        steps = argv.get(j).ok_or("--steps requires value")?.parse::<u32>()?;
+                    }
+                    other => return Err(format!("unknown swipe arg after coordinates: {other}").into()),
+                }
+                j += 1;
+            }
+            input::InputAction::Swipe {
+                x1,
+                y1,
+                x2,
+                y2,
+                duration_ms: duration_override.unwrap_or(300),
+                steps,
+            }
+        }
+        other => return Err(format!("unknown input-test action: {other}").into()),
+    };
+
+    if width <= 0 || height <= 0 {
+        return Err("--size must be positive WIDTHxHEIGHT".into());
+    }
+    let duration_ms = match action {
+        input::InputAction::Tap { duration_ms, .. } => duration_ms,
+        input::InputAction::Swipe { duration_ms, .. } => duration_ms,
+    };
+    if duration_ms > 30_000 {
+        return Err("--duration-ms must be <= 30000".into());
+    }
+    if steps == 0 || steps > 240 {
+        return Err("--steps must be 1..240".into());
+    }
+
+    Ok(input::InputTestConfig { width, height, action })
 }
 
 fn nal_info(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

@@ -38,6 +38,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-display-capture-test" => native_display_capture_test(args.collect()),
         "native-capture" => native_capture(args.collect()),
         "input-test" => input_test(args.collect()),
+        "aap-tcp-probe" => aap_tcp_probe(args.collect()),
+        "aap-frame-probe" => aap_frame_probe(args.collect()),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -85,6 +87,12 @@ Commands:
   input-test [--size 1280x720] tap X Y [--duration-ms 80]
   input-test [--size 1280x720] swipe X1 Y1 X2 Y2 [--duration-ms 300] [--steps 20]
       Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
+
+  aap-tcp-probe [--addr 0.0.0.0:5277] [--dump PATH] [--timeout-ms 60000]
+      Raw TCP probe: accepts one client and hex-dumps incoming bytes.
+
+  aap-frame-probe [--addr 0.0.0.0:5277] [--dump PATH] [--timeout-ms 60000] [--max-frames 256]
+      AAP frame probe: parses AA channel/flags/length/final_length framing and names plaintext control messages.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -597,6 +605,163 @@ fn parse_input_test_args(argv: Vec<String>) -> Result<input::InputTestConfig, Bo
     }
 
     Ok(input::InputTestConfig { width, height, action })
+}
+
+
+#[derive(Debug)]
+struct AapTcpProbeArgs {
+    addr: String,
+    dump: Option<PathBuf>,
+    timeout_ms: u64,
+    max_bytes: usize,
+}
+
+fn aap_tcp_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aap_tcp_probe_args(argv)?;
+    aap::tcp_probe(aap::TcpProbeConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+    })?;
+    Ok(())
+}
+
+fn parse_aap_tcp_probe_args(argv: Vec<String>) -> Result<AapTcpProbeArgs, Box<dyn std::error::Error>> {
+    let mut addr = String::from("0.0.0.0:5277");
+    let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tcp.log"));
+    let mut timeout_ms = 60_000u64;
+    let mut max_bytes = 1024usize * 1024usize;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--addr" | "--listen" => {
+                i += 1;
+                addr = argv.get(i).ok_or("--addr requires value")?.clone();
+            }
+            "--dump" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--dump requires value")?;
+                dump = if value == "-" || value == "none" {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
+            }
+            "--max-bytes" => {
+                i += 1;
+                max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
+            }
+            other => return Err(format!("unknown aap-tcp-probe arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT".into());
+    }
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".into());
+    }
+    if max_bytes == 0 {
+        return Err("--max-bytes must be positive".into());
+    }
+
+    Ok(AapTcpProbeArgs {
+        addr,
+        dump,
+        timeout_ms,
+        max_bytes,
+    })
+}
+
+
+#[derive(Debug)]
+struct AapFrameProbeArgs {
+    addr: String,
+    dump: Option<PathBuf>,
+    timeout_ms: u64,
+    max_bytes: usize,
+    max_frames: usize,
+}
+
+fn aap_frame_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aap_frame_probe_args(argv)?;
+    aap::frame_probe(aap::FrameProbeConfig {
+        addr: args.addr,
+        dump_path: args.dump,
+        timeout_ms: args.timeout_ms,
+        max_bytes: args.max_bytes,
+        max_frames: args.max_frames,
+    })?;
+    Ok(())
+}
+
+fn parse_aap_frame_probe_args(argv: Vec<String>) -> Result<AapFrameProbeArgs, Box<dyn std::error::Error>> {
+    let mut addr = String::from("0.0.0.0:5277");
+    let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-frames.log"));
+    let mut timeout_ms = 60_000u64;
+    let mut max_bytes = 4usize * 1024usize * 1024usize;
+    let mut max_frames = 256usize;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--addr" | "--listen" => {
+                i += 1;
+                addr = argv.get(i).ok_or("--addr requires value")?.clone();
+            }
+            "--dump" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--dump requires value")?;
+                dump = if value == "-" || value == "none" {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                };
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
+            }
+            "--max-bytes" => {
+                i += 1;
+                max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
+            }
+            "--max-frames" => {
+                i += 1;
+                max_frames = argv.get(i).ok_or("--max-frames requires value")?.parse::<usize>()?;
+            }
+            other => return Err(format!("unknown aap-frame-probe arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT".into());
+    }
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".into());
+    }
+    if max_bytes == 0 {
+        return Err("--max-bytes must be positive".into());
+    }
+    if max_frames == 0 {
+        return Err("--max-frames must be positive".into());
+    }
+
+    Ok(AapFrameProbeArgs {
+        addr,
+        dump,
+        timeout_ms,
+        max_bytes,
+        max_frames,
+    })
 }
 
 fn nal_info(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

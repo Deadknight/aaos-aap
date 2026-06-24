@@ -83,3 +83,15 @@ adb shell su 0 /data/local/tmp/arda-senderd input-test --size 1280x720 swipe 200
 - `native-capture --out -` is binary-clean raw Annex-B H264 for `adb exec-out | mpv`.
 - `native-capture --seconds 0` means run until the process is killed; this removes the old finite-test-only behavior for live work.
 - Transaction setter logging now treats setters as returning `Transaction&`/pointer-like values instead of fake `status_t` values.
+
+## v14 - TCP transport probe
+
+- Added `aap-tcp-probe` as the first AAP/DHU transport step.
+- It accepts one TCP client and hex-dumps incoming bytes to stdout and `/data/local/tmp/arda-aap-tcp.log`.
+- This validates binding/listening/connectivity before adding AA message framing, version negotiation, and channel setup.
+
+### v15
+- Added `aap-frame-probe`.
+- Parses AA frame header: channel, flags, payload length, optional final_length on FIRST frames.
+- Names plaintext control messages: VERSION, ENCAPSULATED_SSL, SERVICE_DISCOVERY, CHANNEL_OPEN.
+- Next: add frame writer + version request/response + TLS encapsulation.

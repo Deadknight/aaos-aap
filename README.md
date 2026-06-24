@@ -273,3 +273,48 @@ adb exec-out /data/local/tmp/arda-senderd native-capture \
 ```
 
 Use `--seconds 0` for continuous capture. Use a positive value for finite file tests.
+
+## v14 - AAP TCP probe
+
+Adds `aap-tcp-probe`, the first transport scaffold for DHU/TCP work. It is not the Android Auto protocol yet; it only binds a TCP port, accepts one client, and hex-dumps received bytes.
+
+Run on AAOS:
+
+```bash
+adb shell /data/local/tmp/arda-senderd aap-tcp-probe \
+  --addr 0.0.0.0:5277 \
+  --dump /data/local/tmp/arda-aap-tcp.log \
+  --timeout-ms 60000
+```
+
+From the Mac in another terminal:
+
+```bash
+printf '\x00\x01\x02hello-arda' | nc 192.168.2.2 5277
+```
+
+Then inspect:
+
+```bash
+adb shell cat /data/local/tmp/arda-aap-tcp.log
+```
+
+## v15 AAP frame probe
+
+`aap-frame-probe` accepts one TCP client and parses Android Auto packet framing:
+
+```bash
+adb shell /data/local/tmp/arda-senderd aap-frame-probe \
+  --addr 0.0.0.0:5277 \
+  --dump /data/local/tmp/arda-aap-frames.log \
+  --timeout-ms 60000
+```
+
+Smoke test from Mac:
+
+```bash
+printf '\x00\x03\x00\x06\x00\x00\x00\x06\x00\x01\x00\x01\x00\x07' | nc 192.168.2.2 5277
+adb shell cat /data/local/tmp/arda-aap-frames.log
+```
+
+Expected message hint: `MESSAGE_VERSION_REQUEST 1.7`.

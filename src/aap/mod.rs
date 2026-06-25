@@ -967,6 +967,7 @@ pub struct TlsHandshakeProbeConfig {
     pub video_wm_size_mode: String,
     pub video_wm_density_mode: String,
     pub video_wm_settle_ms: u64,
+    pub video_start_timing: bool,
     pub video_width: i32,
     pub video_height: i32,
     pub video_bit_rate: i32,
@@ -1003,6 +1004,7 @@ impl Default for TlsHandshakeProbeConfig {
             video_wm_size_mode: "stream".to_string(),
             video_wm_density_mode: "density".to_string(),
             video_wm_settle_ms: 1200,
+            video_start_timing: false,
             video_width: 800,
             video_height: 480,
             video_bit_rate: 2_500_000,
@@ -1625,7 +1627,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         log_line(
             &mut dump,
             &format!(
-                "video_native=true size={}x{} bit_rate={} fps={} density={} frame_limit={} auto_config={} policy={} apply_wm={} wm_size_mode={} wm_density_mode={} wm_settle_ms={}",
+                "video_native=true size={}x{} bit_rate={} fps={} density={} frame_limit={} auto_config={} policy={} apply_wm={} wm_size_mode={} wm_density_mode={} wm_settle_ms={} video_start_timing={}",
                 config.video_width,
                 config.video_height,
                 config.video_bit_rate,
@@ -1637,7 +1639,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 config.video_apply_wm_config,
                 config.video_wm_size_mode,
                 config.video_wm_density_mode,
-                config.video_wm_settle_ms
+                config.video_wm_settle_ms,
+                config.video_start_timing
             ),
         )?;
     } else {
@@ -1746,6 +1749,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             wm_size_mode: config.video_wm_size_mode.clone(),
             wm_density_mode: config.video_wm_density_mode.clone(),
             wm_settle_ms: config.video_wm_settle_ms,
+            startup_timing: config.video_start_timing,
         })))
     } else {
         match &config.video_file_path {
@@ -2643,8 +2647,16 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     )?;
                     tx_ssl_frames += tx_count;
                     video_start_sent = true;
+                    if let Some(sender) = video_sender.as_mut() {
+                        sender.mark_media_start_sent();
+                    }
                     println!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
                     log_line(&mut dump, &format!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                    if config.video_start_timing {
+                        let line = "VIDEO_START_LATENCY media_start_sent_ms=0";
+                        println!("{line}");
+                        log_line(&mut dump, line)?;
+                    }
 
                     if !video_pump_timeout_enabled {
                         stream.set_read_timeout(Some(Duration::from_millis(20)))?;
@@ -2679,7 +2691,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
                     if session_id == video_session_id {
                         if let Some(sender) = video_sender.as_mut() {
-                            sender.on_ack(ack_value);
+                            if let Some(line) = sender.on_ack(ack_value) {
+                                println!("{line}");
+                                log_line(&mut dump, &line)?;
+                            }
                             let sent = sender.send_available(
                                 &mut stream,
                                 &mut tls,
@@ -2759,9 +2774,18 @@ enum VideoSender {
 }
 
 impl VideoSender {
-    fn on_ack(&mut self, ack_value: u32) {
+    fn mark_media_start_sent(&mut self) {
+        if let Self::Live(sender) = self {
+            sender.mark_media_start_sent();
+        }
+    }
+
+    fn on_ack(&mut self, ack_value: u32) -> Option<String> {
         match self {
-            Self::File(sender) => sender.on_ack(ack_value),
+            Self::File(sender) => {
+                sender.on_ack(ack_value);
+                None
+            }
             Self::Live(sender) => sender.on_ack(ack_value),
         }
     }
@@ -2975,6 +2999,7 @@ struct VideoLiveConfig {
     wm_size_mode: String,
     wm_density_mode: String,
     wm_settle_ms: u64,
+    startup_timing: bool,
 }
 
 #[derive(Debug)]
@@ -2999,6 +3024,12 @@ struct VideoLiveSender {
     ended: bool,
     wm_applied: bool,
     wm_settled: bool,
+    created_at: Instant,
+    media_start_at: Option<Instant>,
+    child_spawned_at: Option<Instant>,
+    first_stdout_at: Option<Instant>,
+    first_video_data_sent_at: Option<Instant>,
+    first_ack_at: Option<Instant>,
 }
 
 impl VideoLiveSender {
@@ -3017,16 +3048,44 @@ impl VideoLiveSender {
             ended: false,
             wm_applied: false,
             wm_settled: false,
+            created_at: Instant::now(),
+            media_start_at: None,
+            child_spawned_at: None,
+            first_stdout_at: None,
+            first_video_data_sent_at: None,
+            first_ack_at: None,
         }
     }
 
-    fn on_ack(&mut self, ack_value: u32) {
+    fn mark_media_start_sent(&mut self) {
+        if self.media_start_at.is_none() {
+            self.media_start_at = Some(Instant::now());
+        }
+    }
+
+    fn ms_since_media_start(&self, at: Instant) -> u128 {
+        self.media_start_at
+            .map(|start| at.saturating_duration_since(start).as_millis())
+            .unwrap_or_else(|| at.saturating_duration_since(self.created_at).as_millis())
+    }
+
+    fn on_ack(&mut self, ack_value: u32) -> Option<String> {
         // In this DHU trace Ack.ack is reported as 1 for each acknowledged
         // media buffer, not as a monotonically increasing cumulative counter.
         // Treat every ACK as releasing at least one in-flight DATA frame.
         let released = ack_value.max(1);
         self.highest_ack = self.highest_ack.max(ack_value);
         self.unacked = self.unacked.saturating_sub(released);
+        if self.config.startup_timing && self.first_video_data_sent_at.is_some() && self.first_ack_at.is_none() {
+            let now = Instant::now();
+            self.first_ack_at = Some(now);
+            return Some(format!(
+                "VIDEO_START_LATENCY first_ack_ms={} ack={}",
+                self.ms_since_media_start(now),
+                ack_value
+            ));
+        }
+        None
     }
 
     fn wm_density_for_selection(&self, selection: &proto::VideoConfigSelection) -> u32 {
@@ -3182,8 +3241,18 @@ impl VideoLiveSender {
         );
         println!("{line}");
         log_line(dump, &line)?;
+        let settle_start = Instant::now();
         thread::sleep(Duration::from_millis(self.config.wm_settle_ms));
         self.wm_settled = true;
+        if self.config.startup_timing {
+            let line = format!(
+                "VIDEO_START_LATENCY wm_settle_done_ms={} wait_ms={}",
+                self.ms_since_media_start(Instant::now()),
+                settle_start.elapsed().as_millis()
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
         Ok(())
     }
 
@@ -3219,6 +3288,14 @@ impl VideoLiveSender {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture child: {err}")))?;
+
+        let child_spawned_at = Instant::now();
+        self.child_spawned_at = Some(child_spawned_at);
+        if self.config.startup_timing {
+            let line = format!("VIDEO_START_LATENCY child_spawned_ms={}", self.ms_since_media_start(child_spawned_at));
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
 
         let Some(mut stdout) = child.stdout.take() else {
             let _ = child.kill();
@@ -3324,8 +3401,15 @@ impl VideoLiveSender {
 
             match event {
                 LiveNalEvent::Status(line) => {
-                    println!("{line}");
-                    log_line(dump, &line)?;
+                    if self.config.startup_timing && line.starts_with("VIDEO_NATIVE stdout first read") && self.first_stdout_at.is_none() {
+                        let now = Instant::now();
+                        self.first_stdout_at = Some(now);
+                        let timing = format!("VIDEO_START_LATENCY first_stdout_ms={} {}", self.ms_since_media_start(now), line);
+                        println!("{timing}");
+                        log_line(dump, &timing)?;
+                    } else {
+                        session_log(dump, LOG_SUMMARY, &line)?;
+                    }
                 }
                 LiveNalEvent::Nal(NalType::Sps, bytes) | LiveNalEvent::Nal(NalType::Pps, bytes) => {
                     self.codec_config.extend_from_slice(&bytes);
@@ -3361,6 +3445,12 @@ impl VideoLiveSender {
                                 dump,
                                 "MEDIA_MESSAGE_CODEC_CONFIG",
                             )?;
+                            if self.config.startup_timing {
+                                let now = Instant::now();
+                                let line = format!("VIDEO_START_LATENCY codec_config_sent_ms={} bytes={}", self.ms_since_media_start(now), self.codec_config.len());
+                                println!("{line}");
+                                log_line(dump, &line)?;
+                            }
                             self.codec_config.clear();
                         }
                         self.codec_config_sent = true;
@@ -3400,6 +3490,19 @@ impl VideoLiveSender {
                         dump,
                         "MEDIA_MESSAGE_DATA",
                     )?;
+                    if self.config.startup_timing && self.first_video_data_sent_at.is_none() {
+                        let now = Instant::now();
+                        self.first_video_data_sent_at = Some(now);
+                        let line = format!(
+                            "VIDEO_START_LATENCY first_video_data_sent_ms={} frame={} bytes={} pts_us={}",
+                            self.ms_since_media_start(now),
+                            self.frames_sent,
+                            bytes.len(),
+                            pts_us
+                        );
+                        println!("{line}");
+                        log_line(dump, &line)?;
+                    }
                     self.frames_sent += 1;
                     self.unacked += 1;
                 }

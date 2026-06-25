@@ -120,12 +120,12 @@ Commands:
   aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
       Full AAP session probe: service discovery, video channel open/setup/start, ping responses, optional H264 file send.
 
-  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200]
+  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start]
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
   aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs.
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms and enable startup timing logs.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1038,6 +1038,7 @@ struct AapTlsHandshakeProbeArgs {
     video_wm_size_mode: String,
     video_wm_density_mode: String,
     video_wm_settle_ms: u64,
+    video_start_timing: bool,
     video_width: i32,
     video_height: i32,
     video_bit_rate: i32,
@@ -1074,6 +1075,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         video_wm_size_mode: args.video_wm_size_mode,
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
+        video_start_timing: args.video_start_timing,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1128,6 +1130,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         video_wm_size_mode: args.video_wm_size_mode,
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
+        video_start_timing: args.video_start_timing,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1173,6 +1176,7 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         video_wm_size_mode: args.video_wm_size_mode,
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
+        video_start_timing: args.video_start_timing,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1209,6 +1213,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut video_wm_size_mode = String::from("stream");
     let mut video_wm_density_mode = String::from("density");
     let mut video_wm_settle_ms = 1200u64;
+    let mut video_start_timing = false;
     let mut video_width = 800i32;
     let mut video_height = 480i32;
     let mut video_bit_rate = 2_500_000i32;
@@ -1287,6 +1292,19 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--wm-settle-ms" | "--video-wm-settle-ms" => {
                 i += 1;
                 video_wm_settle_ms = argv.get(i).ok_or("--wm-settle-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--fast-start" | "--video-fast-start" => {
+                video_wm_settle_ms = 300;
+                video_start_timing = true;
+            }
+            "--no-fast-start" | "--safe-start" => {
+                video_wm_settle_ms = 1200;
+            }
+            "--video-start-timing" | "--startup-timing" | "--latency-log" | "--latency-logs" => {
+                video_start_timing = true;
+            }
+            "--no-video-start-timing" | "--no-startup-timing" | "--no-latency-log" => {
+                video_start_timing = false;
             }
             "--video-size" | "--live-size" => {
                 i += 1;
@@ -1466,6 +1484,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         video_wm_size_mode,
         video_wm_density_mode,
         video_wm_settle_ms,
+        video_start_timing,
         video_width,
         video_height,
         video_bit_rate,

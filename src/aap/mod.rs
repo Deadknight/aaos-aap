@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
+use crate::input::{self, TouchInjectAction, TouchInjector};
 
 pub mod proto;
 mod fragment;
@@ -870,6 +871,11 @@ pub struct TlsHandshakeProbeConfig {
     pub video_bit_rate: i32,
     pub video_fps: i32,
     pub video_density: u32,
+    pub input_open: bool,
+    pub input_key_binding: bool,
+    pub input_inject: bool,
+    pub input_inject_mode: String,
+    pub input_key_inject: bool,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -898,6 +904,11 @@ impl Default for TlsHandshakeProbeConfig {
             video_bit_rate: 2_500_000,
             video_fps: 30,
             video_density: 160,
+            input_open: false,
+            input_key_binding: true,
+            input_inject: false,
+            input_inject_mode: "uinput".to_string(),
+            input_key_inject: false,
         }
     }
 }
@@ -1472,6 +1483,17 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     } else {
         log_line(&mut dump, "video_native=false")?;
     }
+    log_line(
+        &mut dump,
+        &format!(
+            "input_open={} input_key_binding={} input_inject={} input_inject_mode={} input_key_inject={}",
+            config.input_open,
+            config.input_key_binding,
+            config.input_inject,
+            config.input_inject_mode,
+            config.input_key_inject
+        ),
+    )?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
 
@@ -1532,6 +1554,16 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut service_request_sent = false;
     let mut channel_open_sent = false;
     let mut selected_video_service_id: Option<i32> = None;
+    let mut selected_input_service_id: Option<i32> = None;
+    let mut selected_input_source: Option<proto::InputSourceSelection> = None;
+    let mut selected_video_config_for_input: Option<proto::VideoConfigSelection> = None;
+    let mut input_touch_map: Option<InputTouchMap> = None;
+    let mut input_touch_injector: Option<TouchInjector> = None;
+    let mut input_touch_inject_events = 0usize;
+    let mut input_key_inject_events = 0usize;
+    let mut input_channel_open_sent = false;
+    let mut input_channel_opened = false;
+    let mut input_key_binding_sent = false;
     let mut video_channel_opened = false;
     let mut video_setup_sent = false;
     let mut video_start_sent = false;
@@ -1763,8 +1795,52 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                         log_line(&mut dump, line)?;
                     }
 
+                    let input_candidate = summary.input_source.clone();
+                    if let Some(input) = input_candidate.as_ref() {
+                        let touchscreens = input
+                            .touchscreens
+                            .iter()
+                            .map(|ts| format!("#{}:{}x{}:{}:secondary={}", ts.index, ts.width, ts.height, ts.type_name, ts.is_secondary))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let touchpads = input
+                            .touchpads
+                            .iter()
+                            .map(|tp| format!("#{}:{}x{}:phys={}x{}:nav={}:abs={}:tap={}:sens={}", tp.index, tp.width, tp.height, tp.physical_width, tp.physical_height, tp.ui_navigation, tp.ui_absolute, tp.tap_as_select, tp.sensitivity))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let keycodes = input
+                            .keycodes_supported
+                            .iter()
+                            .map(|code| format!("{}({})", code, proto::keycode_name(*code as u32)))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        println!(
+                            "selected input InputSourceService id={} display_id={} touchscreens=[{}] touchpads=[{}] keycodes=[{}] feedback=[{}]",
+                            input.service_id,
+                            input.display_id,
+                            touchscreens,
+                            touchpads,
+                            keycodes,
+                            input.feedback_events_supported.join(",")
+                        );
+                        log_line(
+                            &mut dump,
+                            &format!(
+                                "selected input InputSourceService id={} display_id={} touchscreens=[{}] touchpads=[{}] keycodes=[{}] feedback=[{}]",
+                                input.service_id,
+                                input.display_id,
+                                touchscreens,
+                                touchpads,
+                                keycodes,
+                                input.feedback_events_supported.join(",")
+                            ),
+                        )?;
+                    }
+
                     if let Some(video) = summary.video_media_sink {
                         selected_video_service_id = Some(video.service_id);
+                        selected_video_config_for_input = video.selected_video_config.clone();
                         println!(
                             "selected video MediaSinkService id={} type={} display_id={} display_type={} video_configs={} first_config={:?}",
                             video.service_id,
@@ -1881,15 +1957,291 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                         log_line(&mut dump, "SERVICE_DISCOVERY_RESPONSE has no video MediaSinkService candidate yet")?;
                         channel_open_sent = true;
                     }
+                    if config.input_open {
+                        if let Some(input) = input_candidate.clone() {
+                            selected_input_service_id = Some(input.service_id);
+                            selected_input_source = Some(input.clone());
+                            let map = InputTouchMap::from_config(&config, Some(&input), selected_video_config_for_input.as_ref());
+                            let line = format!(
+                                "INPUT_TOUCH_MAP source={}x{} target={}x{} mode={} offset={}x{} stream={}x{}",
+                                map.source_width,
+                                map.source_height,
+                                map.target_width,
+                                map.target_height,
+                                map.mode.as_str(),
+                                map.x_offset,
+                                map.y_offset,
+                                map.stream_width,
+                                map.stream_height
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+                            input_touch_map = Some(map.clone());
+
+                            // Create the uinput device as soon as the SDR/input geometry is
+                            // known, not on the first DOWN. Android InputReader may need a
+                            // moment to classify and attach the new direct-touch device to the
+                            // default display; creating it lazily on the first user gesture can
+                            // lose the beginning of a drag.
+                            if config.input_inject
+                                && !is_shell_touch_inject_mode(&config.input_inject_mode)
+                                && input_touch_injector.is_none()
+                            {
+                                match TouchInjector::create(map.target_width, map.target_height) {
+                                    Ok((injector, report)) => {
+                                        for line in report.lines() {
+                                            let line = format!("INPUT_TOUCH_INJECTOR_PREPARE {line}");
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                        input_touch_injector = Some(injector);
+                                    }
+                                    Err(err) => {
+                                        let line = format!("INPUT_TOUCH_INJECT prepare failed: {err}");
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                    }
+                                }
+                            }
+                            let control_payload = proto::build_channel_open_request_control_payload(input.service_id, 0)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            log_line(&mut dump, &format!("tx Input ChannelOpenRequest plaintext bytes={} service_id={} priority=0", control_payload.len(), input.service_id))?;
+                            if let Some(dump) = dump.as_mut() {
+                                let pseudo = AapFrame {
+                                    channel: input.service_id as u8,
+                                    flags: FLAG_CONTROL | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                                    final_length: None,
+                                    payload: control_payload.clone(),
+                                };
+                                describe_frame(0, 0, peer, &pseudo, dump)?;
+                                dump.flush()?;
+                            }
+
+                            let tx_count = write_encrypted_plaintext_fragmented_with_flags(
+                                &mut stream,
+                                &mut tls,
+                                input.service_id as u8,
+                                FLAG_CONTROL,
+                                &control_payload,
+                                &mut dump,
+                                "INPUT_CHANNEL_OPEN_REQUEST",
+                            )?;
+                            input_channel_open_sent = true;
+                            tx_ssl_frames += tx_count;
+                            println!("tx encrypted INPUT_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} flags=ENCRYPTED|CONTROL", input.service_id as u8, input.service_id);
+                            log_line(&mut dump, &format!("tx encrypted INPUT_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} flags=ENCRYPTED|CONTROL", input.service_id as u8, input.service_id))?;
+                        } else {
+                            println!("INPUT_OPEN requested but SDR has no InputSourceService candidate");
+                            log_line(&mut dump, "INPUT_OPEN requested but SDR has no InputSourceService candidate")?;
+                        }
+                    }
                 }
             }
 
             if is_control_message(&plaintext, 0x0008) {
                 if selected_video_service_id.map(|id| id as u8) == Some(frame.channel) {
                     video_channel_opened = true;
+                    println!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}");
+                    log_line(&mut dump, &format!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}"))?;
                 }
-                println!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}");
-                log_line(&mut dump, &format!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}"))?;
+                if selected_input_service_id.map(|id| id as u8) == Some(frame.channel) {
+                    input_channel_opened = true;
+                    println!("INPUT_CHANNEL_OPEN_RESPONSE observed for selected_input_service_id={selected_input_service_id:?} opened={input_channel_opened}");
+                    log_line(&mut dump, &format!("INPUT_CHANNEL_OPEN_RESPONSE observed for selected_input_service_id={selected_input_service_id:?} opened={input_channel_opened}"))?;
+                }
+            }
+
+            if input_channel_opened
+                && config.input_key_binding
+                && !input_key_binding_sent
+                && selected_input_service_id.map(|id| id as u8) == Some(frame.channel)
+            {
+                if let Some(input) = selected_input_source.as_ref() {
+                    if input.keycodes_supported.is_empty() {
+                        let line = "INPUT_KEY_BINDING skipped: SDR advertised no supported keycodes";
+                        println!("{line}");
+                        log_line(&mut dump, line)?;
+                        input_key_binding_sent = true;
+                    } else {
+                        let (input_payload, summary) = proto::build_input_key_binding_request_payload(&input.keycodes_supported)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        println!("INPUT_CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary}");
+                        log_line(&mut dump, &format!("INPUT_CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary}"))?;
+                        log_line(&mut dump, &format!("tx InputKeyBindingRequest plaintext bytes={} channel=0x{:02x}", input_payload.len(), frame.channel))?;
+                        if let Some(dump) = dump.as_mut() {
+                            let pseudo = AapFrame {
+                                channel: frame.channel,
+                                flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                                final_length: None,
+                                payload: input_payload.clone(),
+                            };
+                            describe_frame(0, 0, peer, &pseudo, dump)?;
+                            dump.flush()?;
+                        }
+
+                        let tx_count = write_encrypted_plaintext_fragmented(
+                            &mut stream,
+                            &mut tls,
+                            frame.channel,
+                            &input_payload,
+                            &mut dump,
+                            "INPUT_KEY_BINDING_REQUEST",
+                        )?;
+                        tx_ssl_frames += tx_count;
+                        input_key_binding_sent = true;
+                        println!("tx encrypted INPUT_KEY_BINDING_REQUEST frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                        log_line(&mut dump, &format!("tx encrypted INPUT_KEY_BINDING_REQUEST frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                    }
+                }
+            }
+
+            if input_channel_opened
+                && selected_input_service_id.map(|id| id as u8) == Some(frame.channel)
+                && (frame.flags & FLAG_CONTROL) == 0
+            {
+                if let Some(summary) = proto::describe_input_payload(&plaintext) {
+                    println!("INPUT_MESSAGE observed; {summary}");
+                    log_line(&mut dump, &format!("INPUT_MESSAGE observed; {summary}"))?;
+                } else {
+                    println!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len());
+                    log_line(&mut dump, &format!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len()))?;
+                }
+
+                if config.input_inject || config.input_key_inject {
+                    if let Some(report) = proto::decode_input_report_payload(&plaintext) {
+                        if config.input_inject {
+                            if let Some(touch) = report.touch.as_ref() {
+                                if let Some(pointer) = select_touch_pointer(touch) {
+                                    let map = input_touch_map.get_or_insert_with(|| {
+                                        InputTouchMap::from_config(
+                                            &config,
+                                            selected_input_source.as_ref(),
+                                            selected_video_config_for_input.as_ref(),
+                                        )
+                                    });
+                                    let (x, y) = map.map(pointer.x, pointer.y);
+                                    let action = match touch.action {
+                                        proto::DecodedPointerAction::Down | proto::DecodedPointerAction::PointerDown => Some(TouchInjectAction::Down),
+                                        proto::DecodedPointerAction::Moved => Some(TouchInjectAction::Move),
+                                        proto::DecodedPointerAction::Up | proto::DecodedPointerAction::PointerUp => Some(TouchInjectAction::Up),
+                                        proto::DecodedPointerAction::Unknown => None,
+                                    };
+
+                                    if let Some(action) = action {
+                                        if is_shell_touch_inject_mode(&config.input_inject_mode) {
+                                            match input::inject_touch_motionevent_shell(action, x, y) {
+                                                Ok(()) => {
+                                                    input_touch_inject_events += 1;
+                                                    let line = format!(
+                                                        "INPUT_TOUCH_SHELL_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                        action,
+                                                        pointer.x,
+                                                        pointer.y,
+                                                        x,
+                                                        y,
+                                                        pointer.pointer_id,
+                                                        input_touch_inject_events
+                                                    );
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                                Err(err) => {
+                                                    let line = format!("INPUT_TOUCH_SHELL_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                            }
+                                        } else {
+                                            if input_touch_injector.is_none() {
+                                                match TouchInjector::create(map.target_width, map.target_height) {
+                                                    Ok((injector, report)) => {
+                                                        for line in report.lines() {
+                                                            let line = format!("INPUT_TOUCH_INJECTOR {line}");
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                        input_touch_injector = Some(injector);
+                                                    }
+                                                    Err(err) => {
+                                                        let line = format!("INPUT_TOUCH_INJECT disabled: failed to create uinput touchscreen: {err}");
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                }
+                                            }
+
+                                            if let Some(injector) = input_touch_injector.as_mut() {
+                                                match injector.inject(action, x, y) {
+                                                    Ok(()) => {
+                                                        input_touch_inject_events += 1;
+                                                        let line = format!(
+                                                            "INPUT_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                            action,
+                                                            pointer.x,
+                                                            pointer.y,
+                                                            x,
+                                                            y,
+                                                            pointer.pointer_id,
+                                                            input_touch_inject_events
+                                                        );
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                    Err(err) => {
+                                                        let line = format!("INPUT_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let line = "INPUT_TOUCH_INJECT skipped: touch report has no pointer_data";
+                                    println!("{line}");
+                                    log_line(&mut dump, line)?;
+                                }
+                            }
+                        }
+
+                        if config.input_key_inject {
+                            for key in &report.keys {
+                                if !key.down {
+                                    continue;
+                                }
+                                if let Some(android_code) = input::android_passthrough_keycode(key.keycode) {
+                                    match input::inject_android_keyevent_shell(android_code) {
+                                        Ok(()) => {
+                                            input_key_inject_events += 1;
+                                            let line = format!(
+                                                "INPUT_KEY_INJECT keycode={}({}) android_keyevent={} events={}",
+                                                key.keycode,
+                                                proto::keycode_name(key.keycode),
+                                                android_code,
+                                                input_key_inject_events
+                                            );
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                        Err(err) => {
+                                            let line = format!("INPUT_KEY_INJECT error keycode={}({}): {err}", key.keycode, proto::keycode_name(key.keycode));
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                    }
+                                } else {
+                                    let line = format!(
+                                        "INPUT_KEY_INJECT skipped unmapped keycode={}({})",
+                                        key.keycode,
+                                        proto::keycode_name(key.keycode)
+                                    );
+                                    println!("{line}");
+                                    log_line(&mut dump, &line)?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if video_channel_opened
@@ -2057,8 +2409,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     }
 
     let elapsed = started.elapsed();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
     Ok(())
 }
 
@@ -2755,6 +3107,100 @@ impl Drop for VideoLiveSender {
 }
 
 
+
+#[derive(Debug, Clone)]
+struct InputTouchMap {
+    source_width: i32,
+    source_height: i32,
+    stream_width: i32,
+    stream_height: i32,
+    target_width: i32,
+    target_height: i32,
+    x_offset: i32,
+    y_offset: i32,
+    mode: String,
+}
+
+impl InputTouchMap {
+    fn from_config(
+        config: &TlsHandshakeProbeConfig,
+        input: Option<&proto::InputSourceSelection>,
+        video: Option<&proto::VideoConfigSelection>,
+    ) -> Self {
+        let stream_width = video.map(|v| v.width).unwrap_or(config.video_width).max(1);
+        let stream_height = video.map(|v| v.height).unwrap_or(config.video_height).max(1);
+
+        let touchscreen = input
+            .and_then(|i| i.touchscreens.iter().find(|ts| !ts.is_secondary).or_else(|| i.touchscreens.first()));
+        let source_width = touchscreen.map(|ts| ts.width).unwrap_or(stream_width).max(1);
+        let source_height = touchscreen.map(|ts| ts.height).unwrap_or(stream_height).max(1);
+
+        let normalized_mode = match config.video_wm_size_mode.as_str() {
+            "content" | "content_area" => "content",
+            "safe" | "safe_area" => "safe",
+            _ => "stream",
+        };
+
+        let (target_width, target_height, x_offset, y_offset) = match (normalized_mode, video) {
+            ("content", Some(v)) => (
+                v.content_width.max(1),
+                v.content_height.max(1),
+                v.margin_left as i32,
+                v.margin_top as i32,
+            ),
+            ("safe", Some(v)) => (
+                v.safe_width.max(1),
+                v.safe_height.max(1),
+                v.margin_left as i32 + v.content_inset_left as i32,
+                v.margin_top as i32 + v.content_inset_top as i32,
+            ),
+            _ => (stream_width, stream_height, 0, 0),
+        };
+
+        Self {
+            source_width,
+            source_height,
+            stream_width,
+            stream_height,
+            target_width,
+            target_height,
+            x_offset,
+            y_offset,
+            mode: normalized_mode.to_string(),
+        }
+    }
+
+    fn map(&self, x: u32, y: u32) -> (i32, i32) {
+        let stream_x = scale_coord(x as i64, self.source_width as i64, self.stream_width as i64);
+        let stream_y = scale_coord(y as i64, self.source_height as i64, self.stream_height as i64);
+        let mapped_x = clamp_i32(stream_x - self.x_offset, 0, self.target_width.saturating_sub(1));
+        let mapped_y = clamp_i32(stream_y - self.y_offset, 0, self.target_height.saturating_sub(1));
+        (mapped_x, mapped_y)
+    }
+}
+
+fn select_touch_pointer(touch: &proto::DecodedTouchEvent) -> Option<&proto::DecodedPointer> {
+    if touch.pointers.is_empty() {
+        return None;
+    }
+    touch
+        .pointers
+        .get(touch.action_index as usize)
+        .or_else(|| touch.pointers.iter().find(|p| p.pointer_id == 0))
+        .or_else(|| touch.pointers.first())
+}
+
+fn scale_coord(value: i64, source_size: i64, target_size: i64) -> i32 {
+    if source_size <= 0 || target_size <= 0 {
+        return 0;
+    }
+    ((value * target_size + source_size / 2) / source_size) as i32
+}
+
+fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+    value.max(min).min(max.max(min))
+}
+
 fn is_control_message(payload: &[u8], id: u16) -> bool {
     payload.len() >= 2 && u16::from_be_bytes([payload[0], payload[1]]) == id
 }
@@ -2917,4 +3363,11 @@ fn build_ssl_frame(tls_bytes: &[u8]) -> AapFrame {
         final_length: None,
         payload,
     }
+}
+
+fn is_shell_touch_inject_mode(mode: &str) -> bool {
+    matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "shell" | "motionevent" | "shell-motionevent" | "input"
+    )
 }

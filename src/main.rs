@@ -124,6 +124,9 @@ Commands:
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
+  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|shell] [--input-key-inject]
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android.
+
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
 
@@ -1040,6 +1043,11 @@ struct AapTlsHandshakeProbeArgs {
     video_bit_rate: i32,
     video_fps: i32,
     video_density: u32,
+    input_open: bool,
+    input_key_binding: bool,
+    input_inject: bool,
+    input_inject_mode: String,
+    input_key_inject: bool,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1068,6 +1076,11 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
         video_density: args.video_density,
+        input_open: args.input_open,
+        input_key_binding: args.input_key_binding,
+        input_inject: args.input_inject,
+        input_inject_mode: args.input_inject_mode,
+        input_key_inject: args.input_key_inject,
     })?;
     Ok(())
 }
@@ -1114,6 +1127,11 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
         video_density: args.video_density,
+        input_open: args.input_open,
+        input_key_binding: args.input_key_binding,
+        input_inject: args.input_inject,
+        input_inject_mode: args.input_inject_mode,
+        input_key_inject: args.input_key_inject,
     })?;
     Ok(())
 }
@@ -1151,6 +1169,11 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
         video_density: args.video_density,
+        input_open: args.input_open,
+        input_key_binding: args.input_key_binding,
+        input_inject: args.input_inject,
+        input_inject_mode: args.input_inject_mode,
+        input_key_inject: args.input_key_inject,
     })?;
     Ok(())
 }
@@ -1179,6 +1202,11 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut video_bit_rate = 2_500_000i32;
     let mut video_fps = 30i32;
     let mut video_density = 160u32;
+    let mut input_open = false;
+    let mut input_key_binding = true;
+    let mut input_inject = false;
+    let mut input_inject_mode = String::from("uinput");
+    let mut input_key_inject = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -1263,6 +1291,41 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--video-density" | "--wm-density" | "--live-density" => {
                 i += 1;
                 video_density = argv.get(i).ok_or("--video-density requires DPI value")?.parse::<u32>()?;
+            }
+            "--input-open" | "--open-input" | "--input" => {
+                input_open = true;
+            }
+            "--no-input-open" | "--no-open-input" | "--no-input" => {
+                input_open = false;
+            }
+            "--input-key-binding" | "--input-bind-keys" => {
+                input_key_binding = true;
+            }
+            "--no-input-key-binding" | "--no-input-bind-keys" => {
+                input_key_binding = false;
+            }
+            "--input-inject" | "--input-touch-inject" | "--inject-input" | "--inject-touch" => {
+                input_open = true;
+                input_inject = true;
+            }
+            "--input-inject-mode" | "--input-touch-mode" | "--touch-inject-mode" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--input-inject-mode requires uinput|shell")?.to_ascii_lowercase();
+                input_inject_mode = match value.as_str() {
+                    "uinput" | "shell" | "motionevent" | "shell-motionevent" | "input" => value,
+                    other => return Err(format!("--input-inject-mode unsupported value: {other}; use uinput|shell").into()),
+                };
+            }
+            "--no-input-inject" | "--no-input-touch-inject" | "--no-inject-input" | "--no-inject-touch" => {
+                input_inject = false;
+            }
+            "--input-key-inject" | "--inject-input-keys" | "--inject-keys" => {
+                input_open = true;
+                input_key_binding = true;
+                input_key_inject = true;
+            }
+            "--no-input-key-inject" | "--no-inject-input-keys" | "--no-inject-keys" => {
+                input_key_inject = false;
             }
             "--timeout-ms" => {
                 i += 1;
@@ -1360,6 +1423,11 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         video_bit_rate,
         video_fps,
         video_density,
+        input_open,
+        input_key_binding,
+        input_inject,
+        input_inject_mode,
+        input_key_inject,
     })
 }
 

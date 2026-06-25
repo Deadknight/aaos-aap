@@ -135,6 +135,61 @@ pub fn maybe_build_ping_response_control_payload(
 }
 
 
+pub fn input_message_name(id: u16) -> &'static str {
+    match InputMessageId::from_i32(id as i32) {
+        Some(InputMessageId::INPUT_MESSAGE_INPUT_REPORT) => "INPUT_MESSAGE_INPUT_REPORT",
+        Some(InputMessageId::INPUT_MESSAGE_KEY_BINDING_REQUEST) => "INPUT_MESSAGE_KEY_BINDING_REQUEST",
+        Some(InputMessageId::INPUT_MESSAGE_KEY_BINDING_RESPONSE) => "INPUT_MESSAGE_KEY_BINDING_RESPONSE",
+        Some(InputMessageId::INPUT_MESSAGE_INPUT_FEEDBACK) => "INPUT_MESSAGE_INPUT_FEEDBACK",
+        None => "UNKNOWN_INPUT_MESSAGE",
+    }
+}
+
+pub fn keycode_name(code: u32) -> &'static str {
+    match code {
+        3 => "KEYCODE_HOME",
+        4 => "KEYCODE_BACK",
+        5 => "KEYCODE_CALL",
+        6 => "KEYCODE_ENDCALL",
+        19 => "KEYCODE_DPAD_UP",
+        20 => "KEYCODE_DPAD_DOWN",
+        21 => "KEYCODE_DPAD_LEFT",
+        22 => "KEYCODE_DPAD_RIGHT",
+        23 => "KEYCODE_DPAD_CENTER",
+        24 => "KEYCODE_VOLUME_UP",
+        25 => "KEYCODE_VOLUME_DOWN",
+        79 => "KEYCODE_HEADSETHOOK",
+        82 => "KEYCODE_MENU",
+        84 => "KEYCODE_SEARCH",
+        85 => "KEYCODE_MEDIA_PLAY_PAUSE",
+        86 => "KEYCODE_MEDIA_STOP",
+        87 => "KEYCODE_MEDIA_NEXT",
+        88 => "KEYCODE_MEDIA_PREVIOUS",
+        89 => "KEYCODE_MEDIA_REWIND",
+        90 => "KEYCODE_MEDIA_FAST_FORWARD",
+        126 => "KEYCODE_MEDIA_PLAY",
+        127 => "KEYCODE_MEDIA_PAUSE",
+        164 => "KEYCODE_VOLUME_MUTE",
+        219 => "KEYCODE_ASSIST",
+        231 => "KEYCODE_VOICE_ASSIST",
+        260 => "KEYCODE_NAVIGATE_PREVIOUS",
+        261 => "KEYCODE_NAVIGATE_NEXT",
+        262 => "KEYCODE_NAVIGATE_IN",
+        263 => "KEYCODE_NAVIGATE_OUT",
+        65535 => "AA_SENTINEL",
+        65536 => "AA_ROTARY_CONTROLLER",
+        65537 => "AA_MEDIA",
+        65538 => "AA_NAVIGATION",
+        65539 => "AA_RADIO",
+        65540 => "AA_TEL",
+        65541 => "AA_PRIMARY_BUTTON",
+        65542 => "AA_SECONDARY_BUTTON",
+        65543 => "AA_TERTIARY_BUTTON",
+        65544 => "AA_TURN_CARD",
+        _ => "KEYCODE_UNKNOWN_OR_OEM",
+    }
+}
+
 pub fn media_message_name(id: u16) -> &'static str {
     match MediaMessageId::from_i32(id as i32) {
         Some(MediaMessageId::MEDIA_MESSAGE_DATA) => "MEDIA_MESSAGE_DATA",
@@ -225,6 +280,224 @@ pub fn describe_media_payload(payload: &[u8]) -> Option<String> {
         Some(other) => Some(format!("{other:?} body_len={}", body.len())),
         None => Some(format!("UNKNOWN_MEDIA_MESSAGE id=0x{id:04x} body_len={}", body.len())),
     }
+}
+
+
+pub fn describe_input_payload(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    let body = &payload[2..];
+    let name = input_message_name(id);
+
+    match InputMessageId::from_i32(id as i32) {
+        Some(InputMessageId::INPUT_MESSAGE_INPUT_REPORT) => {
+            let msg = InputReport::parse_from_bytes(body).ok()?;
+            let mut parts = Vec::new();
+            parts.push(format!("{name} timestamp={} disp_channel_id={}", msg.timestamp(), msg.disp_channel_id()));
+            if let Some(touch) = msg.touch_event.as_ref() {
+                parts.push(format!("touchscreen={}", summarize_touch_event(touch)));
+            }
+            if let Some(touchpad) = msg.touchpad_event.as_ref() {
+                parts.push(format!("touchpad={}", summarize_touch_event(touchpad)));
+            }
+            if let Some(keys) = msg.key_event.as_ref() {
+                parts.push(format!("keys={}", summarize_key_event(keys)));
+            }
+            if let Some(abs) = msg.absolute_event.as_ref() {
+                parts.push(format!("absolute={}", summarize_absolute_event(abs)));
+            }
+            if let Some(rel) = msg.relative_event.as_ref() {
+                parts.push(format!("relative={}", summarize_relative_event(rel)));
+            }
+            Some(parts.join(" "))
+        }
+        Some(InputMessageId::INPUT_MESSAGE_KEY_BINDING_REQUEST) => {
+            let msg = KeyBindingRequest::parse_from_bytes(body).ok()?;
+            Some(format!("{name} keycodes={}", summarize_keycodes(&msg.keycodes)))
+        }
+        Some(InputMessageId::INPUT_MESSAGE_KEY_BINDING_RESPONSE) => {
+            let msg = KeyBindingResponse::parse_from_bytes(body).ok()?;
+            Some(format!("{name} status={}", msg.status()))
+        }
+        Some(InputMessageId::INPUT_MESSAGE_INPUT_FEEDBACK) => {
+            let msg = InputFeedback::parse_from_bytes(body).ok()?;
+            Some(format!("{name} event={:?}", msg.event()))
+        }
+        None => Some(format!("UNKNOWN_INPUT_MESSAGE id=0x{id:04x} body_len={}", body.len())),
+    }
+}
+
+fn summarize_touch_event(touch: &TouchEvent) -> String {
+    let mut points = Vec::new();
+    for p in &touch.pointer_data {
+        points.push(format!("id{}@{},{}", p.pointer_id(), p.x(), p.y()));
+    }
+    format!(
+        "action={:?} action_index={} pointers=[{}]",
+        touch.action(),
+        touch.action_index(),
+        points.join(" ")
+    )
+}
+
+fn summarize_key_event(keys: &KeyEvent) -> String {
+    let mut items = Vec::new();
+    for key in &keys.keys {
+        let code = key.keycode();
+        items.push(format!(
+            "{}({}) down={} meta={} longpress={}",
+            code,
+            keycode_name(code),
+            key.down(),
+            key.metastate(),
+            key.longpress()
+        ));
+    }
+    format!("[{}]", items.join("; "))
+}
+
+fn summarize_absolute_event(abs: &AbsoluteEvent) -> String {
+    let mut items = Vec::new();
+    for a in &abs.data {
+        let code = a.keycode();
+        items.push(format!("{}({})={}", code, keycode_name(code), a.value()));
+    }
+    format!("[{}]", items.join("; "))
+}
+
+fn summarize_relative_event(rel: &RelativeEvent) -> String {
+    let mut items = Vec::new();
+    for r in &rel.data {
+        let code = r.keycode();
+        items.push(format!("{}({}) delta={}", code, keycode_name(code), r.delta()));
+    }
+    format!("[{}]", items.join("; "))
+}
+
+
+#[derive(Debug, Clone)]
+pub struct DecodedInputReport {
+    pub timestamp: u64,
+    pub disp_channel_id: i32,
+    pub touch: Option<DecodedTouchEvent>,
+    pub touchpad: Option<DecodedTouchEvent>,
+    pub keys: Vec<DecodedKeyEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedTouchEvent {
+    pub action: DecodedPointerAction,
+    pub action_index: u32,
+    pub pointers: Vec<DecodedPointer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedPointerAction {
+    Down,
+    Up,
+    Moved,
+    PointerDown,
+    PointerUp,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedPointer {
+    pub x: u32,
+    pub y: u32,
+    pub pointer_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedKeyEvent {
+    pub keycode: u32,
+    pub down: bool,
+    pub metastate: u32,
+    pub longpress: bool,
+}
+
+pub fn decode_input_report_payload(payload: &[u8]) -> Option<DecodedInputReport> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != InputMessageId::INPUT_MESSAGE_INPUT_REPORT.value() as u16 {
+        return None;
+    }
+
+    let msg = InputReport::parse_from_bytes(&payload[2..]).ok()?;
+    let touch = msg.touch_event.as_ref().map(decode_touch_event);
+    let touchpad = msg.touchpad_event.as_ref().map(decode_touch_event);
+    let keys = msg
+        .key_event
+        .as_ref()
+        .map(|k| {
+            k.keys
+                .iter()
+                .map(|key| DecodedKeyEvent {
+                    keycode: key.keycode(),
+                    down: key.down(),
+                    metastate: key.metastate(),
+                    longpress: key.longpress(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(DecodedInputReport {
+        timestamp: msg.timestamp(),
+        disp_channel_id: msg.disp_channel_id(),
+        touch,
+        touchpad,
+        keys,
+    })
+}
+
+fn decode_touch_event(touch: &TouchEvent) -> DecodedTouchEvent {
+    let action = match touch.action() {
+        PointerAction::ACTION_DOWN => DecodedPointerAction::Down,
+        PointerAction::ACTION_UP => DecodedPointerAction::Up,
+        PointerAction::ACTION_MOVED => DecodedPointerAction::Moved,
+        PointerAction::ACTION_POINTER_DOWN => DecodedPointerAction::PointerDown,
+        PointerAction::ACTION_POINTER_UP => DecodedPointerAction::PointerUp,
+    };
+    let pointers = touch
+        .pointer_data
+        .iter()
+        .map(|p| DecodedPointer {
+            x: p.x(),
+            y: p.y(),
+            pointer_id: p.pointer_id(),
+        })
+        .collect::<Vec<_>>();
+    DecodedTouchEvent {
+        action,
+        action_index: touch.action_index(),
+        pointers,
+    }
+}
+
+pub fn build_input_key_binding_request_payload(keycodes: &[i32]) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut req = KeyBindingRequest::new();
+    req.keycodes = keycodes.to_vec();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(InputMessageId::INPUT_MESSAGE_KEY_BINDING_REQUEST.value() as u16).to_be_bytes());
+    out.extend_from_slice(&req.write_to_bytes()?);
+    Ok((
+        out,
+        format!("INPUT_MESSAGE_KEY_BINDING_REQUEST keycodes={}", summarize_keycodes(keycodes)),
+    ))
+}
+
+fn summarize_keycodes(keycodes: &[i32]) -> String {
+    let mut items = Vec::new();
+    for code in keycodes {
+        items.push(format!("{}({})", code, keycode_name(*code as u32)));
+    }
+    format!("[{}]", items.join(", "))
 }
 
 /// Build MEDIA_MESSAGE_SETUP for the opened video sink channel.
@@ -337,6 +610,7 @@ pub struct ServiceDiscoverySummary {
     pub one_line: String,
     pub details: Vec<String>,
     pub video_media_sink: Option<MediaSinkSelection>,
+    pub input_source: Option<InputSourceSelection>,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +622,38 @@ pub struct MediaSinkSelection {
     pub video_configs: usize,
     pub first_video_config: Option<String>,
     pub selected_video_config: Option<VideoConfigSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputSourceSelection {
+    pub service_id: i32,
+    pub display_id: u32,
+    pub keycodes_supported: Vec<i32>,
+    pub feedback_events_supported: Vec<String>,
+    pub touchscreens: Vec<InputTouchscreenInfo>,
+    pub touchpads: Vec<InputTouchpadInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputTouchscreenInfo {
+    pub index: usize,
+    pub width: i32,
+    pub height: i32,
+    pub type_name: String,
+    pub is_secondary: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputTouchpadInfo {
+    pub index: usize,
+    pub width: i32,
+    pub height: i32,
+    pub physical_width: i32,
+    pub physical_height: i32,
+    pub ui_navigation: bool,
+    pub ui_absolute: bool,
+    pub tap_as_select: bool,
+    pub sensitivity: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +908,7 @@ fn summarize_service_discovery_response_body(
     let msg = ServiceDiscoveryResponse::parse_from_bytes(body)?;
     let mut details = Vec::new();
     let mut video_media_sink = None;
+    let mut input_source = None;
 
     details.push(format!(
         "SDR headunit display_name={:?} driver_position={:?} services={}",
@@ -655,13 +962,85 @@ fn summarize_service_discovery_response_body(
             }
         }
         if let Some(input) = svc.input_source_service.as_ref() {
+            let feedback_events_supported: Vec<String> = input
+                .feedback_events_supported
+                .iter()
+                .map(|event| format!("{:?}", event))
+                .collect();
+            let touchscreens: Vec<InputTouchscreenInfo> = input
+                .touchscreen
+                .iter()
+                .enumerate()
+                .map(|(index, ts)| InputTouchscreenInfo {
+                    index,
+                    width: ts.width(),
+                    height: ts.height(),
+                    type_name: format!("{:?}", ts.type_()),
+                    is_secondary: ts.is_secondary(),
+                })
+                .collect();
+            let touchpads: Vec<InputTouchpadInfo> = input
+                .touchpad
+                .iter()
+                .enumerate()
+                .map(|(index, tp)| InputTouchpadInfo {
+                    index,
+                    width: tp.width(),
+                    height: tp.height(),
+                    physical_width: tp.physical_width(),
+                    physical_height: tp.physical_height(),
+                    ui_navigation: tp.ui_navigation(),
+                    ui_absolute: tp.ui_absolute(),
+                    tap_as_select: tp.tap_as_select(),
+                    sensitivity: tp.sensitivity(),
+                })
+                .collect();
+
             kinds.push(format!(
-                "input_source touchscreens={} touchpads={} keycodes={} display_id={}",
-                input.touchscreen.len(),
-                input.touchpad.len(),
+                "input_source touchscreens={} touchpads={} keycodes={} display_id={} feedback_events={}",
+                touchscreens.len(),
+                touchpads.len(),
                 input.keycodes_supported.len(),
-                input.display_id()
+                input.display_id(),
+                feedback_events_supported.join(",")
             ));
+            if !input.keycodes_supported.is_empty() {
+                kinds.push(format!("input_keycodes={}", summarize_keycodes(&input.keycodes_supported)));
+            }
+            for ts in &touchscreens {
+                details.push(format!(
+                    "    input touchscreen[{}] {}x{} type={} secondary={}",
+                    ts.index,
+                    ts.width,
+                    ts.height,
+                    ts.type_name,
+                    ts.is_secondary
+                ));
+            }
+            for tp in &touchpads {
+                details.push(format!(
+                    "    input touchpad[{}] {}x{} physical={}x{} ui_navigation={} ui_absolute={} tap_as_select={} sensitivity={}",
+                    tp.index,
+                    tp.width,
+                    tp.height,
+                    tp.physical_width,
+                    tp.physical_height,
+                    tp.ui_navigation,
+                    tp.ui_absolute,
+                    tp.tap_as_select,
+                    tp.sensitivity
+                ));
+            }
+            if input_source.is_none() {
+                input_source = Some(InputSourceSelection {
+                    service_id: svc.id(),
+                    display_id: input.display_id(),
+                    keycodes_supported: input.keycodes_supported.clone(),
+                    feedback_events_supported,
+                    touchscreens,
+                    touchpads,
+                });
+            }
         }
         if let Some(sensor) = svc.sensor_source_service.as_ref() {
             kinds.push(format!("sensor_source sensors={}", sensor.sensors.len()));
@@ -727,6 +1106,7 @@ fn summarize_service_discovery_response_body(
         one_line,
         details,
         video_media_sink,
+        input_source,
     })
 }
 

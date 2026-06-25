@@ -124,8 +124,8 @@ Commands:
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
-  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is app_process/framework, with uinput and shell fallback modes available. Ping request/response logs are quiet by default in session mode.
+  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1050,6 +1050,7 @@ struct AapTlsHandshakeProbeArgs {
     input_app_move_min_ms: u64,
     input_key_inject: bool,
     quiet_ping_logs: bool,
+    log_level: String,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1085,6 +1086,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
+        log_level: args.log_level.clone(),
     })?;
     Ok(())
 }
@@ -1138,6 +1140,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
+        log_level: args.log_level.clone(),
     })?;
     Ok(())
 }
@@ -1182,6 +1185,7 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
+        log_level: args.log_level.clone(),
     })?;
     Ok(())
 }
@@ -1217,6 +1221,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut input_app_move_min_ms = 16u64;
     let mut input_key_inject = false;
     let mut quiet_ping_logs = true;
+    let mut log_level = String::from("normal");
 
     let mut i = 0;
     while i < argv.len() {
@@ -1347,6 +1352,29 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--log-ping" | "--log-ping-logs" | "--no-quiet-ping" => {
                 quiet_ping_logs = false;
             }
+            "--log-level" | "--session-log-level" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--log-level requires quiet|summary|normal|verbose")?.to_ascii_lowercase();
+                log_level = match value.as_str() {
+                    "quiet" | "off" | "none" | "fast" => String::from("quiet"),
+                    "summary" | "minimal" | "min" => String::from("summary"),
+                    "normal" => String::from("normal"),
+                    "verbose" | "trace" | "debug" | "wire" => String::from("verbose"),
+                    other => return Err(format!("--log-level unsupported value: {other}; use quiet|summary|normal|verbose").into()),
+                };
+            }
+            "--quiet-logs" | "--fast-logs" | "--no-wire-logs" => {
+                log_level = String::from("quiet");
+            }
+            "--summary-logs" | "--minimal-logs" => {
+                log_level = String::from("summary");
+            }
+            "--verbose-logs" | "--wire-logs" | "--trace-logs" => {
+                log_level = String::from("verbose");
+            }
+            "--no-dump" | "--dump-none" => {
+                dump = None;
+            }
             "--timeout-ms" => {
                 i += 1;
                 timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
@@ -1450,6 +1478,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         input_app_move_min_ms,
         input_key_inject,
         quiet_ping_logs,
+        log_level,
     })
 }
 

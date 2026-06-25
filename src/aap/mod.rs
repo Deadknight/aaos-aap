@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, atomic::{AtomicBool, Ordering}};
+use std::sync::{mpsc, atomic::{AtomicBool, AtomicU8, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,51 @@ use crate::h264::annexb::{AnnexBStreamParser, NalType};
 use crate::input::{self, AppProcessInputInjector, TouchInjectAction, TouchInjector};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+static SESSION_LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_NORMAL);
+const LOG_QUIET: u8 = 0;
+const LOG_SUMMARY: u8 = 1;
+const LOG_NORMAL: u8 = 2;
+const LOG_VERBOSE: u8 = 3;
+
+fn normalize_session_log_level(value: &str) -> &'static str {
+    match value.to_ascii_lowercase().as_str() {
+        "quiet" | "off" | "none" | "fast" => "quiet",
+        "summary" | "minimal" | "min" => "summary",
+        "verbose" | "trace" | "debug" | "wire" => "verbose",
+        _ => "normal",
+    }
+}
+
+fn session_log_level_value(value: &str) -> u8 {
+    match normalize_session_log_level(value) {
+        "quiet" => LOG_QUIET,
+        "summary" => LOG_SUMMARY,
+        "verbose" => LOG_VERBOSE,
+        _ => LOG_NORMAL,
+    }
+}
+
+fn set_session_log_level(value: &str) {
+    SESSION_LOG_LEVEL.store(session_log_level_value(value), Ordering::SeqCst);
+}
+
+fn session_log_enabled(min_level: u8) -> bool {
+    SESSION_LOG_LEVEL.load(Ordering::Relaxed) >= min_level
+}
+
+fn session_log(dump: &mut Option<Box<dyn Write>>, min_level: u8, line: &str) -> io::Result<()> {
+    if session_log_enabled(min_level) {
+        println!("{line}");
+        log_line(dump, line)?;
+    }
+    Ok(())
+}
+
+fn session_log_format(dump: &mut Option<Box<dyn Write>>, min_level: u8, line: String) -> io::Result<()> {
+    session_log(dump, min_level, &line)
+}
+
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
@@ -934,6 +979,7 @@ pub struct TlsHandshakeProbeConfig {
     pub input_app_move_min_ms: u64,
     pub input_key_inject: bool,
     pub quiet_ping_logs: bool,
+    pub log_level: String,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -969,6 +1015,7 @@ impl Default for TlsHandshakeProbeConfig {
             input_app_move_min_ms: 16,
             input_key_inject: false,
             quiet_ping_logs: true,
+            log_level: "normal".to_string(),
         }
     }
 }
@@ -1222,6 +1269,7 @@ pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     println!("max_frames={}", config.max_frames);
     println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
     println!("keys={}", config.keys_path.display());
+    println!("log_level={}", normalize_session_log_level(&config.log_level));
     if let Some(path) = &config.dump_path {
         println!("dump={}", path.display());
     } else {
@@ -1354,7 +1402,7 @@ pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
             && (frame.flags & FLAG_ENCRYPTED) != 0
             && frame.final_length.is_none()
             && frame.payload.len() <= 64;
-        if !likely_encrypted_ping {
+        if !likely_encrypted_ping && session_log_enabled(LOG_VERBOSE) {
             println!("rx frame:");
             describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
             if let Some(dump) = dump.as_mut() {
@@ -1455,6 +1503,9 @@ pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
 }
 
 fn log_tls_step(dump: &mut Option<Box<dyn Write>>, step: &tls::TlsServerStep) -> io::Result<()> {
+    if !session_log_enabled(LOG_VERBOSE) {
+        return Ok(());
+    }
     let line = format!(
         "tls step: state='{}' handshaking={} cipher={} outgoing_tls={} plaintext={}",
         step.state,
@@ -1483,6 +1534,9 @@ fn log_decrypted_payload(
     index: usize,
     plaintext: &[u8],
 ) -> io::Result<()> {
+    if !session_log_enabled(LOG_VERBOSE) {
+        return Ok(());
+    }
     let pseudo = AapFrame {
         channel,
         flags: flags & !FLAG_ENCRYPTED,
@@ -1520,6 +1574,7 @@ fn log_decrypted_payload(
 /// request is encrypted in TLS and transmitted as an AA frame with ENCRYPTED set.
 pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     install_session_signal_handlers();
+    set_session_log_level(&config.log_level);
     println!("arda aap service discovery probe");
     println!("addr={}", config.addr);
     println!("timeout_ms={}", config.timeout_ms);
@@ -1527,6 +1582,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     println!("max_frames={}", config.max_frames);
     println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
     println!("keys={}", config.keys_path.display());
+    println!("log_level={}", normalize_session_log_level(&config.log_level));
     if let Some(path) = &config.dump_path {
         println!("dump={}", path.display());
     } else {
@@ -1599,7 +1655,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             config.input_key_inject
         ),
     )?;
-    log_line(&mut dump, &format!("quiet_ping_logs={}", config.quiet_ping_logs))?;
+    log_line(&mut dump, &format!("quiet_ping_logs={} log_level={}", config.quiet_ping_logs, normalize_session_log_level(&config.log_level)))?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
 
@@ -1765,7 +1821,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             && (frame.flags & FLAG_ENCRYPTED) != 0
             && frame.final_length.is_none()
             && frame.payload.len() <= 64;
-        if !likely_encrypted_ping {
+        if !likely_encrypted_ping && session_log_enabled(LOG_VERBOSE) {
             println!("rx frame:");
             describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
             if let Some(dump) = dump.as_mut() {
@@ -1820,13 +1876,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             plaintext_chunks.push(frame.payload.clone());
         } else {
             encrypted_frames += 1;
-            if !likely_encrypted_ping {
+            if !likely_encrypted_ping && session_log_enabled(LOG_VERBOSE) {
                 println!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload));
                 log_line(&mut dump, &format!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload)))?;
             }
 
             let step = tls.feed_tls(&frame.payload)?;
-            if !likely_encrypted_ping {
+            if !likely_encrypted_ping && session_log_enabled(LOG_VERBOSE) {
                 log_tls_step(&mut dump, &step)?;
             }
             if !step.plaintext.is_empty() {
@@ -1842,8 +1898,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 };
                 write_frame(&mut stream, &tx_frame)?;
                 stream.flush()?;
-                println!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={}", tx_frame.payload.len());
-                log_line(&mut dump, &format!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={} {}", tx_frame.payload.len(), tls_record_hint(&tx_frame.payload)))?;
+                if session_log_enabled(LOG_VERBOSE) {
+                    println!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={}", tx_frame.payload.len());
+                    log_line(&mut dump, &format!("tx encrypted TLS maintenance frame #{tx_ssl_frames}: tls_bytes={} {}", tx_frame.payload.len(), tls_record_hint(&tx_frame.payload)))?;
+                }
             }
         }
 
@@ -1862,7 +1920,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             log_reassembly_wait_or_drop(&mut dump, frame.channel, &reassembled)?;
             let plaintext = match reassembled {
                 fragment::ReassemblyResult::Complete { payload, fragments, expected_len } => {
-                    if fragments > 1 {
+                    if fragments > 1 && session_log_enabled(LOG_VERBOSE) {
                         let line = format!(
                             "decrypted AA full-frame complete: channel=0x{:02x} fragments={} expected_len={:?} actual_len={}",
                             frame.channel,
@@ -2258,12 +2316,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 && selected_input_service_id.map(|id| id as u8) == Some(frame.channel)
                 && (frame.flags & FLAG_CONTROL) == 0
             {
-                if let Some(summary) = proto::describe_input_payload(&plaintext) {
-                    println!("INPUT_MESSAGE observed; {summary}");
-                    log_line(&mut dump, &format!("INPUT_MESSAGE observed; {summary}"))?;
-                } else {
-                    println!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len());
-                    log_line(&mut dump, &format!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len()))?;
+                if session_log_enabled(LOG_VERBOSE) {
+                    if let Some(summary) = proto::describe_input_payload(&plaintext) {
+                        println!("INPUT_MESSAGE observed; {summary}");
+                        log_line(&mut dump, &format!("INPUT_MESSAGE observed; {summary}"))?;
+                    } else {
+                        println!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len());
+                        log_line(&mut dump, &format!("INPUT_MESSAGE raw undecoded channel=0x{:02x} bytes={}", frame.channel, plaintext.len()))?;
+                    }
                 }
 
                 if config.input_inject || config.input_key_inject {
@@ -2325,7 +2385,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
                                                 if drop_app_move {
                                                     input_app_move_drop_events += 1;
-                                                    if input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0 {
+                                                    if session_log_enabled(LOG_VERBOSE) && (input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0) {
                                                         let line = format!(
                                                             "INPUT_APP_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
                                                             pointer.x,
@@ -2343,18 +2403,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                     match injector.inject_touch(action, x, y, pointer.pointer_id) {
                                                         Ok(()) => {
                                                             input_touch_inject_events += 1;
-                                                            let line = format!(
-                                                                "INPUT_APP_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
-                                                                action,
-                                                                pointer.x,
-                                                                pointer.y,
-                                                                x,
-                                                                y,
-                                                                pointer.pointer_id,
-                                                                input_touch_inject_events
-                                                            );
-                                                            println!("{line}");
-                                                            log_line(&mut dump, &line)?;
+                                                            if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                                let line = format!(
+                                                                    "INPUT_APP_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                    action,
+                                                                    pointer.x,
+                                                                    pointer.y,
+                                                                    x,
+                                                                    y,
+                                                                    pointer.pointer_id,
+                                                                    input_touch_inject_events
+                                                                );
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
                                                         }
                                                         Err(err) => {
                                                             let line = format!("INPUT_APP_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
@@ -2368,18 +2430,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                             match input::inject_touch_motionevent_shell(action, x, y) {
                                                 Ok(()) => {
                                                     input_touch_inject_events += 1;
-                                                    let line = format!(
-                                                        "INPUT_TOUCH_SHELL_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
-                                                        action,
-                                                        pointer.x,
-                                                        pointer.y,
-                                                        x,
-                                                        y,
-                                                        pointer.pointer_id,
-                                                        input_touch_inject_events
-                                                    );
-                                                    println!("{line}");
-                                                    log_line(&mut dump, &line)?;
+                                                    if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                        let line = format!(
+                                                            "INPUT_TOUCH_SHELL_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                            action,
+                                                            pointer.x,
+                                                            pointer.y,
+                                                            x,
+                                                            y,
+                                                            pointer.pointer_id,
+                                                            input_touch_inject_events
+                                                        );
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
                                                 }
                                                 Err(err) => {
                                                     let line = format!("INPUT_TOUCH_SHELL_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
@@ -2410,18 +2474,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                 match injector.inject(action, x, y) {
                                                     Ok(()) => {
                                                         input_touch_inject_events += 1;
-                                                        let line = format!(
-                                                            "INPUT_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
-                                                            action,
-                                                            pointer.x,
-                                                            pointer.y,
-                                                            x,
-                                                            y,
-                                                            pointer.pointer_id,
-                                                            input_touch_inject_events
-                                                        );
-                                                        println!("{line}");
-                                                        log_line(&mut dump, &line)?;
+                                                        if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                            let line = format!(
+                                                                "INPUT_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                action,
+                                                                pointer.x,
+                                                                pointer.y,
+                                                                x,
+                                                                y,
+                                                                pointer.pointer_id,
+                                                                input_touch_inject_events
+                                                            );
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
                                                     }
                                                     Err(err) => {
                                                         let line = format!("INPUT_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
@@ -2607,8 +2673,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 && (frame.flags & FLAG_CONTROL) == 0
             {
                 if let Some((session_id, ack_value, summary)) = proto::parse_media_ack_payload(&plaintext) {
-                    println!("MEDIA_MESSAGE_ACK observed; {summary}");
-                    log_line(&mut dump, &format!("MEDIA_MESSAGE_ACK observed; {summary}"))?;
+                    if session_log_enabled(LOG_VERBOSE) {
+                        println!("MEDIA_MESSAGE_ACK observed; {summary}");
+                        log_line(&mut dump, &format!("MEDIA_MESSAGE_ACK observed; {summary}"))?;
+                    }
                     if session_id == video_session_id {
                         if let Some(sender) = video_sender.as_mut() {
                             sender.on_ack(ack_value);
@@ -3301,18 +3369,8 @@ impl VideoLiveSender {
                     let pts_us = (self.next_pts_index as u64) * 1_000_000u64 / (self.config.fps as u64).max(1);
                     self.next_pts_index += 1;
                     let payload = proto::build_media_data_payload(pts_us, &bytes);
-                    println!(
-                        "VIDEO_NATIVE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
-                        self.frames_sent,
-                        pts_us,
-                        bytes.len(),
-                        self.unacked + 1,
-                        max_unacked,
-                        session_id
-                    );
-                    log_line(
-                        dump,
-                        &format!(
+                    if session_log_enabled(LOG_VERBOSE) {
+                        println!(
                             "VIDEO_NATIVE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
                             self.frames_sent,
                             pts_us,
@@ -3320,8 +3378,20 @@ impl VideoLiveSender {
                             self.unacked + 1,
                             max_unacked,
                             session_id
-                        ),
-                    )?;
+                        );
+                        log_line(
+                            dump,
+                            &format!(
+                                "VIDEO_NATIVE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
+                                self.frames_sent,
+                                pts_us,
+                                bytes.len(),
+                                self.unacked + 1,
+                                max_unacked,
+                                session_id
+                            ),
+                        )?;
+                    }
                     tx_frames += write_encrypted_plaintext_fragmented(
                         stream,
                         tls,
@@ -3516,7 +3586,7 @@ fn write_encrypted_plaintext_fragmented_with_flags(
     );
 
     let multi = plain_frames.len() > 1;
-    if multi {
+    if multi && session_log_enabled(LOG_VERBOSE) {
         println!(
             "tx {label}: fragmenting plaintext bytes={} into {} AA fragments first={} continuation={}",
             plaintext.len(),
@@ -3548,7 +3618,7 @@ fn write_encrypted_plaintext_fragmented_with_flags(
         write_frame(stream, &tx_frame)?;
         written += 1;
 
-        if multi {
+        if multi && session_log_enabled(LOG_VERBOSE) {
             println!(
                 "tx {label} fragment {}/{}: type={} plain_bytes={} tls_bytes={} final_len={:?}",
                 idx + 1,
@@ -3583,6 +3653,9 @@ fn log_reassembly_wait_or_drop(
     channel: u8,
     result: &fragment::ReassemblyResult,
 ) -> io::Result<()> {
+    if !session_log_enabled(LOG_VERBOSE) {
+        return Ok(());
+    }
     match result {
         fragment::ReassemblyResult::Waiting { fragments, expected_len, actual_len } => {
             let line = format!(

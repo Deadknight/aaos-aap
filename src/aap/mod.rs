@@ -11,6 +11,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::h264::annexb::{AnnexBStreamParser, NalType};
+
 pub mod proto;
 mod fragment;
 mod tls;
@@ -850,6 +852,8 @@ pub struct TlsHandshakeProbeConfig {
     pub response_minor: u16,
     pub response_status: u16,
     pub keys_path: PathBuf,
+    pub video_file_path: Option<PathBuf>,
+    pub video_frame_limit: usize,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -864,6 +868,8 @@ impl Default for TlsHandshakeProbeConfig {
             response_minor: 7,
             response_status: 0,
             keys_path: PathBuf::from("/data/local/tmp/arda-certs"),
+            video_file_path: None,
+            video_frame_limit: 30,
         }
     }
 }
@@ -876,6 +882,12 @@ pub fn tls_handshake_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     println!("max_frames={}", config.max_frames);
     println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
     println!("keys={}", config.keys_path.display());
+    if let Some(path) = &config.video_file_path {
+        println!("video_file={}", path.display());
+        println!("video_frame_limit={}", config.video_frame_limit);
+    } else {
+        println!("video_file=none");
+    }
     if let Some(path) = &config.dump_path {
         println!("dump={}", path.display());
     } else {
@@ -1404,6 +1416,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     log_line(&mut dump, &format!("peer={peer}"))?;
     log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
     log_line(&mut dump, &format!("keys={}", config.keys_path.display()))?;
+    if let Some(path) = &config.video_file_path {
+        log_line(&mut dump, &format!("video_file={}", path.display()))?;
+        log_line(&mut dump, &format!("video_frame_limit={}", config.video_frame_limit))?;
+    } else {
+        log_line(&mut dump, "video_file=none")?;
+    }
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
 
@@ -1467,7 +1485,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_channel_opened = false;
     let mut video_setup_sent = false;
     let mut video_start_sent = false;
+    let mut video_max_unacked: u32 = 1;
     let video_session_id: i32 = 1;
+    let mut video_sender = match &config.video_file_path {
+        Some(path) => Some(VideoFileSender::load(path.clone(), config.video_frame_limit)?),
+        None => None,
+    };
     let mut handshake_done_logged = false;
     let mut decrypted_fragments = fragment::FragmentAssembler::default();
 
@@ -1763,9 +1786,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
                 && (frame.flags & FLAG_CONTROL) == 0
             {
-                if let Some((media_payload, configuration_index, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, video_session_id)
+                if let Some((media_payload, configuration_index, max_unacked, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, video_session_id)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                 {
+                    video_max_unacked = max_unacked.max(1);
                     println!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}");
                     log_line(&mut dump, &format!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}"))?;
                     log_line(&mut dump, &format!("tx MediaStart plaintext bytes={} session_id={} configuration_index={}", media_payload.len(), video_session_id, configuration_index))?;
@@ -1792,6 +1816,42 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     video_start_sent = true;
                     println!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
                     log_line(&mut dump, &format!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+
+                    if let Some(sender) = video_sender.as_mut() {
+                        let sent = sender.send_available(
+                            &mut stream,
+                            &mut tls,
+                            frame.channel,
+                            video_session_id,
+                            video_max_unacked,
+                            &mut dump,
+                        )?;
+                        tx_ssl_frames += sent;
+                    }
+                }
+            }
+
+            if video_start_sent
+                && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
+                && (frame.flags & FLAG_CONTROL) == 0
+            {
+                if let Some((session_id, ack_value, summary)) = proto::parse_media_ack_payload(&plaintext) {
+                    println!("MEDIA_MESSAGE_ACK observed; {summary}");
+                    log_line(&mut dump, &format!("MEDIA_MESSAGE_ACK observed; {summary}"))?;
+                    if session_id == video_session_id {
+                        if let Some(sender) = video_sender.as_mut() {
+                            sender.on_ack(ack_value);
+                            let sent = sender.send_available(
+                                &mut stream,
+                                &mut tls,
+                                frame.channel,
+                                video_session_id,
+                                video_max_unacked,
+                                &mut dump,
+                            )?;
+                            tx_ssl_frames += sent;
+                        }
+                    }
                 }
             }
 
@@ -1831,6 +1891,163 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
     log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
     Ok(())
+}
+
+
+#[derive(Debug)]
+struct VideoFileSender {
+    path: PathBuf,
+    codec_config: Option<Vec<u8>>,
+    frames: Vec<Vec<u8>>,
+    next_frame: usize,
+    unacked: u32,
+    highest_ack: u32,
+    codec_config_sent: bool,
+}
+
+impl VideoFileSender {
+    fn load(path: PathBuf, frame_limit: usize) -> io::Result<Self> {
+        let data = std::fs::read(&path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot read --video-file {}: {err}", path.display()),
+            )
+        })?;
+        let mut parser = AnnexBStreamParser::new();
+        parser.push(&data);
+
+        let mut codec_config = Vec::new();
+        let mut frames = Vec::new();
+        while let Some(nal) = parser.next_nal().or_else(|| parser.finish()) {
+            match nal.nal_type() {
+                NalType::Sps | NalType::Pps => codec_config.extend_from_slice(nal.bytes()),
+                NalType::SliceIdr | NalType::SliceNonIdr => {
+                    frames.push(nal.bytes().to_vec());
+                    if frame_limit > 0 && frames.len() >= frame_limit {
+                        break;
+                    }
+                }
+                NalType::Sei | NalType::Aud => {
+                    // Keep these out of the minimal first sender. Once full access-unit
+                    // grouping is needed, prepend them to the next slice frame.
+                }
+                _ => {}
+            }
+        }
+
+        println!(
+            "video file loaded: path={} codec_config_bytes={} video_frames={} frame_limit={}",
+            path.display(),
+            codec_config.len(),
+            frames.len(),
+            frame_limit
+        );
+
+        Ok(Self {
+            path,
+            codec_config: if codec_config.is_empty() { None } else { Some(codec_config) },
+            frames,
+            next_frame: 0,
+            unacked: 0,
+            highest_ack: 0,
+            codec_config_sent: false,
+        })
+    }
+
+    fn on_ack(&mut self, ack_value: u32) {
+        if ack_value > self.highest_ack {
+            let delta = ack_value - self.highest_ack;
+            self.highest_ack = ack_value;
+            self.unacked = self.unacked.saturating_sub(delta);
+        }
+    }
+
+    fn send_available(
+        &mut self,
+        stream: &mut TcpStream,
+        tls: &mut tls::AapTlsServer,
+        channel: u8,
+        session_id: i32,
+        max_unacked: u32,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<usize> {
+        let mut tx_frames = 0usize;
+        if !self.codec_config_sent {
+            if let Some(config) = self.codec_config.as_ref() {
+                let payload = proto::build_media_codec_config_payload(config);
+                println!(
+                    "VIDEO_FILE sending MEDIA_MESSAGE_CODEC_CONFIG bytes={} source={}",
+                    config.len(),
+                    self.path.display()
+                );
+                log_line(
+                    dump,
+                    &format!(
+                        "VIDEO_FILE sending MEDIA_MESSAGE_CODEC_CONFIG bytes={} source={}",
+                        config.len(),
+                        self.path.display()
+                    ),
+                )?;
+                tx_frames += write_encrypted_plaintext_fragmented(
+                    stream,
+                    tls,
+                    channel,
+                    &payload,
+                    dump,
+                    "MEDIA_MESSAGE_CODEC_CONFIG",
+                )?;
+            } else {
+                println!("VIDEO_FILE no SPS/PPS codec config found in {}", self.path.display());
+                log_line(dump, &format!("VIDEO_FILE no SPS/PPS codec config found in {}", self.path.display()))?;
+            }
+            self.codec_config_sent = true;
+        }
+
+        let max_unacked = max_unacked.max(1);
+        while self.next_frame < self.frames.len() && self.unacked < max_unacked {
+            let frame_index = self.next_frame;
+            let pts_us = (frame_index as u64) * 33_333;
+            let payload = proto::build_media_data_payload(pts_us, &self.frames[frame_index]);
+            println!(
+                "VIDEO_FILE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
+                frame_index,
+                pts_us,
+                self.frames[frame_index].len(),
+                self.unacked + 1,
+                max_unacked,
+                session_id
+            );
+            log_line(
+                dump,
+                &format!(
+                    "VIDEO_FILE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
+                    frame_index,
+                    pts_us,
+                    self.frames[frame_index].len(),
+                    self.unacked + 1,
+                    max_unacked,
+                    session_id
+                ),
+            )?;
+            tx_frames += write_encrypted_plaintext_fragmented(
+                stream,
+                tls,
+                channel,
+                &payload,
+                dump,
+                "MEDIA_MESSAGE_DATA",
+            )?;
+            self.next_frame += 1;
+            self.unacked += 1;
+        }
+
+        if self.next_frame >= self.frames.len() && self.unacked == 0 {
+            println!("VIDEO_FILE finished: frames_sent={} source={}", self.frames.len(), self.path.display());
+            log_line(dump, &format!("VIDEO_FILE finished: frames_sent={} source={}", self.frames.len(), self.path.display()))?;
+        }
+
+        Ok(tx_frames)
+    }
 }
 
 fn is_control_message(payload: &[u8], id: u16) -> bool {

@@ -32,3 +32,12 @@ Next after test:
 - Added explicit `MEDIA_MESSAGE_SETUP` after `CHANNEL_OPEN_RESPONSE opened=true`.
 - Improved `MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION` / request logging.
 - Next: after CONFIG/START, send first H.264 codec config / IDR data.
+
+## v27
+
+Docs-based AV DATA path:
+- Do not advance by guessing media states.
+- Verified from docs: video channel uses specific AV messages, not control.
+- `0x8000 SETUP`, `0x8003 CONFIG`, `0x8001 START` are already observed working.
+- Next DATA sender uses documented `0x0001 CODEC_CONFIG` and `0x0000 DATA` with 8-byte big-endian PTS header.
+- ACK-based flow control added for `0x8004 MEDIA_MESSAGE_ACK` and `max_unacked` from CONFIG.

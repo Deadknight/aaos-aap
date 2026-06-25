@@ -117,8 +117,8 @@ Commands:
   aap-service-discovery-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
       Runs VERSION + TLS, waits for AUTH_COMPLETE, sends encrypted protobuf ServiceDiscoveryRequest, and replies to PING_REQUEST.
 
-  aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
-      Alias for the current minimal AAP control session: service discovery, video MediaSinkService channel open, and encrypted ping responses.
+  aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
+      Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1022,6 +1022,8 @@ struct AapTlsHandshakeProbeArgs {
     response_minor: u16,
     response_status: u16,
     keys: PathBuf,
+    video_file: Option<PathBuf>,
+    video_frame_limit: usize,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1036,6 +1038,8 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         response_minor: args.response_minor,
         response_status: args.response_status,
         keys_path: args.keys,
+        video_file_path: args.video_file,
+        video_frame_limit: args.video_frame_limit,
     })?;
     Ok(())
 }
@@ -1068,6 +1072,8 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         response_minor: args.response_minor,
         response_status: args.response_status,
         keys_path: args.keys,
+        video_file_path: args.video_file,
+        video_frame_limit: args.video_frame_limit,
     })?;
     Ok(())
 }
@@ -1091,6 +1097,8 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         response_minor: args.response_minor,
         response_status: args.response_status,
         keys_path: args.keys,
+        video_file_path: args.video_file,
+        video_frame_limit: args.video_frame_limit,
     })?;
     Ok(())
 }
@@ -1105,6 +1113,8 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut response_minor = 7u16;
     let mut response_status = 0u16;
     let mut keys = PathBuf::from("/data/local/tmp/arda-certs");
+    let mut video_file: Option<PathBuf> = None;
+    let mut video_frame_limit = 30usize;
 
     let mut i = 0;
     while i < argv.len() {
@@ -1125,6 +1135,14 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--keys" | "--keys-path" => {
                 i += 1;
                 keys = PathBuf::from(argv.get(i).ok_or("--keys requires directory path")?);
+            }
+            "--video-file" | "--h264-file" => {
+                i += 1;
+                video_file = Some(PathBuf::from(argv.get(i).ok_or("--video-file requires path")?));
+            }
+            "--video-frames" | "--video-frame-limit" => {
+                i += 1;
+                video_frame_limit = argv.get(i).ok_or("--video-frames requires value")?.parse::<usize>()?;
             }
             "--timeout-ms" => {
                 i += 1;
@@ -1184,6 +1202,8 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         response_minor,
         response_status,
         keys,
+        video_file,
+        video_frame_limit,
     })
 }
 

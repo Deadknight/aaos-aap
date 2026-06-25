@@ -251,7 +251,7 @@ pub fn build_video_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::
 pub fn maybe_build_media_start_from_config_payload(
     payload: &[u8],
     session_id: i32,
-) -> Result<Option<(Vec<u8>, u32, String)>, protobuf::Error> {
+) -> Result<Option<(Vec<u8>, u32, u32, String)>, protobuf::Error> {
     if payload.len() < 2 {
         return Ok(None);
     }
@@ -279,7 +279,46 @@ pub fn maybe_build_media_start_from_config_payload(
         configuration_index,
         cfg.max_unacked()
     );
-    Ok(Some((out, configuration_index, summary)))
+    Ok(Some((out, configuration_index, cfg.max_unacked(), summary)))
+}
+
+
+/// Build MEDIA_MESSAGE_CODEC_CONFIG. Docs and aa-proxy media_tap both treat
+/// codec config as: 2-byte media message id + raw codec bytes (H.264 SPS/PPS).
+pub fn build_media_codec_config_payload(codec_config: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + codec_config.len());
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_CODEC_CONFIG.value() as u16).to_be_bytes());
+    out.extend_from_slice(codec_config);
+    out
+}
+
+/// Build MEDIA_MESSAGE_DATA with timestamp. Docs and aa-proxy media_tap use:
+/// 2-byte id + uint64 big-endian PTS in microseconds + encoded media bytes.
+pub fn build_media_data_payload(pts_us: u64, media_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 8 + media_data.len());
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_DATA.value() as u16).to_be_bytes());
+    out.extend_from_slice(&pts_us.to_be_bytes());
+    out.extend_from_slice(media_data);
+    out
+}
+
+/// If payload is MEDIA_MESSAGE_ACK, return (session_id, ack_counter, summary).
+pub fn parse_media_ack_payload(payload: &[u8]) -> Option<(i32, u32, String)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != MediaMessageId::MEDIA_MESSAGE_ACK.value() as u16 {
+        return None;
+    }
+    let msg = Ack::parse_from_bytes(&payload[2..]).ok()?;
+    let summary = format!(
+        "MEDIA_MESSAGE_ACK session_id={} ack={} receive_ts_count={}",
+        msg.session_id(),
+        msg.ack(),
+        msg.receive_timestamp_ns.len()
+    );
+    Some((msg.session_id(), msg.ack(), summary))
 }
 
 pub fn smoke_summary() -> String {

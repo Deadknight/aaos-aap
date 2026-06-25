@@ -34,3 +34,26 @@ AAP protobuf structs. The current requested codec is H.264 baseline
 
 Expected follow-up from DHU is `MEDIA_MESSAGE_CONFIG STATUS_READY`; existing
 logic then sends `MEDIA_MESSAGE_START`.
+
+## v27 - docs-based H264 file DATA probe
+
+Adds optional `--video-file PATH` / `--video-frames N` to `aap-session-probe`.
+After docs-confirmed AV sequence (`SETUP` -> `CONFIG STATUS_READY` -> `START`), the session can send Annex-B H264 using:
+
+- `MEDIA_MESSAGE_CODEC_CONFIG` (`0x0001`): raw H264 SPS/PPS bytes
+- `MEDIA_MESSAGE_DATA` (`0x0000`): `u64` big-endian PTS in microseconds + raw H264 NAL bytes
+- standard AAP plaintext fragmentation before TLS encryption for large payloads
+- `MEDIA_MESSAGE_ACK` (`0x8004`) tracking to respect `max_unacked`
+
+Example:
+
+```bash
+adb shell /data/local/tmp/arda-senderd aap-session-probe \
+  --addr 0.0.0.0:5277 \
+  --keys /data/local/tmp/arda-certs \
+  --dump /data/local/tmp/arda-aap-session.log \
+  --response 1.7 \
+  --max-frames 2000 \
+  --video-file /data/local/tmp/arda-test.h264 \
+  --video-frames 60
+```

@@ -61,3 +61,12 @@ Next after test:
 - Fix native-capture child stdout buffering for live AAP video.
 - Log first live stdout reads and first parsed NALs.
 - Select SDR video config with docs-backed resolution/fps/density/margin logging; native live capture follows SDR size/fps by default.
+
+### v30 live video pump fix
+
+Current issue: first native H264 IDR frame reaches DHU, but the display freezes. Logs show the video pipeline sends frame 0, receives ACKs, then only sends more frames when inbound HU frames wake the receive loop.
+
+Fix:
+- Enable a 20ms receive timeout after MEDIA_MESSAGE_START and pump video on timeout.
+- Interpret repeated ACK value 1 as one buffer released, not as cumulative high-watermark.
+- Keep service discovery / channel open / setup / start behavior unchanged.

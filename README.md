@@ -96,3 +96,25 @@ adb shell /data/local/tmp/arda-senderd aap-session-probe \
 - Native stdout mode is now unbuffered and flushes every MediaCodec output buffer so the AAP live-video reader can see SPS/PPS and frame NALs immediately.
 - `aap-session-probe --video-native` can auto-configure native capture size/fps from the selected SDR `VideoConfiguration`.
 - Use `--no-video-auto-config` to force manual `--video-size` / `--video-fps` values.
+
+## v30 live video pump fix
+
+- After `MEDIA_MESSAGE_START`, the session receive timeout is reduced to 20ms so live native video can be pumped between HU frames instead of only when ping/focus frames arrive.
+- `MEDIA_MESSAGE_ACK` is treated as releasing at least one in-flight media buffer. The DHU trace reports `ack=1` repeatedly, so treating it as a cumulative counter stalls after two frames.
+- This fixes the symptom where the first IDR frame appears in DHU, then the display freezes while pings continue.
+
+Test:
+
+```bash
+adb push target/aarch64-linux-android/release/arda-senderd /data/local/tmp/arda-senderd
+adb shell chmod 755 /data/local/tmp/arda-senderd
+adb shell /data/local/tmp/arda-senderd aap-session-probe \
+  --addr 0.0.0.0:5277 \
+  --keys /data/local/tmp/arda-certs \
+  --dump /data/local/tmp/arda-aap-session.log \
+  --response 1.7 \
+  --max-frames 5000 \
+  --video-native \
+  --video-bit-rate 2500000 \
+  --video-frames 0
+```

@@ -1535,6 +1535,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     };
     let mut handshake_done_logged = false;
     let mut decrypted_fragments = fragment::FragmentAssembler::default();
+    // Once media START is sent, the video sender must be pumped even when the
+    // HU is quiet.  Otherwise live video only advances on incoming ping/focus
+    // frames and appears frozen after the first IDR.
+    let mut video_pump_timeout_enabled = false;
 
     while frames < config.max_frames {
         let frame = match reader.read_frame(&mut stream) {
@@ -1548,6 +1552,27 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
+                if video_start_sent {
+                    if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
+                        let sent = sender.send_available(
+                            &mut stream,
+                            &mut tls,
+                            video_channel,
+                            video_session_id,
+                            video_max_unacked,
+                            &mut dump,
+                        )?;
+                        tx_ssl_frames += sent;
+                        if sent == 0 {
+                            // Avoid a busy loop when the capture reader has no complete NAL yet
+                            // or flow control is waiting for the next ACK.
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    } else {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    continue;
+                }
                 println!("read timeout after frames={frames} service_request_sent={service_request_sent} bytes={bytes}");
                 log_line(&mut dump, &format!("read timeout after frames={frames} service_request_sent={service_request_sent} bytes={bytes}"))?;
                 break;
@@ -1887,6 +1912,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     println!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
                     log_line(&mut dump, &format!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
 
+                    if !video_pump_timeout_enabled {
+                        stream.set_read_timeout(Some(Duration::from_millis(20)))?;
+                        video_pump_timeout_enabled = true;
+                        let line = "VIDEO_PUMP enabled: receive timeout reduced to 20ms so native video is pumped between HU frames";
+                        println!("{line}");
+                        log_line(&mut dump, line)?;
+                    }
+
                     if let Some(sender) = video_sender.as_mut() {
                         let sent = sender.send_available(
                             &mut stream,
@@ -2093,11 +2126,12 @@ impl VideoFileSender {
     }
 
     fn on_ack(&mut self, ack_value: u32) {
-        if ack_value > self.highest_ack {
-            let delta = ack_value - self.highest_ack;
-            self.highest_ack = ack_value;
-            self.unacked = self.unacked.saturating_sub(delta);
-        }
+        // In this DHU trace Ack.ack is reported as 1 for each acknowledged
+        // media buffer, not as a monotonically increasing cumulative counter.
+        // Treat every ACK as releasing at least one in-flight DATA frame.
+        let released = ack_value.max(1);
+        self.highest_ack = self.highest_ack.max(ack_value);
+        self.unacked = self.unacked.saturating_sub(released);
     }
 
     fn send_available(
@@ -2238,11 +2272,12 @@ impl VideoLiveSender {
     }
 
     fn on_ack(&mut self, ack_value: u32) {
-        if ack_value > self.highest_ack {
-            let delta = ack_value - self.highest_ack;
-            self.highest_ack = ack_value;
-            self.unacked = self.unacked.saturating_sub(delta);
-        }
+        // In this DHU trace Ack.ack is reported as 1 for each acknowledged
+        // media buffer, not as a monotonically increasing cumulative counter.
+        // Treat every ACK as releasing at least one in-flight DATA frame.
+        let released = ack_value.max(1);
+        self.highest_ack = self.highest_ack.max(ack_value);
+        self.unacked = self.unacked.saturating_sub(released);
     }
 
     fn configure_from_sdr(

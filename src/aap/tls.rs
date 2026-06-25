@@ -11,7 +11,7 @@ use rustls::sign::CertifiedKey;
 use rustls::version::TLS12;
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, ServerConnection, SignatureScheme};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -121,6 +121,17 @@ impl AapTlsServer {
             .negotiated_cipher_suite()
             .map(|s| s.suite().as_str().unwrap_or("unknown"))
             .unwrap_or("unknown")
+    }
+
+    /// Encrypt one plaintext AA application/control payload into TLS records.
+    /// The returned bytes are the payload of an AA frame with ENCRYPTED set.
+    pub fn encrypt_plaintext(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        self.conn.writer().write_all(plaintext)?;
+        let mut outgoing_tls = Vec::new();
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut outgoing_tls).map_err(io_other)?;
+        }
+        Ok(outgoing_tls)
     }
 }
 

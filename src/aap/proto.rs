@@ -110,3 +110,26 @@ pub fn smoke_summary() -> String {
     .unwrap_or_else(|| "AUTH decode failed".to_string());
     format!("proto OK: {auth}")
 }
+
+/// Build a phone-like ServiceDiscoveryRequest control payload.
+/// Returned bytes include the 2-byte AAP control message id followed by the
+/// protobuf body.
+pub fn build_service_discovery_request_control_payload(
+    label_text: &str,
+    device_name: &str,
+) -> Result<Vec<u8>, protobuf::Error> {
+    let mut req = ServiceDiscoveryRequest::new();
+    req.set_label_text(label_text.to_string());
+    req.set_device_name(device_name.to_string());
+
+    // Keep the first generated request minimal for compatibility.
+    // The rust-protobuf generator used in this tree does not expose a
+    // set_phone_info(...) helper for this field shape on every build; once the
+    // service-discovery round-trip is confirmed we can populate phone_info via
+    // the generated field API that this exact proto version exposes.
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(ControlMessageType::MESSAGE_SERVICE_DISCOVERY_REQUEST.value() as u16).to_be_bytes());
+    payload.extend_from_slice(&req.write_to_bytes()?);
+    Ok(payload)
+}

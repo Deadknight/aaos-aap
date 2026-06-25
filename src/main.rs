@@ -45,7 +45,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "aap-tls-handshake-probe" => aap_tls_handshake_probe(args.collect()),
         "aap-tls-plain-probe" => aap_tls_plain_probe(args.collect()),
         "aap-service-discovery-probe" => aap_service_discovery_probe(args.collect()),
+        "aap-session-probe" => aap_service_discovery_probe(args.collect()),
         "aap-proto-smoke" => aap_proto_smoke(),
+        "aap-fragment-smoke" => aap_fragment_smoke(),
         "version" | "--version" => {
             println!("arda-senderd {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -113,7 +115,13 @@ Commands:
       Runs VERSION + TLS, then keeps reading encrypted post-TLS AA frames and logs decrypted plaintext messages.
 
   aap-service-discovery-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
-      Runs VERSION + TLS, waits for AUTH_COMPLETE, then sends encrypted protobuf ServiceDiscoveryRequest.
+      Runs VERSION + TLS, waits for AUTH_COMPLETE, sends encrypted protobuf ServiceDiscoveryRequest, and replies to PING_REQUEST.
+
+  aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
+      Alias for the current minimal AAP control session: service discovery, video MediaSinkService channel open, and encrypted ping responses.
+
+  aap-fragment-smoke
+      Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
 
 Examples on AAOS:
   /data/local/tmp/arda-senderd capture-test --size 1280x720 --seconds 10 --out /sdcard/arda.h264
@@ -1034,6 +1042,11 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
 
 fn aap_proto_smoke() -> Result<(), Box<dyn std::error::Error>> {
     aap::proto_smoke()?;
+    Ok(())
+}
+
+fn aap_fragment_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    aap::fragment_smoke()?;
     Ok(())
 }
 

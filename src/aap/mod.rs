@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub mod proto;
+mod fragment;
 mod tls;
 
 #[derive(Debug, Clone)]
@@ -1334,7 +1335,16 @@ fn log_decrypted_payload(
         final_length: None,
         payload: plaintext.to_vec(),
     };
-    let hint = control_hint(&pseudo).map(|h| format!(" {h}")).unwrap_or_default();
+    let hint = control_hint(&pseudo)
+        .or_else(|| {
+            if channel != 0 && (flags & FLAG_CONTROL) == 0 {
+                proto::describe_media_payload(plaintext)
+            } else {
+                None
+            }
+        })
+        .map(|h| format!(" {h}"))
+        .unwrap_or_default();
     println!("decrypted AA payload #{index}: channel=0x{channel:02x} bytes={}{}", plaintext.len(), hint);
     if let Some(dump) = dump.as_mut() {
         writeln!(dump, "decrypted AA payload #{index}: channel=0x{channel:02x} bytes={}{}", plaintext.len(), hint)?;
@@ -1452,7 +1462,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut decrypted_frames = 0usize;
     let mut decrypted_bytes = 0usize;
     let mut service_request_sent = false;
+    let mut channel_open_sent = false;
+    let mut selected_video_service_id: Option<i32> = None;
+    let mut video_channel_opened = false;
+    let mut video_setup_sent = false;
+    let mut video_start_sent = false;
+    let video_session_id: i32 = 1;
     let mut handshake_done_logged = false;
+    let mut decrypted_fragments = fragment::FragmentAssembler::default();
 
     while frames < config.max_frames {
         let frame = match reader.read_frame(&mut stream) {
@@ -1555,6 +1572,35 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             if plaintext.is_empty() {
                 continue;
             }
+
+            let plaintext_frame = AapFrame {
+                channel: frame.channel,
+                flags: frame.flags & !FLAG_ENCRYPTED,
+                final_length: frame.final_length,
+                payload: plaintext,
+            };
+            let reassembled = decrypted_fragments.push(&plaintext_frame);
+            log_reassembly_wait_or_drop(&mut dump, frame.channel, &reassembled)?;
+            let plaintext = match reassembled {
+                fragment::ReassemblyResult::Complete { payload, fragments, expected_len } => {
+                    if fragments > 1 {
+                        let line = format!(
+                            "decrypted AA full-frame complete: channel=0x{:02x} fragments={} expected_len={:?} actual_len={}",
+                            frame.channel,
+                            fragments,
+                            expected_len,
+                            payload.len()
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
+                    payload
+                }
+                fragment::ReassemblyResult::Waiting { .. } | fragment::ReassemblyResult::Dropped(_) => {
+                    continue;
+                }
+            };
+
             decrypted_frames += 1;
             decrypted_bytes += plaintext.len();
             log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &plaintext)?;
@@ -1579,30 +1625,344 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     dump.flush()?;
                 }
 
-                let encrypted = tls.encrypt_plaintext(&control_payload)?;
-                let tx_frame = AapFrame {
-                    channel: 0,
-                    flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST | FLAG_ENCRYPTED,
-                    final_length: None,
-                    payload: encrypted,
-                };
-                write_frame(&mut stream, &tx_frame)?;
-                stream.flush()?;
+                let tx_count = write_encrypted_plaintext_fragmented(
+                    &mut stream,
+                    &mut tls,
+                    0,
+                    &control_payload,
+                    &mut dump,
+                    "ServiceDiscoveryRequest",
+                )?;
                 service_request_sent = true;
-                println!("tx encrypted ServiceDiscoveryRequest frame: tls_bytes={}", tx_frame.payload.len());
-                log_line(&mut dump, &format!("tx encrypted ServiceDiscoveryRequest frame: tls_bytes={} {}", tx_frame.payload.len(), tls_record_hint(&tx_frame.payload)))?;
+                tx_ssl_frames += tx_count;
+                println!("tx encrypted ServiceDiscoveryRequest frame(s): count={tx_count}");
+                log_line(&mut dump, &format!("tx encrypted ServiceDiscoveryRequest frame(s): count={tx_count}"))?;
+            }
+
+            if !channel_open_sent {
+                if let Some(summary) = proto::parse_service_discovery_response_control_payload(&plaintext)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                {
+                    println!("SERVICE_DISCOVERY_RESPONSE observed; parsed {} detail line(s)", summary.details.len());
+                    log_line(&mut dump, &format!("SERVICE_DISCOVERY_RESPONSE observed; parsed {} detail line(s)", summary.details.len()))?;
+                    for line in &summary.details {
+                        println!("{line}");
+                        log_line(&mut dump, line)?;
+                    }
+
+                    if let Some(video) = summary.video_media_sink {
+                        selected_video_service_id = Some(video.service_id);
+                        println!(
+                            "selected video MediaSinkService id={} type={} display_id={} display_type={} video_configs={} first_config={:?}",
+                            video.service_id,
+                            video.available_type,
+                            video.display_id,
+                            video.display_type,
+                            video.video_configs,
+                            video.first_video_config
+                        );
+                        log_line(
+                            &mut dump,
+                            &format!(
+                                "selected video MediaSinkService id={} type={} display_id={} display_type={} video_configs={} first_config={:?}",
+                                video.service_id,
+                                video.available_type,
+                                video.display_id,
+                                video.display_type,
+                                video.video_configs,
+                                video.first_video_config
+                            ),
+                        )?;
+
+                        let control_payload = proto::build_channel_open_request_control_payload(video.service_id, 0)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        log_line(&mut dump, &format!("tx ChannelOpenRequest plaintext bytes={} service_id={} priority=0", control_payload.len(), video.service_id))?;
+                        // CHANNEL_OPEN_REQUEST is a service-channel control frame, not a
+                        // channel-0 control message. DHU rejects it on channel 0 with
+                        // MESSAGE_UNEXPECTED_MESSAGE. Real AA/DHU traces use:
+                        //   channel = service_id
+                        //   flags   = ENCRYPTED | CONTROL | FIRST | LAST = 0x0f
+                        if let Some(dump) = dump.as_mut() {
+                            let pseudo = AapFrame {
+                                channel: video.service_id as u8,
+                                flags: FLAG_CONTROL | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                                final_length: None,
+                                payload: control_payload.clone(),
+                            };
+                            describe_frame(0, 0, peer, &pseudo, dump)?;
+                            dump.flush()?;
+                        }
+
+                        let tx_count = write_encrypted_plaintext_fragmented_with_flags(
+                            &mut stream,
+                            &mut tls,
+                            video.service_id as u8,
+                            FLAG_CONTROL,
+                            &control_payload,
+                            &mut dump,
+                            "CHANNEL_OPEN_REQUEST",
+                        )?;
+                        channel_open_sent = true;
+                        tx_ssl_frames += tx_count;
+                        println!("tx encrypted CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} flags=ENCRYPTED|CONTROL", video.service_id as u8, video.service_id);
+                        log_line(&mut dump, &format!("tx encrypted CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} flags=ENCRYPTED|CONTROL", video.service_id as u8, video.service_id))?;
+                    } else {
+                        println!("SERVICE_DISCOVERY_RESPONSE has no video MediaSinkService candidate yet");
+                        log_line(&mut dump, "SERVICE_DISCOVERY_RESPONSE has no video MediaSinkService candidate yet")?;
+                        channel_open_sent = true;
+                    }
+                }
+            }
+
+            if is_control_message(&plaintext, 0x0008) {
+                if selected_video_service_id.map(|id| id as u8) == Some(frame.channel) {
+                    video_channel_opened = true;
+                }
+                println!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}");
+                log_line(&mut dump, &format!("CHANNEL_OPEN_RESPONSE observed for selected_video_service_id={selected_video_service_id:?} opened={video_channel_opened}"))?;
+            }
+
+            if video_channel_opened
+                && !video_setup_sent
+                && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
+            {
+                let (media_payload, summary) = proto::build_video_media_setup_payload()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                println!("CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary}");
+                log_line(&mut dump, &format!("CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary}"))?;
+                log_line(&mut dump, &format!("tx MediaSetup plaintext bytes={} channel=0x{:02x}", media_payload.len(), frame.channel))?;
+
+                if let Some(dump) = dump.as_mut() {
+                    let pseudo = AapFrame {
+                        channel: frame.channel,
+                        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                        final_length: None,
+                        payload: media_payload.clone(),
+                    };
+                    describe_frame(0, 0, peer, &pseudo, dump)?;
+                    dump.flush()?;
+                }
+
+                let tx_count = write_encrypted_plaintext_fragmented(
+                    &mut stream,
+                    &mut tls,
+                    frame.channel,
+                    &media_payload,
+                    &mut dump,
+                    "MEDIA_MESSAGE_SETUP",
+                )?;
+                tx_ssl_frames += tx_count;
+                video_setup_sent = true;
+                println!("tx encrypted MEDIA_MESSAGE_SETUP frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                log_line(&mut dump, &format!("tx encrypted MEDIA_MESSAGE_SETUP frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+            }
+
+            if video_channel_opened
+                && video_setup_sent
+                && !video_start_sent
+                && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
+                && (frame.flags & FLAG_CONTROL) == 0
+            {
+                if let Some((media_payload, configuration_index, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, video_session_id)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                {
+                    println!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}");
+                    log_line(&mut dump, &format!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}"))?;
+                    log_line(&mut dump, &format!("tx MediaStart plaintext bytes={} session_id={} configuration_index={}", media_payload.len(), video_session_id, configuration_index))?;
+                    if let Some(dump) = dump.as_mut() {
+                        let pseudo = AapFrame {
+                            channel: frame.channel,
+                            flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                            final_length: None,
+                            payload: media_payload.clone(),
+                        };
+                        describe_frame(0, 0, peer, &pseudo, dump)?;
+                        dump.flush()?;
+                    }
+
+                    let tx_count = write_encrypted_plaintext_fragmented(
+                        &mut stream,
+                        &mut tls,
+                        frame.channel,
+                        &media_payload,
+                        &mut dump,
+                        "MEDIA_MESSAGE_START",
+                    )?;
+                    tx_ssl_frames += tx_count;
+                    video_start_sent = true;
+                    println!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                    log_line(&mut dump, &format!("tx encrypted MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                }
+            }
+
+            if let Some(control_payload) = proto::maybe_build_ping_response_control_payload(&plaintext)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            {
+                println!("PING_REQUEST observed; sending encrypted PING_RESPONSE");
+                log_line(&mut dump, "PING_REQUEST observed; sending encrypted PING_RESPONSE")?;
+                log_line(&mut dump, &format!("tx PingResponse plaintext bytes={}", control_payload.len()))?;
+                if let Some(dump) = dump.as_mut() {
+                    let pseudo = AapFrame {
+                        channel: 0,
+                        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                        final_length: None,
+                        payload: control_payload.clone(),
+                    };
+                    describe_frame(0, 0, peer, &pseudo, dump)?;
+                    dump.flush()?;
+                }
+
+                let tx_count = write_encrypted_plaintext_fragmented(
+                    &mut stream,
+                    &mut tls,
+                    0,
+                    &control_payload,
+                    &mut dump,
+                    "PING_RESPONSE",
+                )?;
+                tx_ssl_frames += tx_count;
+                println!("tx encrypted PING_RESPONSE frame(s): count={tx_count}");
+                log_line(&mut dump, &format!("tx encrypted PING_RESPONSE frame(s): count={tx_count}"))?;
             }
         }
     }
 
     let elapsed = started.elapsed();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
     Ok(())
 }
 
 fn is_control_message(payload: &[u8], id: u16) -> bool {
     payload.len() >= 2 && u16::from_be_bytes([payload[0], payload[1]]) == id
+}
+
+
+fn write_encrypted_plaintext_fragmented(
+    stream: &mut TcpStream,
+    tls: &mut tls::AapTlsServer,
+    channel: u8,
+    plaintext: &[u8],
+    dump: &mut Option<Box<dyn Write>>,
+    label: &str,
+) -> io::Result<usize> {
+    write_encrypted_plaintext_fragmented_with_flags(
+        stream,
+        tls,
+        channel,
+        0,
+        plaintext,
+        dump,
+        label,
+    )
+}
+
+fn write_encrypted_plaintext_fragmented_with_flags(
+    stream: &mut TcpStream,
+    tls: &mut tls::AapTlsServer,
+    channel: u8,
+    base_flags: u8,
+    plaintext: &[u8],
+    dump: &mut Option<Box<dyn Write>>,
+    label: &str,
+) -> io::Result<usize> {
+    let first = fragment::DEFAULT_FIRST_FRAGMENT_PAYLOAD_BYTES;
+    let continuation = fragment::openauto_continuation_fragment_payload_bytes(first);
+    let plain_frames = fragment::fragment_plain_payload(
+        plaintext,
+        fragment::PlainPayloadFragmentOptions {
+            channel,
+            base_flags,
+            first_fragment_payload_bytes: first,
+            continuation_fragment_payload_bytes: continuation,
+            first_final_length: Some(plaintext.len() as u32),
+        },
+    );
+
+    let multi = plain_frames.len() > 1;
+    if multi {
+        println!(
+            "tx {label}: fragmenting plaintext bytes={} into {} AA fragments first={} continuation={}",
+            plaintext.len(),
+            plain_frames.len(),
+            first,
+            continuation
+        );
+        log_line(
+            dump,
+            &format!(
+                "tx {label}: fragmenting plaintext bytes={} into {} AA fragments first={} continuation={}",
+                plaintext.len(),
+                plain_frames.len(),
+                first,
+                continuation
+            ),
+        )?;
+    }
+
+    let mut written = 0usize;
+    for (idx, plain_frame) in plain_frames.iter().enumerate() {
+        let encrypted = tls.encrypt_plaintext(&plain_frame.payload)?;
+        let tx_frame = AapFrame {
+            channel: plain_frame.channel,
+            flags: plain_frame.flags | FLAG_ENCRYPTED,
+            final_length: plain_frame.final_length,
+            payload: encrypted,
+        };
+        write_frame(stream, &tx_frame)?;
+        written += 1;
+
+        if multi {
+            println!(
+                "tx {label} fragment {}/{}: type={} plain_bytes={} tls_bytes={} final_len={:?}",
+                idx + 1,
+                plain_frames.len(),
+                frame_type_name(tx_frame.flags),
+                plain_frame.payload.len(),
+                tx_frame.payload.len(),
+                tx_frame.final_length
+            );
+            log_line(
+                dump,
+                &format!(
+                    "tx {label} fragment {}/{}: type={} plain_bytes={} tls_bytes={} final_len={:?} {}",
+                    idx + 1,
+                    plain_frames.len(),
+                    frame_type_name(tx_frame.flags),
+                    plain_frame.payload.len(),
+                    tx_frame.payload.len(),
+                    tx_frame.final_length,
+                    tls_record_hint(&tx_frame.payload)
+                ),
+            )?;
+        }
+    }
+
+    stream.flush()?;
+    Ok(written)
+}
+
+fn log_reassembly_wait_or_drop(
+    dump: &mut Option<Box<dyn Write>>,
+    channel: u8,
+    result: &fragment::ReassemblyResult,
+) -> io::Result<()> {
+    match result {
+        fragment::ReassemblyResult::Waiting { fragments, expected_len, actual_len } => {
+            let line = format!(
+                "decrypted AA fragment_wait: channel=0x{channel:02x} fragments={} expected_len={:?} actual_len={}",
+                fragments, expected_len, actual_len
+            );
+            println!("{line}");
+            log_line(dump, &line)
+        }
+        fragment::ReassemblyResult::Dropped(reason) => {
+            let line = format!("decrypted AA fragment_drop: {reason}");
+            println!("{line}");
+            log_line(dump, &line)
+        }
+        fragment::ReassemblyResult::Complete { .. } => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1614,6 +1974,14 @@ pub fn proto_smoke() -> io::Result<()> {
     println!("{}", proto::smoke_summary());
     println!("generated module: OUT_DIR/protos/mod.rs");
     println!("next: build ServiceDiscoveryRequest/Response and ChannelOpen messages via proto structs");
+    Ok(())
+}
+
+pub fn fragment_smoke() -> io::Result<()> {
+    println!("arda aap fragment smoke");
+    println!("{}", fragment::smoke_summary());
+    println!("policy: split plaintext/application payload before TLS; encrypt each fragment separately");
+    println!("first fragment carries final_length = total plaintext payload length");
     Ok(())
 }
 

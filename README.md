@@ -118,3 +118,22 @@ adb shell /data/local/tmp/arda-senderd aap-session-probe \
   --video-bit-rate 2500000 \
   --video-frames 0
 ```
+
+## v31: SDR resolution/density/margin aware video config
+
+- `aap-session-probe` can now select HU video config with `--video-config-policy highest|balanced|lowest|index:N`.
+- SDR video config logs now include codec stream size, density, real_density, per-side margins, content insets, stable insets, content area and safe area.
+- Optional `--apply-wm-config` applies selected SDR config to Android WindowManager before native capture starts.
+  - `--wm-size-mode stream` uses codec resolution, for example 1920x1080.
+  - `--wm-size-mode content` uses codec resolution minus HU margins.
+  - `--wm-size-mode safe` uses content size minus content insets.
+  - `--wm-density-mode density|real` selects SDR density or real_density.
+- Default remains safe: no `wm` changes are applied unless `--apply-wm-config` is given.
+
+Reset if needed:
+
+```bash
+adb shell wm size reset
+adb shell wm density reset
+adb reboot
+```

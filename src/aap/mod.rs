@@ -860,10 +860,16 @@ pub struct TlsHandshakeProbeConfig {
     pub video_frame_limit: usize,
     pub video_native: bool,
     pub video_auto_config: bool,
+    pub video_config_policy: String,
+    pub video_apply_wm_config: bool,
+    pub video_wm_size_mode: String,
+    pub video_wm_density_mode: String,
+    pub video_wm_settle_ms: u64,
     pub video_width: i32,
     pub video_height: i32,
     pub video_bit_rate: i32,
     pub video_fps: i32,
+    pub video_density: u32,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -882,10 +888,16 @@ impl Default for TlsHandshakeProbeConfig {
             video_frame_limit: 30,
             video_native: false,
             video_auto_config: true,
+            video_config_policy: "highest".to_string(),
+            video_apply_wm_config: false,
+            video_wm_size_mode: "stream".to_string(),
+            video_wm_density_mode: "density".to_string(),
+            video_wm_settle_ms: 1200,
             video_width: 800,
             video_height: 480,
             video_bit_rate: 2_500_000,
             video_fps: 30,
+            video_density: 160,
         }
     }
 }
@@ -1442,13 +1454,19 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         log_line(
             &mut dump,
             &format!(
-                "video_native=true size={}x{} bit_rate={} fps={} frame_limit={} auto_config={}",
+                "video_native=true size={}x{} bit_rate={} fps={} density={} frame_limit={} auto_config={} policy={} apply_wm={} wm_size_mode={} wm_density_mode={} wm_settle_ms={}",
                 config.video_width,
                 config.video_height,
                 config.video_bit_rate,
                 config.video_fps,
+                config.video_density,
                 config.video_frame_limit,
-                config.video_auto_config
+                config.video_auto_config,
+                config.video_config_policy,
+                config.video_apply_wm_config,
+                config.video_wm_size_mode,
+                config.video_wm_density_mode,
+                config.video_wm_settle_ms
             ),
         )?;
     } else {
@@ -1525,7 +1543,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             height: config.video_height,
             bit_rate: config.video_bit_rate,
             fps: config.video_fps,
+            density: config.video_density,
             frame_limit: config.video_frame_limit,
+            apply_wm_config: config.video_apply_wm_config,
+            wm_size_mode: config.video_wm_size_mode.clone(),
+            wm_density_mode: config.video_wm_density_mode.clone(),
+            wm_settle_ms: config.video_wm_settle_ms,
         })))
     } else {
         match &config.video_file_path {
@@ -1730,7 +1753,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             }
 
             if !channel_open_sent {
-                if let Some(summary) = proto::parse_service_discovery_response_control_payload(&plaintext)
+                if let Some(summary) = proto::parse_service_discovery_response_control_payload(&plaintext, &config.video_config_policy)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                 {
                     println!("SERVICE_DISCOVERY_RESPONSE observed; parsed {} detail line(s)", summary.details.len());
@@ -1767,7 +1790,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                         if config.video_auto_config {
                             if let Some(vc) = video.selected_video_config.as_ref() {
                                 let line = format!(
-                                    "VIDEO_AUTO_CONFIG selected from SDR: service_id={} config_index={} {}x{} fps={} density={} real_density={} margins={}x{} codec={} resolution={}",
+                                    "VIDEO_AUTO_CONFIG selected from SDR: policy={} service_id={} config_index={} stream={}x{} fps={} density={} real_density={} total_margins={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{} content_insets=L{} R{} T{} B{} codec={} resolution={}",
+                                    config.video_config_policy,
                                     video.service_id,
                                     vc.config_index,
                                     vc.width,
@@ -1777,6 +1801,18 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                     vc.real_density,
                                     vc.width_margin,
                                     vc.height_margin,
+                                    vc.margin_left,
+                                    vc.margin_right,
+                                    vc.margin_top,
+                                    vc.margin_bottom,
+                                    vc.content_width,
+                                    vc.content_height,
+                                    vc.safe_width,
+                                    vc.safe_height,
+                                    vc.content_inset_left,
+                                    vc.content_inset_right,
+                                    vc.content_inset_top,
+                                    vc.content_inset_bottom,
                                     vc.codec,
                                     vc.resolution
                                 );
@@ -1790,6 +1826,22 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                 println!("{line}");
                                 log_line(&mut dump, line)?;
                             }
+                        } else if let Some(vc) = video.selected_video_config.as_ref() {
+                            let line = format!(
+                                "VIDEO_AUTO_CONFIG disabled: keeping manual native size={}x{} fps={} density={} even though SDR selected config_index={} stream={}x{} fps={} density={} resolution={}",
+                                config.video_width,
+                                config.video_height,
+                                config.video_fps,
+                                config.video_density,
+                                vc.config_index,
+                                vc.width,
+                                vc.height,
+                                vc.fps,
+                                vc.density,
+                                vc.resolution
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
                         }
 
                         let control_payload = proto::build_channel_open_request_control_payload(video.service_id, 0)
@@ -2228,8 +2280,13 @@ struct VideoLiveConfig {
     height: i32,
     bit_rate: i32,
     fps: i32,
+    density: u32,
     /// 0 means unlimited; otherwise stop sending after this many video slice NALs.
     frame_limit: usize,
+    apply_wm_config: bool,
+    wm_size_mode: String,
+    wm_density_mode: String,
+    wm_settle_ms: u64,
 }
 
 #[derive(Debug)]
@@ -2252,6 +2309,8 @@ struct VideoLiveSender {
     unacked: u32,
     highest_ack: u32,
     ended: bool,
+    wm_applied: bool,
+    wm_settled: bool,
 }
 
 impl VideoLiveSender {
@@ -2268,6 +2327,8 @@ impl VideoLiveSender {
             unacked: 0,
             highest_ack: 0,
             ended: false,
+            wm_applied: false,
+            wm_settled: false,
         }
     }
 
@@ -2278,6 +2339,107 @@ impl VideoLiveSender {
         let released = ack_value.max(1);
         self.highest_ack = self.highest_ack.max(ack_value);
         self.unacked = self.unacked.saturating_sub(released);
+    }
+
+    fn wm_density_for_selection(&self, selection: &proto::VideoConfigSelection) -> u32 {
+        match self.config.wm_density_mode.as_str() {
+            "real" | "real_density" => selection.real_density.max(1),
+            _ => selection.density.max(1),
+        }
+    }
+
+    fn wm_size_for_selection(&self, selection: &proto::VideoConfigSelection) -> (i32, i32, &'static str) {
+        match self.config.wm_size_mode.as_str() {
+            "content" | "content_area" => (selection.content_width, selection.content_height, "content"),
+            "safe" | "safe_area" => (selection.safe_width, selection.safe_height, "safe"),
+            _ => (selection.width, selection.height, "stream"),
+        }
+    }
+
+    fn apply_wm_config_from_sdr(
+        &mut self,
+        selection: &proto::VideoConfigSelection,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if !self.config.apply_wm_config {
+            let line = format!(
+                "WM_CONFIG not applied: stream={}x{} density={} real_density={} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
+                selection.width,
+                selection.height,
+                selection.density,
+                selection.real_density,
+                selection.margin_left,
+                selection.margin_right,
+                selection.margin_top,
+                selection.margin_bottom,
+                selection.content_width,
+                selection.content_height,
+                selection.safe_width,
+                selection.safe_height
+            );
+            println!("{line}");
+            return log_line(dump, &line);
+        }
+
+        let (wm_width, wm_height, size_mode) = self.wm_size_for_selection(selection);
+        let wm_density = self.wm_density_for_selection(selection);
+        let line = format!(
+            "WM_CONFIG applying: size={}x{} mode={} density={} density_mode={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
+            wm_width,
+            wm_height,
+            size_mode,
+            wm_density,
+            self.config.wm_density_mode,
+            selection.width,
+            selection.height,
+            selection.margin_left,
+            selection.margin_right,
+            selection.margin_top,
+            selection.margin_bottom,
+            selection.content_width,
+            selection.content_height,
+            selection.safe_width,
+            selection.safe_height
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        let size_arg = format!("{}x{}", wm_width, wm_height);
+        let density_arg = wm_density.to_string();
+        let status_size = Command::new("wm").arg("size").arg(&size_arg).status();
+        log_line(dump, &format!("WM_CONFIG command: wm size {} -> {:?}", size_arg, status_size))?;
+        let status_density = Command::new("wm").arg("density").arg(&density_arg).status();
+        log_line(dump, &format!("WM_CONFIG command: wm density {} -> {:?}", density_arg, status_density))?;
+        self.wm_applied = true;
+        Ok(())
+    }
+
+    fn apply_manual_wm_config_if_needed(
+        &mut self,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if !self.config.apply_wm_config || self.wm_applied {
+            return Ok(());
+        }
+
+        let size_arg = format!("{}x{}", self.config.width, self.config.height);
+        let density_arg = self.config.density.max(1).to_string();
+        let line = format!(
+            "WM_CONFIG applying manual native config: size={} density={} size_mode={} density_mode={} note=no SDR auto-config applied",
+            size_arg,
+            density_arg,
+            self.config.wm_size_mode,
+            self.config.wm_density_mode
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        let status_size = Command::new("wm").arg("size").arg(&size_arg).status();
+        log_line(dump, &format!("WM_CONFIG command: wm size {} -> {:?}", size_arg, status_size))?;
+        let status_density = Command::new("wm").arg("density").arg(&density_arg).status();
+        log_line(dump, &format!("WM_CONFIG command: wm density {} -> {:?}", density_arg, status_density))?;
+        self.wm_applied = true;
+        Ok(())
     }
 
     fn configure_from_sdr(
@@ -2293,8 +2455,9 @@ impl VideoLiveSender {
         self.config.width = selection.width;
         self.config.height = selection.height;
         self.config.fps = selection.fps;
+        self.config.density = self.wm_density_for_selection(selection);
         let line = format!(
-            "VIDEO_NATIVE configured from SDR: size={}x{} fps={} bit_rate={} density={} real_density={} margins={}x{} config_index={} codec={} resolution={}",
+            "VIDEO_NATIVE configured from SDR: stream_size={}x{} fps={} bit_rate={} density={} real_density={} total_margins={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{} config_index={} codec={} resolution={}",
             self.config.width,
             self.config.height,
             self.config.fps,
@@ -2303,18 +2466,46 @@ impl VideoLiveSender {
             selection.real_density,
             selection.width_margin,
             selection.height_margin,
+            selection.margin_left,
+            selection.margin_right,
+            selection.margin_top,
+            selection.margin_bottom,
+            selection.content_width,
+            selection.content_height,
+            selection.safe_width,
+            selection.safe_height,
             selection.config_index,
             selection.codec,
             selection.resolution
         );
         println!("{line}");
-        log_line(dump, &line)
+        log_line(dump, &line)?;
+        self.apply_wm_config_from_sdr(selection, dump)
+    }
+
+    fn settle_after_wm_if_needed(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        if !self.wm_applied || self.wm_settled || self.config.wm_settle_ms == 0 {
+            return Ok(());
+        }
+
+        let line = format!(
+            "WM_CONFIG settling before native capture: wait_ms={} note=screenrecord may stall if started while display is reconfiguring",
+            self.config.wm_settle_ms
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+        thread::sleep(Duration::from_millis(self.config.wm_settle_ms));
+        self.wm_settled = true;
+        Ok(())
     }
 
     fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
         if self.child.is_some() || self.ended {
             return Ok(());
         }
+
+        self.apply_manual_wm_config_if_needed(dump)?;
+        self.settle_after_wm_if_needed(dump)?;
 
         let exe = env::current_exe()?;
         let size = format!("{}x{}", self.config.width, self.config.height);

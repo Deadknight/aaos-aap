@@ -120,7 +120,7 @@ Commands:
   aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
       Full AAP session probe: service discovery, video channel open/setup/start, ping responses, optional H264 file send.
 
-  aap-session-probe ... --video-native [--video-size 800x480] [--video-bit-rate 2500000] [--video-fps 30] [--video-frames 0]
+  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200]
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
@@ -1030,10 +1030,16 @@ struct AapTlsHandshakeProbeArgs {
     video_frame_limit: usize,
     video_native: bool,
     video_auto_config: bool,
+    video_config_policy: String,
+    video_apply_wm_config: bool,
+    video_wm_size_mode: String,
+    video_wm_density_mode: String,
+    video_wm_settle_ms: u64,
     video_width: i32,
     video_height: i32,
     video_bit_rate: i32,
     video_fps: i32,
+    video_density: u32,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1052,10 +1058,16 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         video_frame_limit: args.video_frame_limit,
         video_native: args.video_native,
         video_auto_config: args.video_auto_config,
+        video_config_policy: args.video_config_policy,
+        video_apply_wm_config: args.video_apply_wm_config,
+        video_wm_size_mode: args.video_wm_size_mode,
+        video_wm_density_mode: args.video_wm_density_mode,
+        video_wm_settle_ms: args.video_wm_settle_ms,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
+        video_density: args.video_density,
     })?;
     Ok(())
 }
@@ -1092,10 +1104,16 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         video_frame_limit: args.video_frame_limit,
         video_native: args.video_native,
         video_auto_config: args.video_auto_config,
+        video_config_policy: args.video_config_policy,
+        video_apply_wm_config: args.video_apply_wm_config,
+        video_wm_size_mode: args.video_wm_size_mode,
+        video_wm_density_mode: args.video_wm_density_mode,
+        video_wm_settle_ms: args.video_wm_settle_ms,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
+        video_density: args.video_density,
     })?;
     Ok(())
 }
@@ -1123,10 +1141,16 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         video_frame_limit: args.video_frame_limit,
         video_native: args.video_native,
         video_auto_config: args.video_auto_config,
+        video_config_policy: args.video_config_policy,
+        video_apply_wm_config: args.video_apply_wm_config,
+        video_wm_size_mode: args.video_wm_size_mode,
+        video_wm_density_mode: args.video_wm_density_mode,
+        video_wm_settle_ms: args.video_wm_settle_ms,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
         video_fps: args.video_fps,
+        video_density: args.video_density,
     })?;
     Ok(())
 }
@@ -1145,10 +1169,16 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut video_frame_limit = 30usize;
     let mut video_native = false;
     let mut video_auto_config = true;
+    let mut video_config_policy = String::from("highest");
+    let mut video_apply_wm_config = false;
+    let mut video_wm_size_mode = String::from("stream");
+    let mut video_wm_density_mode = String::from("density");
+    let mut video_wm_settle_ms = 1200u64;
     let mut video_width = 800i32;
     let mut video_height = 480i32;
     let mut video_bit_rate = 2_500_000i32;
     let mut video_fps = 30i32;
+    let mut video_density = 160u32;
 
     let mut i = 0;
     while i < argv.len() {
@@ -1187,6 +1217,34 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--no-video-auto-config" | "--video-manual-config" => {
                 video_auto_config = false;
             }
+            "--video-config-policy" | "--video-policy" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--video-config-policy requires highest|balanced|lowest|index:N")?;
+                video_config_policy = aap::proto::normalize_video_config_policy(value);
+            }
+            "--video-config-index" | "--video-index" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--video-config-index requires number")?.parse::<usize>()?;
+                video_config_policy = format!("index:{value}");
+            }
+            "--apply-wm-config" => {
+                video_apply_wm_config = true;
+            }
+            "--no-apply-wm-config" => {
+                video_apply_wm_config = false;
+            }
+            "--wm-size-mode" => {
+                i += 1;
+                video_wm_size_mode = argv.get(i).ok_or("--wm-size-mode requires stream|content|safe")?.to_ascii_lowercase();
+            }
+            "--wm-density-mode" => {
+                i += 1;
+                video_wm_density_mode = argv.get(i).ok_or("--wm-density-mode requires density|real")?.to_ascii_lowercase();
+            }
+            "--wm-settle-ms" | "--video-wm-settle-ms" => {
+                i += 1;
+                video_wm_settle_ms = argv.get(i).ok_or("--wm-settle-ms requires milliseconds")?.parse::<u64>()?;
+            }
             "--video-size" | "--live-size" => {
                 i += 1;
                 let value = argv.get(i).ok_or("--video-size requires WIDTHxHEIGHT")?;
@@ -1201,6 +1259,10 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--video-fps" | "--live-fps" => {
                 i += 1;
                 video_fps = argv.get(i).ok_or("--video-fps requires value")?.parse::<i32>()?;
+            }
+            "--video-density" | "--wm-density" | "--live-density" => {
+                i += 1;
+                video_density = argv.get(i).ok_or("--video-density requires DPI value")?.parse::<u32>()?;
             }
             "--timeout-ms" => {
                 i += 1;
@@ -1261,6 +1323,18 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if video_fps <= 0 || video_fps > 60 {
         return Err("--video-fps must be 1..60".into());
     }
+    if video_density == 0 {
+        return Err("--video-density must be positive".into());
+    }
+    if !matches!(video_wm_size_mode.as_str(), "stream" | "content" | "content_area" | "safe" | "safe_area") {
+        return Err("--wm-size-mode must be stream, content, or safe".into());
+    }
+    if !matches!(video_wm_density_mode.as_str(), "density" | "real" | "real_density") {
+        return Err("--wm-density-mode must be density or real".into());
+    }
+    if video_wm_settle_ms > 10_000 {
+        return Err("--wm-settle-ms must be 0..10000".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -1276,10 +1350,16 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         video_frame_limit,
         video_native,
         video_auto_config,
+        video_config_policy,
+        video_apply_wm_config,
+        video_wm_size_mode,
+        video_wm_density_mode,
+        video_wm_settle_ms,
         video_width,
         video_height,
         video_bit_rate,
         video_fps,
+        video_density,
     })
 }
 

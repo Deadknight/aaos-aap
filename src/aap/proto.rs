@@ -65,7 +65,7 @@ pub fn describe_control_body(id: u16, body: &[u8]) -> Option<String> {
             ))
         }
         Some(ControlMessageType::MESSAGE_SERVICE_DISCOVERY_RESPONSE) => {
-            let summary = summarize_service_discovery_response_body(body).ok()?;
+            let summary = summarize_service_discovery_response_body(body, "highest").ok()?;
             Some(summary.one_line)
         }
         Some(ControlMessageType::MESSAGE_CHANNEL_OPEN_REQUEST) => {
@@ -360,9 +360,70 @@ pub struct VideoConfigSelection {
     pub real_density: u32,
     pub width_margin: u32,
     pub height_margin: u32,
+    pub margin_left: u32,
+    pub margin_right: u32,
+    pub margin_top: u32,
+    pub margin_bottom: u32,
+    pub content_inset_left: u32,
+    pub content_inset_right: u32,
+    pub content_inset_top: u32,
+    pub content_inset_bottom: u32,
+    pub stable_inset_left: u32,
+    pub stable_inset_right: u32,
+    pub stable_inset_top: u32,
+    pub stable_inset_bottom: u32,
+    pub content_width: i32,
+    pub content_height: i32,
+    pub safe_width: i32,
+    pub safe_height: i32,
     pub codec: String,
     pub resolution: String,
     pub summary: String,
+}
+
+fn clamp_dim(v: i32) -> i32 {
+    v.max(1)
+}
+
+fn insets_tuple(insets: Option<&Insets>) -> (u32, u32, u32, u32) {
+    match insets {
+        Some(i) => (i.left(), i.right(), i.top(), i.bottom()),
+        None => (0, 0, 0, 0),
+    }
+}
+
+fn video_config_layout(vc: &VideoConfiguration, width: i32, height: i32) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, i32, i32, i32, i32) {
+    let ui = vc.ui_config.as_ref();
+    let (mut margin_left, mut margin_right, mut margin_top, mut margin_bottom) =
+        insets_tuple(ui.and_then(|u| u.margins.as_ref()));
+
+    // Older/leaner HU configs sometimes only populate total width_margin/height_margin.
+    // Split those totals symmetrically when per-side UiConfig margins are absent.
+    if margin_left == 0 && margin_right == 0 && vc.width_margin() > 0 {
+        margin_left = vc.width_margin() / 2;
+        margin_right = vc.width_margin() - margin_left;
+    }
+    if margin_top == 0 && margin_bottom == 0 && vc.height_margin() > 0 {
+        margin_top = vc.height_margin() / 2;
+        margin_bottom = vc.height_margin() - margin_top;
+    }
+
+    let (content_inset_left, content_inset_right, content_inset_top, content_inset_bottom) =
+        insets_tuple(ui.and_then(|u| u.content_insets.as_ref()));
+    let (stable_inset_left, stable_inset_right, stable_inset_top, stable_inset_bottom) =
+        insets_tuple(ui.and_then(|u| u.stable_content_insets.as_ref()));
+
+    let content_width = clamp_dim(width - (margin_left + margin_right) as i32);
+    let content_height = clamp_dim(height - (margin_top + margin_bottom) as i32);
+    let safe_width = clamp_dim(content_width - (content_inset_left + content_inset_right) as i32);
+    let safe_height = clamp_dim(content_height - (content_inset_top + content_inset_bottom) as i32);
+
+    (
+        margin_left, margin_right, margin_top, margin_bottom,
+        content_inset_left, content_inset_right, content_inset_top, content_inset_bottom,
+        stable_inset_left, stable_inset_right, stable_inset_top, stable_inset_bottom,
+        content_width, content_height, safe_width, safe_height,
+    )
 }
 
 
@@ -389,53 +450,132 @@ fn video_fps_value(fps: VideoFrameRateType) -> i32 {
 
 fn video_config_summary(index: usize, vc: &VideoConfiguration) -> String {
     let (width, height) = video_resolution_dimensions(vc.codec_resolution()).unwrap_or((0, 0));
+    let (
+        margin_left, margin_right, margin_top, margin_bottom,
+        content_inset_left, content_inset_right, content_inset_top, content_inset_bottom,
+        stable_inset_left, stable_inset_right, stable_inset_top, stable_inset_bottom,
+        content_width, content_height, safe_width, safe_height,
+    ) = video_config_layout(vc, width, height);
     format!(
-        "index={} resolution={:?} {}x{} fps={:?}/{} margins={}x{} density={} real_density={} video_codec={:?}",
+        "index={} resolution={:?} {}x{} fps={:?}/{} density={} real_density={} total_margins={}x{} margins=L{} R{} T{} B{} content={}x{} content_insets=L{} R{} T{} B{} stable_insets=L{} R{} T{} B{} safe={}x{} video_codec={:?}",
         index,
         vc.codec_resolution(),
         width,
         height,
         vc.frame_rate(),
         video_fps_value(vc.frame_rate()),
-        vc.width_margin(),
-        vc.height_margin(),
         vc.density(),
         vc.real_density(),
+        vc.width_margin(),
+        vc.height_margin(),
+        margin_left, margin_right, margin_top, margin_bottom,
+        content_width, content_height,
+        content_inset_left, content_inset_right, content_inset_top, content_inset_bottom,
+        stable_inset_left, stable_inset_right, stable_inset_top, stable_inset_bottom,
+        safe_width, safe_height,
         vc.video_codec_type()
     )
 }
 
-fn select_best_video_config(configs: &[VideoConfiguration]) -> Option<VideoConfigSelection> {
-    configs
+fn make_video_config_selection(index: usize, vc: &VideoConfiguration) -> Option<VideoConfigSelection> {
+    let (width, height) = video_resolution_dimensions(vc.codec_resolution())?;
+    let fps = video_fps_value(vc.frame_rate());
+    let codec = format!("{:?}", vc.video_codec_type());
+    let resolution = format!("{:?}", vc.codec_resolution());
+    let summary = video_config_summary(index, vc);
+    let (
+        margin_left, margin_right, margin_top, margin_bottom,
+        content_inset_left, content_inset_right, content_inset_top, content_inset_bottom,
+        stable_inset_left, stable_inset_right, stable_inset_top, stable_inset_bottom,
+        content_width, content_height, safe_width, safe_height,
+    ) = video_config_layout(vc, width, height);
+    Some(VideoConfigSelection {
+        config_index: index,
+        width,
+        height,
+        fps,
+        density: vc.density(),
+        real_density: vc.real_density(),
+        width_margin: vc.width_margin(),
+        height_margin: vc.height_margin(),
+        margin_left,
+        margin_right,
+        margin_top,
+        margin_bottom,
+        content_inset_left,
+        content_inset_right,
+        content_inset_top,
+        content_inset_bottom,
+        stable_inset_left,
+        stable_inset_right,
+        stable_inset_top,
+        stable_inset_bottom,
+        content_width,
+        content_height,
+        safe_width,
+        safe_height,
+        codec,
+        resolution,
+        summary,
+    })
+}
+
+pub fn normalize_video_config_policy(policy: &str) -> String {
+    let p = policy.trim();
+    if p.is_empty() {
+        return "highest".to_string();
+    }
+    let lower = p.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("index:") {
+        if rest.parse::<usize>().is_ok() {
+            return lower;
+        }
+    }
+    match lower.as_str() {
+        "highest" | "max" | "best" => "highest".to_string(),
+        "balanced" | "medium" | "mid" => "balanced".to_string(),
+        "lowest" | "min" | "safe" => "lowest".to_string(),
+        _ => "highest".to_string(),
+    }
+}
+
+fn select_video_config(configs: &[VideoConfiguration], policy: &str) -> Option<VideoConfigSelection> {
+    let normalized = normalize_video_config_policy(policy);
+    let mut selections: Vec<VideoConfigSelection> = configs
         .iter()
         .enumerate()
-        .filter_map(|(index, vc)| {
-            let (width, height) = video_resolution_dimensions(vc.codec_resolution())?;
-            let fps = video_fps_value(vc.frame_rate());
-            let codec = format!("{:?}", vc.video_codec_type());
-            let resolution = format!("{:?}", vc.codec_resolution());
-            let summary = video_config_summary(index, vc);
-            let area = (width as i64) * (height as i64);
-            let score = area * 100 + fps as i64;
-            Some((
-                score,
-                VideoConfigSelection {
-                    config_index: index,
-                    width,
-                    height,
-                    fps,
-                    density: vc.density(),
-                    real_density: vc.real_density(),
-                    width_margin: vc.width_margin(),
-                    height_margin: vc.height_margin(),
-                    codec,
-                    resolution,
-                    summary,
-                },
-            ))
-        })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, selection)| selection)
+        .filter_map(|(index, vc)| make_video_config_selection(index, vc))
+        .collect();
+    if selections.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = normalized.strip_prefix("index:") {
+        if let Ok(index) = rest.parse::<usize>() {
+            if let Some(found) = selections.iter().find(|s| s.config_index == index) {
+                return Some(found.clone());
+            }
+        }
+    }
+
+    selections.sort_by_key(|s| ((s.width as i64) * (s.height as i64), s.fps as i64));
+    match normalized.as_str() {
+        "lowest" => selections.into_iter().next(),
+        "balanced" => {
+            let mut candidates: Vec<VideoConfigSelection> = selections
+                .iter()
+                .cloned()
+                .filter(|s| s.width <= 1280 && s.height <= 720)
+                .collect();
+            if candidates.is_empty() {
+                selections.into_iter().next()
+            } else {
+                candidates.sort_by_key(|s| ((s.width as i64) * (s.height as i64), s.fps as i64));
+                candidates.into_iter().last()
+            }
+        }
+        _ => selections.into_iter().last(),
+    }
 }
 
 /// Parse a MESSAGE_SERVICE_DISCOVERY_RESPONSE control payload, select the first
@@ -443,6 +583,7 @@ fn select_best_video_config(configs: &[VideoConfiguration]) -> Option<VideoConfi
 /// `payload` includes the 2-byte control message id.
 pub fn parse_service_discovery_response_control_payload(
     payload: &[u8],
+    video_config_policy: &str,
 ) -> Result<Option<ServiceDiscoverySummary>, protobuf::Error> {
     if payload.len() < 2 {
         return Ok(None);
@@ -451,11 +592,12 @@ pub fn parse_service_discovery_response_control_payload(
     if id != ControlMessageType::MESSAGE_SERVICE_DISCOVERY_RESPONSE.value() as u16 {
         return Ok(None);
     }
-    summarize_service_discovery_response_body(&payload[2..]).map(Some)
+    summarize_service_discovery_response_body(&payload[2..], video_config_policy).map(Some)
 }
 
 fn summarize_service_discovery_response_body(
     body: &[u8],
+    video_config_policy: &str,
 ) -> Result<ServiceDiscoverySummary, protobuf::Error> {
     let msg = ServiceDiscoveryResponse::parse_from_bytes(body)?;
     let mut details = Vec::new();
@@ -500,7 +642,7 @@ fn summarize_service_discovery_response_body(
                     .video_configs
                     .first()
                     .map(|vc| video_config_summary(0, vc));
-                let selected_video_config = select_best_video_config(&sink.video_configs);
+                let selected_video_config = select_video_config(&sink.video_configs, video_config_policy);
                 video_media_sink = Some(MediaSinkSelection {
                     service_id: svc.id(),
                     available_type,

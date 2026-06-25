@@ -70,3 +70,10 @@ Fix:
 - Enable a 20ms receive timeout after MEDIA_MESSAGE_START and pump video on timeout.
 - Interpret repeated ACK value 1 as one buffer released, not as cumulative high-watermark.
 - Keep service discovery / channel open / setup / start behavior unchanged.
+
+## v31
+
+- Add SDR video config policy selection: highest/balanced/lowest/index:N.
+- Parse and log margins/content-insets/stable-insets from VideoConfiguration.
+- Add optional WM application: stream/content/safe size modes and density/real_density modes.
+- Keep default non-invasive: no WM change unless explicitly requested.

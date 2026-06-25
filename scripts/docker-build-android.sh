@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ANDROID_HOME="${ANDROID_HOME:-/opt/android-sdk}"
+export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/android-ndk-r26d}"
 export ANDROID_API="${ANDROID_API:-23}"
-export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+export ANDROID_BUILD_TOOLS="${ANDROID_BUILD_TOOLS:-35.0.0}"
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS:$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
 
 TARGET="${TARGET:-aarch64-linux-android}"
 FEATURES="${FEATURES:-}"
@@ -20,7 +23,19 @@ elif [[ "$TARGET" == "armv7-linux-androideabi" ]]; then
   export AR_armv7_linux_androideabi="llvm-ar"
 fi
 
-echo "Building Rust + embedded native C++ probe for $TARGET (ANDROID_API=$ANDROID_API)"
+if [[ -z "${ANDROID_JAR:-}" ]]; then
+  ANDROID_JAR="$(find "$ANDROID_HOME/platforms" -name android.jar | sort -V | tail -n 1)"
+  export ANDROID_JAR
+fi
+
+if [[ -z "${D8:-}" ]]; then
+  D8="$(find "$ANDROID_HOME/build-tools" -name d8 | sort -V | tail -n 1)"
+  export D8
+fi
+
+echo "Building Rust + embedded native C++ probe + app_process inputd for $TARGET (ANDROID_API=$ANDROID_API)"
+echo "ANDROID_JAR=$ANDROID_JAR"
+echo "D8=$D8"
 
 if [[ -n "$FEATURES" ]]; then
   cargo build --release --target "$TARGET" --features "$FEATURES"

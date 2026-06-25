@@ -137,3 +137,33 @@ adb shell wm size reset
 adb shell wm density reset
 adb reboot
 ```
+
+### v39 app_process input injector
+
+`--input-inject` defaults to the older safe `uinput` backend. The app_process backend is kept as an explicit experimental mode: the Rust binary is still the only process started manually, then it writes an embedded `arda-inputd.jar`, launches it with `app_process`, sends mapped AA touchscreen/key events to it, and stops it when the session exits.
+
+Fallback modes are still available:
+
+```bash
+--input-inject-mode uinput   # default safe mode, old /dev/uinput virtual touchscreen
+--input-inject-mode app      # experimental InputManager.injectInputEvent via app_process
+--input-inject-mode shell    # slow /system/bin/input motionevent fallback
+```
+
+The Android Docker build installs SDK platform/build-tools because `build.rs` compiles the embedded input daemon with `javac` + `d8`.
+
+
+## v39d emergency note
+
+`--input-inject` no longer defaults to app_process injection. Default is back to `uinput` so the standard arda test command cannot start `arda-inputd` accidentally. Use `--input-inject-mode app` only for explicit experiments.
+
+### v39e app-process input safety
+
+`--input-inject-mode app` is kept available because drag/touch can work on AAOS, but it is no longer started during ServiceDiscovery. It starts lazily on first actual injected event, uses conservative Gearhead-like MotionEvent parameters, ignores stray MOVE/UP events without a live DOWN, and throttles MOVE events by default.
+
+Useful knobs:
+
+```bash
+--input-inject-mode app
+--input-app-move-min-ms 16   # default; use 0 to disable MOVE throttling, 32 to be safer
+```

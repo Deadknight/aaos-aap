@@ -1,9 +1,11 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     generate_protos();
+    build_inputd_java();
     build_native_cpp();
 }
 
@@ -20,6 +22,173 @@ fn generate_protos() {
         .include("proto")
         .inputs(["proto/protos.proto", "proto/ev.proto"])
         .run_from_script();
+}
+
+fn build_inputd_java() {
+    println!("cargo:rerun-if-changed=src/inputd/java/com/arda/input/InputServer.java");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
+    let jar_out = out_dir.join("arda_inputd.jar");
+    let target = env::var("TARGET").unwrap_or_default();
+
+    if !target.contains("android") {
+        // Host builds are not used for the app_process injector. Keep them possible.
+        fs::write(&jar_out, []).expect("write host placeholder arda_inputd.jar");
+        return;
+    }
+
+    let javac = env::var("JAVAC").unwrap_or_else(|_| "javac".to_string());
+    let d8 = find_d8().unwrap_or_else(|| {
+        panic!("Android d8 not found. Install Android build-tools or set D8=/path/to/d8")
+    });
+    let jar = env::var("JAR").unwrap_or_else(|_| "jar".to_string());
+    let android_jar = find_android_jar().unwrap_or_else(|| {
+        panic!("android.jar not found. Install an Android SDK platform or set ANDROID_JAR=/path/to/android.jar")
+    });
+
+    let src = PathBuf::from("src/inputd/java/com/arda/input/InputServer.java");
+    let classes_dir = out_dir.join("arda_inputd_classes");
+    let dex_dir = out_dir.join("arda_inputd_dex");
+    let _ = fs::remove_dir_all(&classes_dir);
+    let _ = fs::remove_dir_all(&dex_dir);
+    fs::create_dir_all(&classes_dir).expect("create inputd classes dir");
+    fs::create_dir_all(&dex_dir).expect("create inputd dex dir");
+
+    let javac_status = Command::new(&javac)
+        .args(["-source", "8", "-target", "8", "-encoding", "UTF-8"])
+        .arg("-classpath")
+        .arg(&android_jar)
+        .arg("-d")
+        .arg(&classes_dir)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run javac {javac}: {err}"));
+    if !javac_status.success() {
+        panic!("arda inputd javac failed with {javac_status}");
+    }
+
+    // D8 does not accept a raw classes directory on all build-tools versions
+    // (some versions fail with "Unsupported source file type"). Package the
+    // compiled .class tree into a temporary jar first, then dex that jar.
+    let classes_jar = out_dir.join("arda_inputd_classes.jar");
+    let _ = fs::remove_file(&classes_jar);
+    let classes_jar_status = Command::new(&jar)
+        .arg("cf")
+        .arg(&classes_jar)
+        .arg("-C")
+        .arg(&classes_dir)
+        .arg(".")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run jar {jar}: {err}"));
+    if !classes_jar_status.success() {
+        panic!("arda inputd class jar packaging failed with {classes_jar_status}");
+    }
+
+    let d8_status = Command::new(&d8)
+        .arg("--min-api")
+        .arg(env::var("ANDROID_API").unwrap_or_else(|_| "23".to_string()))
+        .arg("--classpath")
+        .arg(&android_jar)
+        .arg("--output")
+        .arg(&dex_dir)
+        .arg(&classes_jar)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run d8 {}: {err}", d8.display()));
+    if !d8_status.success() {
+        panic!("arda inputd d8 failed with {d8_status}");
+    }
+
+    let classes_dex = dex_dir.join("classes.dex");
+    if !classes_dex.exists() {
+        panic!("d8 did not produce {}", classes_dex.display());
+    }
+    let _ = fs::remove_file(&jar_out);
+    let jar_status = Command::new(&jar)
+        .arg("cf")
+        .arg(&jar_out)
+        .arg("-C")
+        .arg(&dex_dir)
+        .arg("classes.dex")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run jar {jar}: {err}"));
+    if !jar_status.success() {
+        panic!("arda inputd jar packaging failed with {jar_status}");
+    }
+}
+
+fn find_android_jar() -> Option<PathBuf> {
+    if let Ok(value) = env::var("ANDROID_JAR") {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    for env_name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(root) = env::var(env_name) {
+            let platforms = PathBuf::from(root).join("platforms");
+            if let Some(path) = newest_android_jar(&platforms) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn newest_android_jar(platforms: &Path) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(platforms)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path().join("android.jar");
+            if !path.exists() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let api = name.strip_prefix("android-").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+            Some((api, path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(api, _)| *api);
+    candidates.pop().map(|(_, path)| path)
+}
+
+fn find_d8() -> Option<PathBuf> {
+    if let Ok(value) = env::var("D8") {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    for env_name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(root) = env::var(env_name) {
+            let build_tools = PathBuf::from(root).join("build-tools");
+            if let Some(path) = newest_build_tool(&build_tools, "d8") {
+                return Some(path);
+            }
+        }
+    }
+
+    find_on_path("d8")
+}
+
+fn newest_build_tool(build_tools: &Path, tool: &str) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(build_tools)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(tool))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop()
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_env = env::var_os("PATH")?;
+    env::split_paths(&path_env)
+        .map(|dir| dir.join(name))
+        .find(|path| path.exists())
 }
 
 fn build_native_cpp() {

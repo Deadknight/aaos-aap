@@ -9,14 +9,40 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
-use crate::input::{self, TouchInjectAction, TouchInjector};
+use crate::input::{self, AppProcessInputInjector, TouchInjectAction, TouchInjector};
+
+static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+
+unsafe extern "C" {
+    fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
+}
+
+extern "C" fn handle_session_signal(_signum: c_int) {
+    SESSION_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_session_signal_handlers() {
+    SESSION_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    unsafe {
+        let _ = signal(SIGINT, handle_session_signal);
+        let _ = signal(SIGTERM, handle_session_signal);
+    }
+}
+
+fn session_shutdown_requested() -> bool {
+    SESSION_SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
 
 pub mod proto;
 mod fragment;
@@ -114,6 +140,14 @@ fn read_and_dump(
                 break;
             }
             Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
+            }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
@@ -285,6 +319,14 @@ pub fn frame_probe(config: FrameProbeConfig) -> io::Result<()> {
                 println!("client disconnected after frames={frames} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} bytes={bytes}"))?;
                 break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
@@ -737,12 +779,26 @@ pub fn ssl_frame_probe(config: SslFrameProbeConfig) -> io::Result<()> {
     let mut bytes = HEADER_LENGTH + version.payload.len() + HEADER_LENGTH + response_frame.payload.len();
     let mut ssl_frames = 0usize;
     while frames < config.max_frames {
+        if session_shutdown_requested() {
+            println!("shutdown requested; stopping AAP session");
+            log_line(&mut dump, "shutdown requested; stopping AAP session")?;
+            break;
+        }
+
         let frame = match reader.read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 println!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
                 break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
@@ -875,6 +931,7 @@ pub struct TlsHandshakeProbeConfig {
     pub input_key_binding: bool,
     pub input_inject: bool,
     pub input_inject_mode: String,
+    pub input_app_move_min_ms: u64,
     pub input_key_inject: bool,
     pub quiet_ping_logs: bool,
 }
@@ -909,6 +966,7 @@ impl Default for TlsHandshakeProbeConfig {
             input_key_binding: true,
             input_inject: false,
             input_inject_mode: "uinput".to_string(),
+            input_app_move_min_ms: 16,
             input_key_inject: false,
             quiet_ping_logs: true,
         }
@@ -1018,12 +1076,26 @@ pub fn tls_handshake_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     let mut decrypted_bytes = 0usize;
 
     while frames < config.max_frames {
+        if session_shutdown_requested() {
+            println!("shutdown requested; stopping AAP session");
+            log_line(&mut dump, "shutdown requested; stopping AAP session")?;
+            break;
+        }
+
         let frame = match reader.read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 println!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} ssl_frames={ssl_frames} bytes={bytes}"))?;
                 break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
@@ -1243,12 +1315,26 @@ pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     let mut handshake_done_logged = false;
 
     while frames < config.max_frames {
+        if session_shutdown_requested() {
+            println!("shutdown requested; stopping AAP session");
+            log_line(&mut dump, "shutdown requested; stopping AAP session")?;
+            break;
+        }
+
         let frame = match reader.read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 println!("client disconnected after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} bytes={bytes}"))?;
                 break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
@@ -1433,6 +1519,7 @@ fn log_decrypted_payload(
 /// ServiceDiscoveryRequest built through generated protobuf structs. The
 /// request is encrypted in TLS and transmitted as an AA frame with ENCRYPTED set.
 pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
+    install_session_signal_handlers();
     println!("arda aap service discovery probe");
     println!("addr={}", config.addr);
     println!("timeout_ms={}", config.timeout_ms);
@@ -1503,11 +1590,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     log_line(
         &mut dump,
         &format!(
-            "input_open={} input_key_binding={} input_inject={} input_inject_mode={} input_key_inject={}",
+            "input_open={} input_key_binding={} input_inject={} input_inject_mode={} input_app_move_min_ms={} input_key_inject={}",
             config.input_open,
             config.input_key_binding,
             config.input_inject,
             config.input_inject_mode,
+            config.input_app_move_min_ms,
             config.input_key_inject
         ),
     )?;
@@ -1577,7 +1665,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut selected_video_config_for_input: Option<proto::VideoConfigSelection> = None;
     let mut input_touch_map: Option<InputTouchMap> = None;
     let mut input_touch_injector: Option<TouchInjector> = None;
+    let mut input_app_injector: Option<AppProcessInputInjector> = None;
     let mut input_touch_inject_events = 0usize;
+    let mut input_app_move_drop_events = 0usize;
+    let mut last_app_move_inject_at: Option<std::time::Instant> = None;
     let mut input_key_inject_events = 0usize;
     let mut input_channel_open_sent = false;
     let mut input_channel_opened = false;
@@ -1614,12 +1705,26 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_pump_timeout_enabled = false;
 
     while frames < config.max_frames {
+        if session_shutdown_requested() {
+            println!("shutdown requested; stopping AAP session");
+            log_line(&mut dump, "shutdown requested; stopping AAP session")?;
+            break;
+        }
+
         let frame = match reader.read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 println!("client disconnected after frames={frames} service_request_sent={service_request_sent} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} service_request_sent={service_request_sent} bytes={bytes}"))?;
                 break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                println!("read interrupted by shutdown request; stopping AAP session");
+                log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                continue;
             }
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
@@ -2012,13 +2117,33 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             log_line(&mut dump, &line)?;
                             input_touch_map = Some(map.clone());
 
-                            // Create the uinput device as soon as the SDR/input geometry is
-                            // known, not on the first DOWN. Android InputReader may need a
-                            // moment to classify and attach the new direct-touch device to the
-                            // default display; creating it lazily on the first user gesture can
-                            // lose the beginning of a drag.
-                            if config.input_inject
+                            // Do not start app_process here. AAOS can get unstable if framework
+                            // input is armed before video/input focus has settled. App mode now
+                            // starts lazily on the first injected event; uinput still prepares
+                            // early because it only creates a virtual device.
+                            if false
+                                && (config.input_inject || config.input_key_inject)
+                                && is_app_process_input_inject_mode(&config.input_inject_mode)
+                                && input_app_injector.is_none()
+                            {
+                                match AppProcessInputInjector::create(input.display_id as i32) {
+                                    Ok((injector, report)) => {
+                                        for line in report.lines() {
+                                            let line = format!("INPUT_APP_INJECTOR_PREPARE {line}");
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                        input_app_injector = Some(injector);
+                                    }
+                                    Err(err) => {
+                                        let line = format!("INPUT_APP_INJECT prepare failed: {err}");
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                    }
+                                }
+                            } else if config.input_inject
                                 && !is_shell_touch_inject_mode(&config.input_inject_mode)
+                                && !is_app_process_input_inject_mode(&config.input_inject_mode)
                                 && input_touch_injector.is_none()
                             {
                                 match TouchInjector::create(map.target_width, map.target_height) {
@@ -2162,7 +2287,84 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                     };
 
                                     if let Some(action) = action {
-                                        if is_shell_touch_inject_mode(&config.input_inject_mode) {
+                                        if is_app_process_input_inject_mode(&config.input_inject_mode) {
+                                            if input_app_injector.is_none() {
+                                                let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                                match AppProcessInputInjector::create(display_id) {
+                                                    Ok((injector, report)) => {
+                                                        for line in report.lines() {
+                                                            let line = format!("INPUT_APP_INJECTOR {line}");
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                        input_app_injector = Some(injector);
+                                                    }
+                                                    Err(err) => {
+                                                        let line = format!("INPUT_APP_INJECT disabled: failed to start app_process inputd: {err}");
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                }
+                                            }
+
+                                            if let Some(injector) = input_app_injector.as_mut() {
+                                                let mut drop_app_move = false;
+                                                if matches!(action, TouchInjectAction::Move) && config.input_app_move_min_ms > 0 {
+                                                    let now = std::time::Instant::now();
+                                                    if let Some(last) = last_app_move_inject_at {
+                                                        if now.duration_since(last).as_millis() < config.input_app_move_min_ms as u128 {
+                                                            drop_app_move = true;
+                                                        }
+                                                    }
+                                                    if !drop_app_move {
+                                                        last_app_move_inject_at = Some(now);
+                                                    }
+                                                } else if !matches!(action, TouchInjectAction::Move) {
+                                                    last_app_move_inject_at = None;
+                                                }
+
+                                                if drop_app_move {
+                                                    input_app_move_drop_events += 1;
+                                                    if input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0 {
+                                                        let line = format!(
+                                                            "INPUT_APP_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
+                                                            pointer.x,
+                                                            pointer.y,
+                                                            x,
+                                                            y,
+                                                            pointer.pointer_id,
+                                                            input_app_move_drop_events,
+                                                            config.input_app_move_min_ms
+                                                        );
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                } else {
+                                                    match injector.inject_touch(action, x, y, pointer.pointer_id) {
+                                                        Ok(()) => {
+                                                            input_touch_inject_events += 1;
+                                                            let line = format!(
+                                                                "INPUT_APP_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                action,
+                                                                pointer.x,
+                                                                pointer.y,
+                                                                x,
+                                                                y,
+                                                                pointer.pointer_id,
+                                                                input_touch_inject_events
+                                                            );
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                        Err(err) => {
+                                                            let line = format!("INPUT_APP_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if is_shell_touch_inject_mode(&config.input_inject_mode) {
                                             match input::inject_touch_motionevent_shell(action, x, y) {
                                                 Ok(()) => {
                                                     input_touch_inject_events += 1;
@@ -2244,11 +2446,39 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                     continue;
                                 }
                                 if let Some(android_code) = input::android_passthrough_keycode(key.keycode) {
-                                    match input::inject_android_keyevent_shell(android_code) {
+                                    let key_result = if is_app_process_input_inject_mode(&config.input_inject_mode) {
+                                        if input_app_injector.is_none() {
+                                            let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                            match AppProcessInputInjector::create(display_id) {
+                                                Ok((injector, report)) => {
+                                                    for line in report.lines() {
+                                                        let line = format!("INPUT_APP_INJECTOR {line}");
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                    input_app_injector = Some(injector);
+                                                }
+                                                Err(err) => {
+                                                    let line = format!("INPUT_APP_KEY_INJECT disabled: failed to start app_process inputd: {err}");
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                            }
+                                        }
+                                        match input_app_injector.as_mut() {
+                                            Some(injector) => injector.inject_key_press(android_code),
+                                            None => Err(io::Error::new(io::ErrorKind::NotConnected, "app_process inputd is not available")),
+                                        }
+                                    } else {
+                                        input::inject_android_keyevent_shell(android_code)
+                                    };
+
+                                    match key_result {
                                         Ok(()) => {
                                             input_key_inject_events += 1;
                                             let line = format!(
-                                                "INPUT_KEY_INJECT keycode={}({}) android_keyevent={} events={}",
+                                                "INPUT_KEY_INJECT mode={} keycode={}({}) android_keyevent={} events={}",
+                                                config.input_inject_mode,
                                                 key.keycode,
                                                 proto::keycode_name(key.keycode),
                                                 android_code,
@@ -2258,7 +2488,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                             log_line(&mut dump, &line)?;
                                         }
                                         Err(err) => {
-                                            let line = format!("INPUT_KEY_INJECT error keycode={}({}): {err}", key.keycode, proto::keycode_name(key.keycode));
+                                            let line = format!("INPUT_KEY_INJECT error mode={} keycode={}({}): {err}", config.input_inject_mode, key.keycode, proto::keycode_name(key.keycode));
                                             println!("{line}");
                                             log_line(&mut dump, &line)?;
                                         }
@@ -3401,6 +3631,13 @@ fn build_ssl_frame(tls_bytes: &[u8]) -> AapFrame {
         final_length: None,
         payload,
     }
+}
+
+fn is_app_process_input_inject_mode(mode: &str) -> bool {
+    matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "app" | "framework" | "java" | "app-process" | "app_process" | "inputd"
+    )
 }
 
 fn is_shell_touch_inject_mode(mode: &str) -> bool {

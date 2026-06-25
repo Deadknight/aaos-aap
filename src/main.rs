@@ -124,8 +124,8 @@ Commands:
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
-  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|shell] [--input-key-inject] [--quiet-ping|--log-ping]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. Ping request/response logs are quiet by default in session mode.
+  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping]
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is app_process/framework, with uinput and shell fallback modes available. Ping request/response logs are quiet by default in session mode.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1047,6 +1047,7 @@ struct AapTlsHandshakeProbeArgs {
     input_key_binding: bool,
     input_inject: bool,
     input_inject_mode: String,
+    input_app_move_min_ms: u64,
     input_key_inject: bool,
     quiet_ping_logs: bool,
 }
@@ -1081,6 +1082,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         input_key_binding: args.input_key_binding,
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
+        input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
     })?;
@@ -1133,6 +1135,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         input_key_binding: args.input_key_binding,
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
+        input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
     })?;
@@ -1176,6 +1179,7 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         input_key_binding: args.input_key_binding,
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
+        input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
         quiet_ping_logs: args.quiet_ping_logs,
     })?;
@@ -1210,6 +1214,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut input_key_binding = true;
     let mut input_inject = false;
     let mut input_inject_mode = String::from("uinput");
+    let mut input_app_move_min_ms = 16u64;
     let mut input_key_inject = false;
     let mut quiet_ping_logs = true;
 
@@ -1315,11 +1320,15 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--input-inject-mode" | "--input-touch-mode" | "--touch-inject-mode" => {
                 i += 1;
-                let value = argv.get(i).ok_or("--input-inject-mode requires uinput|shell")?.to_ascii_lowercase();
+                let value = argv.get(i).ok_or("--input-inject-mode requires uinput|app|shell")?.to_ascii_lowercase();
                 input_inject_mode = match value.as_str() {
-                    "uinput" | "shell" | "motionevent" | "shell-motionevent" | "input" => value,
-                    other => return Err(format!("--input-inject-mode unsupported value: {other}; use uinput|shell").into()),
+                    "app" | "framework" | "java" | "app-process" | "app_process" | "inputd" | "uinput" | "shell" | "motionevent" | "shell-motionevent" | "input" => value,
+                    other => return Err(format!("--input-inject-mode unsupported value: {other}; use uinput|app|shell").into()),
                 };
+            }
+            "--input-app-move-min-ms" | "--app-input-move-min-ms" | "--input-move-min-ms" => {
+                i += 1;
+                input_app_move_min_ms = argv.get(i).ok_or("--input-app-move-min-ms requires milliseconds")?.parse::<u64>()?;
             }
             "--no-input-inject" | "--no-input-touch-inject" | "--no-inject-input" | "--no-inject-touch" => {
                 input_inject = false;
@@ -1438,6 +1447,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         input_key_binding,
         input_inject,
         input_inject_mode,
+        input_app_move_min_ms,
         input_key_inject,
         quiet_ping_logs,
     })

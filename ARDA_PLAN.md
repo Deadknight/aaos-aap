@@ -77,3 +77,21 @@ Fix:
 - Parse and log margins/content-insets/stable-insets from VideoConfiguration.
 - Add optional WM application: stream/content/safe size modes and density/real_density modes.
 - Keep default non-invasive: no WM change unless explicitly requested.
+
+## v39 app_process input injector
+
+- Default `--input-inject` backend is now `--input-inject-mode app`.
+- `arda-senderd` embeds a small Android Java input daemon jar at build time.
+- Runtime flow is automatic: `arda-senderd` writes `/data/local/tmp/arda-inputd.jar`, starts it with `app_process`, streams touch/key commands to its stdin, and stops it on normal exit / Ctrl-C path.
+- The Java child creates `MotionEvent` / `KeyEvent` and calls `InputManager.injectInputEvent()` scrcpy-style, bypassing the unreliable `/dev/uinput` display-routing path.
+- Fallbacks remain: `--input-inject-mode uinput` and `--input-inject-mode shell`.
+- Build now needs Android SDK platform `android.jar` and build-tools `d8`; Dockerfile.android installs them.
+
+
+## v39d emergency input safety
+
+App-process InputManager injection stays in tree, but it is no longer default. Default input injection mode is `uinput`; app mode requires explicit `--input-inject-mode app`. This prevents accidental AAOS input/focus disruption during normal video tests.
+
+## v39e note
+
+App-process InputManager injection is no longer treated as the default path. It is kept as explicit `--input-inject-mode app`, starts lazily on the first injected event, and throttles MOVE events with `--input-app-move-min-ms` (default 16ms). This keeps the working drag path available while reducing the chance of AAOS focus/input stack corruption.

@@ -4,12 +4,13 @@
 //! cross-compiled with a minimal Android NDK Docker image. The first target is a
 //! virtual direct touchscreen that can emit tap and swipe gestures.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::os::unix::io::AsRawFd;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -133,6 +134,111 @@ impl TouchInjectAction {
             TouchInjectAction::Move => "MOVE",
             TouchInjectAction::Up => "UP",
         }
+    }
+}
+
+const INPUTD_JAR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arda_inputd.jar"));
+const INPUTD_JAR_PATH: &str = "/data/local/tmp/arda-inputd.jar";
+
+/// Long-lived Android framework injector launched through app_process.
+///
+/// This follows the scrcpy-style path: arda-senderd remains the single user
+/// entry point, but it starts a tiny Java child process under the same uid. The
+/// child owns MotionEvent/KeyEvent creation and calls
+/// InputManager.injectInputEvent(), so Android receives framework input events
+/// directly instead of trying to route a /dev/uinput device to a display.
+pub struct AppProcessInputInjector {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    jar_path: PathBuf,
+}
+
+impl AppProcessInputInjector {
+    pub fn create(display_id: i32) -> io::Result<(Self, String)> {
+        if INPUTD_JAR_BYTES.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "embedded arda_inputd.jar is empty; rebuild Android target with d8/android.jar available",
+            ));
+        }
+
+        let jar_path = PathBuf::from(INPUTD_JAR_PATH);
+        fs::write(&jar_path, INPUTD_JAR_BYTES)?;
+
+        let mut report = String::new();
+        report.push_str("arda app_process input injector\n");
+        report.push_str(&format!("jar={} bytes={}\n", jar_path.display(), INPUTD_JAR_BYTES.len()));
+        report.push_str(&format!("display_id={}\n", display_id));
+
+        let mut child = Command::new("/system/bin/app_process")
+            .env("CLASSPATH", &jar_path)
+            .arg("/")
+            .arg("com.arda.input.InputServer")
+            .arg("--display")
+            .arg(display_id.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "app_process child stdin missing")
+        })?;
+
+        report.push_str(&format!("pid={}\n", child.id()));
+        thread::sleep(Duration::from_millis(250));
+
+        Ok((Self { child, stdin: Some(stdin), jar_path }, report))
+    }
+
+    pub fn inject_touch(
+        &mut self,
+        action: TouchInjectAction,
+        x: i32,
+        y: i32,
+        pointer_id: u32,
+    ) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "app_process inputd stdin is closed")
+        })?;
+        writeln!(stdin, "T {} {} {} {}", action.shell_word(), x, y, pointer_id)?;
+        stdin.flush()
+    }
+
+    pub fn inject_key_press(&mut self, keycode: u32) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "app_process inputd stdin is closed")
+        })?;
+        writeln!(stdin, "K {}", keycode)?;
+        stdin.flush()
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = writeln!(stdin, "STOP");
+            let _ = stdin.flush();
+        }
+
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    let _ = fs::remove_file(&self.jar_path);
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.jar_path);
+    }
+}
+
+impl Drop for AppProcessInputInjector {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

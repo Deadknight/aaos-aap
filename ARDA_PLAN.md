@@ -41,3 +41,23 @@ Docs-based AV DATA path:
 - `0x8000 SETUP`, `0x8003 CONFIG`, `0x8001 START` are already observed working.
 - Next DATA sender uses documented `0x0001 CODEC_CONFIG` and `0x0000 DATA` with 8-byte big-endian PTS header.
 - ACK-based flow control added for `0x8004 MEDIA_MESSAGE_ACK` and `max_unacked` from CONFIG.
+
+## v28
+
+Wire the working native capture path into the docs-based AAP video path.
+
+- Keep v27 H264 packet format unchanged because it already rendered in DHU.
+- Add `--video-native` to spawn `native-capture --out -` only after video START.
+- Parse child stdout as Annex-B H264 NALs.
+- Send SPS/PPS as `MEDIA_MESSAGE_CODEC_CONFIG`.
+- Send slice NALs as `MEDIA_MESSAGE_DATA` with monotonic 30fps PTS.
+- Continue respecting `MEDIA_MESSAGE_ACK` / `max_unacked`.
+
+Next after test:
+- Convert probe into cleaner long-running session mode.
+- Add touch/input channel opening and map uinput injection.
+
+### v29
+- Fix native-capture child stdout buffering for live AAP video.
+- Log first live stdout reads and first parsed NALs.
+- Select SDR video config with docs-backed resolution/fps/density/margin logging; native live capture follows SDR size/fps by default.

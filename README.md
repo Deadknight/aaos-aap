@@ -57,3 +57,42 @@ adb shell /data/local/tmp/arda-senderd aap-session-probe \
   --video-file /data/local/tmp/arda-test.h264 \
   --video-frames 60
 ```
+
+## v28 - native-capture live video bridge
+
+Adds `--video-native` to `aap-session-probe`.
+
+After the docs-confirmed media sequence succeeds (`CHANNEL_OPEN_RESPONSE` ->
+`MEDIA_MESSAGE_SETUP` -> `MEDIA_MESSAGE_CONFIG STATUS_READY` ->
+`MEDIA_MESSAGE_START`), the session now spawns this same binary as an internal
+`native-capture --out -` child and streams its Annex-B H264 output into the
+opened AAP video channel.
+
+The live path reuses the v27 docs-based media packet format:
+
+- `MEDIA_MESSAGE_CODEC_CONFIG` (`0x0001`) for SPS/PPS
+- `MEDIA_MESSAGE_DATA` (`0x0000`) for `u64` big-endian PTS + raw H264 NAL bytes
+- existing plaintext fragmentation-before-TLS for large video payloads
+- existing `MEDIA_MESSAGE_ACK` flow control using HU `max_unacked`
+
+Example:
+
+```bash
+adb shell /data/local/tmp/arda-senderd aap-session-probe \
+  --addr 0.0.0.0:5277 \
+  --keys /data/local/tmp/arda-certs \
+  --dump /data/local/tmp/arda-aap-session.log \
+  --response 1.7 \
+  --max-frames 5000 \
+  --video-native \
+  --video-size 800x480 \
+  --video-bit-rate 2500000 \
+  --video-fps 30 \
+  --video-frames 0
+```
+
+## v29 live native video notes
+
+- Native stdout mode is now unbuffered and flushes every MediaCodec output buffer so the AAP live-video reader can see SPS/PPS and frame NALs immediately.
+- `aap-session-probe --video-native` can auto-configure native capture size/fps from the selected SDR `VideoConfiguration`.
+- Use `--no-video-auto-config` to force manual `--video-size` / `--video-fps` values.

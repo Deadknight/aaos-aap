@@ -5,10 +5,14 @@
 //! bytes arrive so the next step can implement the actual message framing and
 //! service negotiation.
 
+use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
@@ -854,6 +858,12 @@ pub struct TlsHandshakeProbeConfig {
     pub keys_path: PathBuf,
     pub video_file_path: Option<PathBuf>,
     pub video_frame_limit: usize,
+    pub video_native: bool,
+    pub video_auto_config: bool,
+    pub video_width: i32,
+    pub video_height: i32,
+    pub video_bit_rate: i32,
+    pub video_fps: i32,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -870,6 +880,12 @@ impl Default for TlsHandshakeProbeConfig {
             keys_path: PathBuf::from("/data/local/tmp/arda-certs"),
             video_file_path: None,
             video_frame_limit: 30,
+            video_native: false,
+            video_auto_config: true,
+            video_width: 800,
+            video_height: 480,
+            video_bit_rate: 2_500_000,
+            video_fps: 30,
         }
     }
 }
@@ -1422,6 +1438,22 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     } else {
         log_line(&mut dump, "video_file=none")?;
     }
+    if config.video_native {
+        log_line(
+            &mut dump,
+            &format!(
+                "video_native=true size={}x{} bit_rate={} fps={} frame_limit={} auto_config={}",
+                config.video_width,
+                config.video_height,
+                config.video_bit_rate,
+                config.video_fps,
+                config.video_frame_limit,
+                config.video_auto_config
+            ),
+        )?;
+    } else {
+        log_line(&mut dump, "video_native=false")?;
+    }
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
 
@@ -1487,9 +1519,19 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_start_sent = false;
     let mut video_max_unacked: u32 = 1;
     let video_session_id: i32 = 1;
-    let mut video_sender = match &config.video_file_path {
-        Some(path) => Some(VideoFileSender::load(path.clone(), config.video_frame_limit)?),
-        None => None,
+    let mut video_sender: Option<VideoSender> = if config.video_native {
+        Some(VideoSender::Live(VideoLiveSender::new(VideoLiveConfig {
+            width: config.video_width,
+            height: config.video_height,
+            bit_rate: config.video_bit_rate,
+            fps: config.video_fps,
+            frame_limit: config.video_frame_limit,
+        })))
+    } else {
+        match &config.video_file_path {
+            Some(path) => Some(VideoSender::File(VideoFileSender::load(path.clone(), config.video_frame_limit)?)),
+            None => None,
+        }
     };
     let mut handshake_done_logged = false;
     let mut decrypted_fragments = fragment::FragmentAssembler::default();
@@ -1697,6 +1739,34 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             ),
                         )?;
 
+                        if config.video_auto_config {
+                            if let Some(vc) = video.selected_video_config.as_ref() {
+                                let line = format!(
+                                    "VIDEO_AUTO_CONFIG selected from SDR: service_id={} config_index={} {}x{} fps={} density={} real_density={} margins={}x{} codec={} resolution={}",
+                                    video.service_id,
+                                    vc.config_index,
+                                    vc.width,
+                                    vc.height,
+                                    vc.fps,
+                                    vc.density,
+                                    vc.real_density,
+                                    vc.width_margin,
+                                    vc.height_margin,
+                                    vc.codec,
+                                    vc.resolution
+                                );
+                                println!("{line}");
+                                log_line(&mut dump, &line)?;
+                                if let Some(sender) = video_sender.as_mut() {
+                                    sender.configure_from_sdr(vc, &mut dump)?;
+                                }
+                            } else {
+                                let line = "VIDEO_AUTO_CONFIG requested but no concrete video config was parsed from SDR";
+                                println!("{line}");
+                                log_line(&mut dump, line)?;
+                            }
+                        }
+
                         let control_payload = proto::build_channel_open_request_control_payload(video.service_id, 0)
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                         log_line(&mut dump, &format!("tx ChannelOpenRequest plaintext bytes={} service_id={} priority=0", control_payload.len(), video.service_id))?;
@@ -1884,6 +1954,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 println!("tx encrypted PING_RESPONSE frame(s): count={tx_count}");
                 log_line(&mut dump, &format!("tx encrypted PING_RESPONSE frame(s): count={tx_count}"))?;
             }
+
+            if video_start_sent {
+                if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
+                    let sent = sender.send_available(
+                        &mut stream,
+                        &mut tls,
+                        video_channel,
+                        video_session_id,
+                        video_max_unacked,
+                        &mut dump,
+                    )?;
+                    tx_ssl_frames += sent;
+                }
+            }
         }
     }
 
@@ -1893,6 +1977,60 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     Ok(())
 }
 
+
+
+#[derive(Debug)]
+enum VideoSender {
+    File(VideoFileSender),
+    Live(VideoLiveSender),
+}
+
+impl VideoSender {
+    fn on_ack(&mut self, ack_value: u32) {
+        match self {
+            Self::File(sender) => sender.on_ack(ack_value),
+            Self::Live(sender) => sender.on_ack(ack_value),
+        }
+    }
+
+    fn configure_from_sdr(
+        &mut self,
+        selection: &proto::VideoConfigSelection,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Live(sender) => sender.configure_from_sdr(selection, dump),
+            Self::File(_) => {
+                let line = format!(
+                    "VIDEO_AUTO_CONFIG ignored for file sender: SDR selected {}x{} fps={} density={} margins={}x{}",
+                    selection.width,
+                    selection.height,
+                    selection.fps,
+                    selection.density,
+                    selection.width_margin,
+                    selection.height_margin
+                );
+                println!("{line}");
+                log_line(dump, &line)
+            }
+        }
+    }
+
+    fn send_available(
+        &mut self,
+        stream: &mut TcpStream,
+        tls: &mut tls::AapTlsServer,
+        channel: u8,
+        session_id: i32,
+        max_unacked: u32,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<usize> {
+        match self {
+            Self::File(sender) => sender.send_available(stream, tls, channel, session_id, max_unacked, dump),
+            Self::Live(sender) => sender.send_available(stream, tls, channel, session_id, max_unacked, dump),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct VideoFileSender {
@@ -2049,6 +2187,347 @@ impl VideoFileSender {
         Ok(tx_frames)
     }
 }
+
+#[derive(Debug, Clone)]
+struct VideoLiveConfig {
+    width: i32,
+    height: i32,
+    bit_rate: i32,
+    fps: i32,
+    /// 0 means unlimited; otherwise stop sending after this many video slice NALs.
+    frame_limit: usize,
+}
+
+#[derive(Debug)]
+enum LiveNalEvent {
+    Status(String),
+    Nal(NalType, Vec<u8>),
+    Ended(String),
+}
+
+#[derive(Debug)]
+struct VideoLiveSender {
+    config: VideoLiveConfig,
+    child: Option<Child>,
+    rx: Option<mpsc::Receiver<LiveNalEvent>>,
+    codec_config: Vec<u8>,
+    codec_config_sent: bool,
+    no_codec_config_warned: bool,
+    next_pts_index: usize,
+    frames_sent: usize,
+    unacked: u32,
+    highest_ack: u32,
+    ended: bool,
+}
+
+impl VideoLiveSender {
+    fn new(config: VideoLiveConfig) -> Self {
+        Self {
+            config,
+            child: None,
+            rx: None,
+            codec_config: Vec::new(),
+            codec_config_sent: false,
+            no_codec_config_warned: false,
+            next_pts_index: 0,
+            frames_sent: 0,
+            unacked: 0,
+            highest_ack: 0,
+            ended: false,
+        }
+    }
+
+    fn on_ack(&mut self, ack_value: u32) {
+        if ack_value > self.highest_ack {
+            let delta = ack_value - self.highest_ack;
+            self.highest_ack = ack_value;
+            self.unacked = self.unacked.saturating_sub(delta);
+        }
+    }
+
+    fn configure_from_sdr(
+        &mut self,
+        selection: &proto::VideoConfigSelection,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if self.child.is_some() {
+            let line = "VIDEO_AUTO_CONFIG ignored because native capture child is already running";
+            println!("{line}");
+            return log_line(dump, line);
+        }
+        self.config.width = selection.width;
+        self.config.height = selection.height;
+        self.config.fps = selection.fps;
+        let line = format!(
+            "VIDEO_NATIVE configured from SDR: size={}x{} fps={} bit_rate={} density={} real_density={} margins={}x{} config_index={} codec={} resolution={}",
+            self.config.width,
+            self.config.height,
+            self.config.fps,
+            self.config.bit_rate,
+            selection.density,
+            selection.real_density,
+            selection.width_margin,
+            selection.height_margin,
+            selection.config_index,
+            selection.codec,
+            selection.resolution
+        );
+        println!("{line}");
+        log_line(dump, &line)
+    }
+
+    fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        if self.child.is_some() || self.ended {
+            return Ok(());
+        }
+
+        let exe = env::current_exe()?;
+        let size = format!("{}x{}", self.config.width, self.config.height);
+        let bit_rate = self.config.bit_rate.to_string();
+        let fps = self.config.fps.to_string();
+        // Child lifetime is controlled by this session. 0 means capture until killed.
+        let seconds = String::from("0");
+
+        let mut child = Command::new(exe)
+            .arg("native-capture")
+            .arg("--size")
+            .arg(&size)
+            .arg("--bit-rate")
+            .arg(&bit_rate)
+            .arg("--fps")
+            .arg(&fps)
+            .arg("--seconds")
+            .arg(&seconds)
+            .arg("--out")
+            .arg("-")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture child: {err}")))?;
+
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            return Err(io::Error::new(io::ErrorKind::Other, "native-capture child stdout missing"));
+        };
+
+        let (tx, rx) = mpsc::channel::<LiveNalEvent>();
+        thread::spawn(move || {
+            let mut parser = AnnexBStreamParser::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut reads = 0u64;
+            let mut nals = 0u64;
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        reads += 1;
+                        if reads == 1 {
+                            let _ = tx.send(LiveNalEvent::Status(format!(
+                                "VIDEO_NATIVE stdout first read bytes={}",
+                                n
+                            )));
+                        }
+                        parser.push(&buf[..n]);
+                        while let Some(nal) = parser.next_nal() {
+                            let ty = nal.nal_type();
+                            nals += 1;
+                            if nals <= 4 {
+                                let _ = tx.send(LiveNalEvent::Status(format!(
+                                    "VIDEO_NATIVE parser nal#{} type={:?} bytes={}",
+                                    nals,
+                                    ty,
+                                    nal.bytes().len()
+                                )));
+                            }
+                            if tx.send(LiveNalEvent::Nal(ty, nal.bytes().to_vec())).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        let _ = tx.send(LiveNalEvent::Ended(format!("native-capture stdout read error: {err}")));
+                        return;
+                    }
+                }
+            }
+            if let Some(nal) = parser.finish() {
+                let ty = nal.nal_type();
+                let _ = tx.send(LiveNalEvent::Nal(ty, nal.bytes().to_vec()));
+            }
+            let _ = tx.send(LiveNalEvent::Ended("native-capture stdout EOF".to_string()));
+        });
+
+        let line = format!(
+            "VIDEO_NATIVE started child: size={} bit_rate={} fps={} frame_limit={}",
+            size,
+            bit_rate,
+            fps,
+            self.config.frame_limit
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+        log_line(dump, "VIDEO_NATIVE child_log=/data/local/tmp/arda-display-capture-test.log")?;
+
+        self.child = Some(child);
+        self.rx = Some(rx);
+        Ok(())
+    }
+
+    fn send_available(
+        &mut self,
+        stream: &mut TcpStream,
+        tls: &mut tls::AapTlsServer,
+        channel: u8,
+        session_id: i32,
+        max_unacked: u32,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<usize> {
+        self.ensure_started(dump)?;
+
+        if self.config.frame_limit > 0 && self.frames_sent >= self.config.frame_limit {
+            self.stop_child();
+            return Ok(0);
+        }
+
+        let mut tx_frames = 0usize;
+        let max_unacked = max_unacked.max(1);
+
+        loop {
+            if self.unacked >= max_unacked {
+                break;
+            }
+            if self.config.frame_limit > 0 && self.frames_sent >= self.config.frame_limit {
+                self.stop_child();
+                break;
+            }
+
+            let event = match self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                Some(event) => event,
+                None => break,
+            };
+
+            match event {
+                LiveNalEvent::Status(line) => {
+                    println!("{line}");
+                    log_line(dump, &line)?;
+                }
+                LiveNalEvent::Nal(NalType::Sps, bytes) | LiveNalEvent::Nal(NalType::Pps, bytes) => {
+                    self.codec_config.extend_from_slice(&bytes);
+                    // If the encoder emits a new SPS/PPS set later, send it before following frames.
+                    if self.codec_config_sent {
+                        self.codec_config_sent = false;
+                    }
+                }
+                LiveNalEvent::Nal(NalType::SliceIdr, bytes) | LiveNalEvent::Nal(NalType::SliceNonIdr, bytes) => {
+                    if !self.codec_config_sent {
+                        if self.codec_config.is_empty() {
+                            if !self.no_codec_config_warned {
+                                let line = "VIDEO_NATIVE warning: sending H264 DATA before SPS/PPS codec config";
+                                println!("{line}");
+                                log_line(dump, line)?;
+                                self.no_codec_config_warned = true;
+                            }
+                        } else {
+                            let payload = proto::build_media_codec_config_payload(&self.codec_config);
+                            println!(
+                                "VIDEO_NATIVE sending MEDIA_MESSAGE_CODEC_CONFIG bytes={}",
+                                self.codec_config.len()
+                            );
+                            log_line(
+                                dump,
+                                &format!("VIDEO_NATIVE sending MEDIA_MESSAGE_CODEC_CONFIG bytes={}", self.codec_config.len()),
+                            )?;
+                            tx_frames += write_encrypted_plaintext_fragmented(
+                                stream,
+                                tls,
+                                channel,
+                                &payload,
+                                dump,
+                                "MEDIA_MESSAGE_CODEC_CONFIG",
+                            )?;
+                            self.codec_config.clear();
+                        }
+                        self.codec_config_sent = true;
+                    }
+
+                    let pts_us = (self.next_pts_index as u64) * 1_000_000u64 / (self.config.fps as u64).max(1);
+                    self.next_pts_index += 1;
+                    let payload = proto::build_media_data_payload(pts_us, &bytes);
+                    println!(
+                        "VIDEO_NATIVE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
+                        self.frames_sent,
+                        pts_us,
+                        bytes.len(),
+                        self.unacked + 1,
+                        max_unacked,
+                        session_id
+                    );
+                    log_line(
+                        dump,
+                        &format!(
+                            "VIDEO_NATIVE sending MEDIA_MESSAGE_DATA frame={} pts_us={} bytes={} unacked={}/{} session_id={}",
+                            self.frames_sent,
+                            pts_us,
+                            bytes.len(),
+                            self.unacked + 1,
+                            max_unacked,
+                            session_id
+                        ),
+                    )?;
+                    tx_frames += write_encrypted_plaintext_fragmented(
+                        stream,
+                        tls,
+                        channel,
+                        &payload,
+                        dump,
+                        "MEDIA_MESSAGE_DATA",
+                    )?;
+                    self.frames_sent += 1;
+                    self.unacked += 1;
+                }
+                LiveNalEvent::Nal(NalType::Sei, _) | LiveNalEvent::Nal(NalType::Aud, _) => {
+                    // Keep first live pipeline minimal, same as file sender.
+                }
+                LiveNalEvent::Nal(_, _) => {}
+                LiveNalEvent::Ended(reason) => {
+                    let line = format!("VIDEO_NATIVE ended: {reason}");
+                    println!("{line}");
+                    log_line(dump, &line)?;
+                    self.ended = true;
+                    self.stop_child();
+                    break;
+                }
+            }
+        }
+
+        if self.config.frame_limit > 0 && self.frames_sent >= self.config.frame_limit {
+            let line = format!("VIDEO_NATIVE frame limit reached: frames_sent={}", self.frames_sent);
+            println!("{line}");
+            log_line(dump, &line)?;
+            self.stop_child();
+        }
+
+        Ok(tx_frames)
+    }
+
+    fn stop_child(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        self.ended = true;
+    }
+}
+
+impl Drop for VideoLiveSender {
+    fn drop(&mut self) {
+        self.stop_child();
+    }
+}
+
 
 fn is_control_message(payload: &[u8], id: u16) -> bool {
     payload.len() >= 2 && u16::from_be_bytes([payload[0], payload[1]]) == id

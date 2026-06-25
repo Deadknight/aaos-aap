@@ -347,6 +347,95 @@ pub struct MediaSinkSelection {
     pub display_type: String,
     pub video_configs: usize,
     pub first_video_config: Option<String>,
+    pub selected_video_config: Option<VideoConfigSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoConfigSelection {
+    pub config_index: usize,
+    pub width: i32,
+    pub height: i32,
+    pub fps: i32,
+    pub density: u32,
+    pub real_density: u32,
+    pub width_margin: u32,
+    pub height_margin: u32,
+    pub codec: String,
+    pub resolution: String,
+    pub summary: String,
+}
+
+
+fn video_resolution_dimensions(res: VideoCodecResolutionType) -> Option<(i32, i32)> {
+    match res {
+        VideoCodecResolutionType::VIDEO_800x480 => Some((800, 480)),
+        VideoCodecResolutionType::VIDEO_1280x720 => Some((1280, 720)),
+        VideoCodecResolutionType::VIDEO_1920x1080 => Some((1920, 1080)),
+        VideoCodecResolutionType::VIDEO_2560x1440 => Some((2560, 1440)),
+        VideoCodecResolutionType::VIDEO_3840x2160 => Some((3840, 2160)),
+        VideoCodecResolutionType::VIDEO_720x1280 => Some((720, 1280)),
+        VideoCodecResolutionType::VIDEO_1080x1920 => Some((1080, 1920)),
+        VideoCodecResolutionType::VIDEO_1440x2560 => Some((1440, 2560)),
+        VideoCodecResolutionType::VIDEO_2160x3840 => Some((2160, 3840)),
+    }
+}
+
+fn video_fps_value(fps: VideoFrameRateType) -> i32 {
+    match fps {
+        VideoFrameRateType::VIDEO_FPS_60 => 60,
+        VideoFrameRateType::VIDEO_FPS_30 => 30,
+    }
+}
+
+fn video_config_summary(index: usize, vc: &VideoConfiguration) -> String {
+    let (width, height) = video_resolution_dimensions(vc.codec_resolution()).unwrap_or((0, 0));
+    format!(
+        "index={} resolution={:?} {}x{} fps={:?}/{} margins={}x{} density={} real_density={} video_codec={:?}",
+        index,
+        vc.codec_resolution(),
+        width,
+        height,
+        vc.frame_rate(),
+        video_fps_value(vc.frame_rate()),
+        vc.width_margin(),
+        vc.height_margin(),
+        vc.density(),
+        vc.real_density(),
+        vc.video_codec_type()
+    )
+}
+
+fn select_best_video_config(configs: &[VideoConfiguration]) -> Option<VideoConfigSelection> {
+    configs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, vc)| {
+            let (width, height) = video_resolution_dimensions(vc.codec_resolution())?;
+            let fps = video_fps_value(vc.frame_rate());
+            let codec = format!("{:?}", vc.video_codec_type());
+            let resolution = format!("{:?}", vc.codec_resolution());
+            let summary = video_config_summary(index, vc);
+            let area = (width as i64) * (height as i64);
+            let score = area * 100 + fps as i64;
+            Some((
+                score,
+                VideoConfigSelection {
+                    config_index: index,
+                    width,
+                    height,
+                    fps,
+                    density: vc.density(),
+                    real_density: vc.real_density(),
+                    width_margin: vc.width_margin(),
+                    height_margin: vc.height_margin(),
+                    codec,
+                    resolution,
+                    summary,
+                },
+            ))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, selection)| selection)
 }
 
 /// Parse a MESSAGE_SERVICE_DISCOVERY_RESPONSE control payload, select the first
@@ -407,18 +496,11 @@ fn summarize_service_discovery_response_body(
                 );
 
             if looks_like_video && video_media_sink.is_none() {
-                let first_video_config = sink.video_configs.first().map(|vc| {
-                    format!(
-                        "resolution={:?} fps={:?} margins={}x{} density={} real_density={} video_codec={:?}",
-                        vc.codec_resolution(),
-                        vc.frame_rate(),
-                        vc.width_margin(),
-                        vc.height_margin(),
-                        vc.density(),
-                        vc.real_density(),
-                        vc.video_codec_type()
-                    )
-                });
+                let first_video_config = sink
+                    .video_configs
+                    .first()
+                    .map(|vc| video_config_summary(0, vc));
+                let selected_video_config = select_best_video_config(&sink.video_configs);
                 video_media_sink = Some(MediaSinkSelection {
                     service_id: svc.id(),
                     available_type,
@@ -426,6 +508,7 @@ fn summarize_service_discovery_response_body(
                     display_type,
                     video_configs: video_count,
                     first_video_config,
+                    selected_video_config,
                 });
             }
         }

@@ -118,6 +118,10 @@ Commands:
       Runs VERSION + TLS, waits for AUTH_COMPLETE, sends encrypted protobuf ServiceDiscoveryRequest, and replies to PING_REQUEST.
 
   aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
+      Full AAP session probe: service discovery, video channel open/setup/start, ping responses, optional H264 file send.
+
+  aap-session-probe ... --video-native [--video-size 800x480] [--video-bit-rate 2500000] [--video-fps 30] [--video-frames 0]
+      Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
   aap-fragment-smoke
@@ -1024,6 +1028,12 @@ struct AapTlsHandshakeProbeArgs {
     keys: PathBuf,
     video_file: Option<PathBuf>,
     video_frame_limit: usize,
+    video_native: bool,
+    video_auto_config: bool,
+    video_width: i32,
+    video_height: i32,
+    video_bit_rate: i32,
+    video_fps: i32,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1040,6 +1050,12 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         keys_path: args.keys,
         video_file_path: args.video_file,
         video_frame_limit: args.video_frame_limit,
+        video_native: args.video_native,
+        video_auto_config: args.video_auto_config,
+        video_width: args.video_width,
+        video_height: args.video_height,
+        video_bit_rate: args.video_bit_rate,
+        video_fps: args.video_fps,
     })?;
     Ok(())
 }
@@ -1074,6 +1090,12 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         keys_path: args.keys,
         video_file_path: args.video_file,
         video_frame_limit: args.video_frame_limit,
+        video_native: args.video_native,
+        video_auto_config: args.video_auto_config,
+        video_width: args.video_width,
+        video_height: args.video_height,
+        video_bit_rate: args.video_bit_rate,
+        video_fps: args.video_fps,
     })?;
     Ok(())
 }
@@ -1099,6 +1121,12 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         keys_path: args.keys,
         video_file_path: args.video_file,
         video_frame_limit: args.video_frame_limit,
+        video_native: args.video_native,
+        video_auto_config: args.video_auto_config,
+        video_width: args.video_width,
+        video_height: args.video_height,
+        video_bit_rate: args.video_bit_rate,
+        video_fps: args.video_fps,
     })?;
     Ok(())
 }
@@ -1115,6 +1143,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut keys = PathBuf::from("/data/local/tmp/arda-certs");
     let mut video_file: Option<PathBuf> = None;
     let mut video_frame_limit = 30usize;
+    let mut video_native = false;
+    let mut video_auto_config = true;
+    let mut video_width = 800i32;
+    let mut video_height = 480i32;
+    let mut video_bit_rate = 2_500_000i32;
+    let mut video_fps = 30i32;
 
     let mut i = 0;
     while i < argv.len() {
@@ -1143,6 +1177,30 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--video-frames" | "--video-frame-limit" => {
                 i += 1;
                 video_frame_limit = argv.get(i).ok_or("--video-frames requires value")?.parse::<usize>()?;
+            }
+            "--video-native" | "--native-video" | "--live-video" => {
+                video_native = true;
+            }
+            "--video-auto-config" => {
+                video_auto_config = true;
+            }
+            "--no-video-auto-config" | "--video-manual-config" => {
+                video_auto_config = false;
+            }
+            "--video-size" | "--live-size" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--video-size requires WIDTHxHEIGHT")?;
+                let (w, h) = parse_size_i32(value)?;
+                video_width = w;
+                video_height = h;
+            }
+            "--video-bit-rate" | "--video-bitrate" | "--live-bit-rate" => {
+                i += 1;
+                video_bit_rate = argv.get(i).ok_or("--video-bit-rate requires value")?.parse::<i32>()?;
+            }
+            "--video-fps" | "--live-fps" => {
+                i += 1;
+                video_fps = argv.get(i).ok_or("--video-fps requires value")?.parse::<i32>()?;
             }
             "--timeout-ms" => {
                 i += 1;
@@ -1191,6 +1249,18 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if max_frames == 0 {
         return Err("--max-frames must be positive".into());
     }
+    if video_native && video_file.is_some() {
+        return Err("use either --video-native or --video-file, not both".into());
+    }
+    if video_width <= 0 || video_height <= 0 {
+        return Err("--video-size must be positive WIDTHxHEIGHT".into());
+    }
+    if video_bit_rate <= 0 {
+        return Err("--video-bit-rate must be positive".into());
+    }
+    if video_fps <= 0 || video_fps > 60 {
+        return Err("--video-fps must be 1..60".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -1204,6 +1274,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         keys,
         video_file,
         video_frame_limit,
+        video_native,
+        video_auto_config,
+        video_width,
+        video_height,
+        video_bit_rate,
+        video_fps,
     })
 }
 

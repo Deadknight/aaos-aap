@@ -98,6 +98,12 @@ FILE* open_output_path_or_stdout(const char* out_path, Buffer* report, bool* out
             close(fd);
             return nullptr;
         }
+        // stdout may be a pipe owned by the AAP live-video parent.  FILE* uses
+        // full buffering for pipes, and with a static/low-motion AAOS screen the
+        // encoder can produce too little data to flush promptly.  Keep stdout
+        // binary-clean but unbuffered so each MediaCodec output buffer is visible
+        // to the Rust Annex-B reader immediately.
+        setvbuf(f, nullptr, _IONBF, 0);
         return f;
     }
     FILE* f = fopen(out_path, "wb");
@@ -442,6 +448,9 @@ int drain_codec_output_to_file(
                 return -1;
             }
             *encoded_bytes += written;
+            // Low-latency live mode: do not let FILE* pipe buffering hide small
+            // codec-config or low-motion H264 buffers from the Rust live sender.
+            fflush(out);
             (*output_buffers)++;
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) (*codec_config_buffers)++;
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) (*key_buffers)++;

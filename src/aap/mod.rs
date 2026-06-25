@@ -876,6 +876,7 @@ pub struct TlsHandshakeProbeConfig {
     pub input_inject: bool,
     pub input_inject_mode: String,
     pub input_key_inject: bool,
+    pub quiet_ping_logs: bool,
 }
 
 impl Default for TlsHandshakeProbeConfig {
@@ -909,6 +910,7 @@ impl Default for TlsHandshakeProbeConfig {
             input_inject: false,
             input_inject_mode: "uinput".to_string(),
             input_key_inject: false,
+            quiet_ping_logs: true,
         }
     }
 }
@@ -1261,12 +1263,19 @@ pub fn tls_plain_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
 
         frames += 1;
         bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
-        println!("rx frame:");
-        describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
-        if let Some(dump) = dump.as_mut() {
-            writeln!(dump, "rx frame:")?;
-            describe_frame(frames, bytes, peer, &frame, dump)?;
-            dump.flush()?;
+        let likely_encrypted_ping = config.quiet_ping_logs
+            && frame.channel == 0
+            && (frame.flags & FLAG_ENCRYPTED) != 0
+            && frame.final_length.is_none()
+            && frame.payload.len() <= 64;
+        if !likely_encrypted_ping {
+            println!("rx frame:");
+            describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
+            if let Some(dump) = dump.as_mut() {
+                writeln!(dump, "rx frame:")?;
+                describe_frame(frames, bytes, peer, &frame, dump)?;
+                dump.flush()?;
+            }
         }
 
         if tls.is_handshaking() {
@@ -1370,6 +1379,14 @@ fn log_tls_step(dump: &mut Option<Box<dyn Write>>, step: &tls::TlsServerStep) ->
     );
     println!("{line}");
     log_line(dump, &line)
+}
+
+fn is_ping_request_payload(payload: &[u8]) -> bool {
+    payload.len() >= 2 && u16::from_be_bytes([payload[0], payload[1]]) == 11
+}
+
+fn is_ping_response_payload(payload: &[u8]) -> bool {
+    payload.len() >= 2 && u16::from_be_bytes([payload[0], payload[1]]) == 12
 }
 
 fn log_decrypted_payload(
@@ -1494,6 +1511,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             config.input_key_inject
         ),
     )?;
+    log_line(&mut dump, &format!("quiet_ping_logs={}", config.quiet_ping_logs))?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
 
@@ -1637,12 +1655,19 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
         frames += 1;
         bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
-        println!("rx frame:");
-        describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
-        if let Some(dump) = dump.as_mut() {
-            writeln!(dump, "rx frame:")?;
-            describe_frame(frames, bytes, peer, &frame, dump)?;
-            dump.flush()?;
+        let likely_encrypted_ping = config.quiet_ping_logs
+            && frame.channel == 0
+            && (frame.flags & FLAG_ENCRYPTED) != 0
+            && frame.final_length.is_none()
+            && frame.payload.len() <= 64;
+        if !likely_encrypted_ping {
+            println!("rx frame:");
+            describe_frame(frames, bytes, peer, &frame, &mut io::stdout())?;
+            if let Some(dump) = dump.as_mut() {
+                writeln!(dump, "rx frame:")?;
+                describe_frame(frames, bytes, peer, &frame, dump)?;
+                dump.flush()?;
+            }
         }
 
         let mut plaintext_chunks: Vec<Vec<u8>> = Vec::new();
@@ -1690,11 +1715,15 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             plaintext_chunks.push(frame.payload.clone());
         } else {
             encrypted_frames += 1;
-            println!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload));
-            log_line(&mut dump, &format!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload)))?;
+            if !likely_encrypted_ping {
+                println!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload));
+                log_line(&mut dump, &format!("rx encrypted AA frame #{encrypted_frames}: tls_bytes={} {}", frame.payload.len(), tls_record_hint(&frame.payload)))?;
+            }
 
             let step = tls.feed_tls(&frame.payload)?;
-            log_tls_step(&mut dump, &step)?;
+            if !likely_encrypted_ping {
+                log_tls_step(&mut dump, &step)?;
+            }
             if !step.plaintext.is_empty() {
                 plaintext_chunks.push(step.plaintext);
             }
@@ -1748,7 +1777,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
             decrypted_frames += 1;
             decrypted_bytes += plaintext.len();
-            log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &plaintext)?;
+            let quiet_ping_payload = config.quiet_ping_logs
+                && frame.channel == 0
+                && (is_ping_request_payload(&plaintext) || is_ping_response_payload(&plaintext));
+            if !quiet_ping_payload {
+                log_decrypted_payload(&mut dump, peer, frame.channel, frame.flags, decrypted_frames, &plaintext)?;
+            }
 
             if !service_request_sent && is_control_message(&plaintext, 0x0004) {
                 println!("AUTH_COMPLETE observed; sending encrypted ServiceDiscoveryRequest");
@@ -2365,18 +2399,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             if let Some(control_payload) = proto::maybe_build_ping_response_control_payload(&plaintext)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
             {
-                println!("PING_REQUEST observed; sending encrypted PING_RESPONSE");
-                log_line(&mut dump, "PING_REQUEST observed; sending encrypted PING_RESPONSE")?;
-                log_line(&mut dump, &format!("tx PingResponse plaintext bytes={}", control_payload.len()))?;
-                if let Some(dump) = dump.as_mut() {
-                    let pseudo = AapFrame {
-                        channel: 0,
-                        flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
-                        final_length: None,
-                        payload: control_payload.clone(),
-                    };
-                    describe_frame(0, 0, peer, &pseudo, dump)?;
-                    dump.flush()?;
+                if !config.quiet_ping_logs {
+                    println!("PING_REQUEST observed; sending encrypted PING_RESPONSE");
+                    log_line(&mut dump, "PING_REQUEST observed; sending encrypted PING_RESPONSE")?;
+                    log_line(&mut dump, &format!("tx PingResponse plaintext bytes={}", control_payload.len()))?;
+                    if let Some(dump) = dump.as_mut() {
+                        let pseudo = AapFrame {
+                            channel: 0,
+                            flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+                            final_length: None,
+                            payload: control_payload.clone(),
+                        };
+                        describe_frame(0, 0, peer, &pseudo, dump)?;
+                        dump.flush()?;
+                    }
                 }
 
                 let tx_count = write_encrypted_plaintext_fragmented(
@@ -2388,8 +2424,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     "PING_RESPONSE",
                 )?;
                 tx_ssl_frames += tx_count;
-                println!("tx encrypted PING_RESPONSE frame(s): count={tx_count}");
-                log_line(&mut dump, &format!("tx encrypted PING_RESPONSE frame(s): count={tx_count}"))?;
+                if !config.quiet_ping_logs {
+                    println!("tx encrypted PING_RESPONSE frame(s): count={tx_count}");
+                    log_line(&mut dump, &format!("tx encrypted PING_RESPONSE frame(s): count={tx_count}"))?;
+                }
             }
 
             if video_start_sent {

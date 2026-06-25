@@ -124,8 +124,8 @@ Commands:
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
-  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|shell] [--input-key-inject]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android.
+  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|shell] [--input-key-inject] [--quiet-ping|--log-ping]
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. Ping request/response logs are quiet by default in session mode.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1048,6 +1048,7 @@ struct AapTlsHandshakeProbeArgs {
     input_inject: bool,
     input_inject_mode: String,
     input_key_inject: bool,
+    quiet_ping_logs: bool,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1081,6 +1082,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
         input_key_inject: args.input_key_inject,
+        quiet_ping_logs: args.quiet_ping_logs,
     })?;
     Ok(())
 }
@@ -1132,6 +1134,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
         input_key_inject: args.input_key_inject,
+        quiet_ping_logs: args.quiet_ping_logs,
     })?;
     Ok(())
 }
@@ -1174,6 +1177,7 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         input_inject: args.input_inject,
         input_inject_mode: args.input_inject_mode,
         input_key_inject: args.input_key_inject,
+        quiet_ping_logs: args.quiet_ping_logs,
     })?;
     Ok(())
 }
@@ -1207,6 +1211,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut input_inject = false;
     let mut input_inject_mode = String::from("uinput");
     let mut input_key_inject = false;
+    let mut quiet_ping_logs = true;
 
     let mut i = 0;
     while i < argv.len() {
@@ -1327,6 +1332,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--no-input-key-inject" | "--no-inject-input-keys" | "--no-inject-keys" => {
                 input_key_inject = false;
             }
+            "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
+                quiet_ping_logs = true;
+            }
+            "--log-ping" | "--log-ping-logs" | "--no-quiet-ping" => {
+                quiet_ping_logs = false;
+            }
             "--timeout-ms" => {
                 i += 1;
                 timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
@@ -1428,6 +1439,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         input_inject,
         input_inject_mode,
         input_key_inject,
+        quiet_ping_logs,
     })
 }
 

@@ -127,7 +127,7 @@ Commands:
   aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
       Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
 
-  aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-tone-hz 440] [--audio-dump|--audio-dump-dir PATH] [--no-audio-ack]
+  aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
 
   aap-fragment-smoke
@@ -1068,6 +1068,17 @@ struct AapTlsHandshakeProbeArgs {
     audio_tone_hz: f32,
     audio_tone_chunk_ms: u64,
     audio_tone_volume: f32,
+    audio_capture: bool,
+    audio_capture_source: String,
+    audio_capture_chunk_ms: u64,
+    audio_capture_gain: f32,
+    audio_capture_as: String,
+    audio_capture_package: String,
+    mic_open: bool,
+    mic_send_request_open: bool,
+    mic_dump_path: Option<PathBuf>,
+    mic_ack: bool,
+    mic_max_unacked: u32,
     quiet_ping_logs: bool,
     log_level: String,
 }
@@ -1120,6 +1131,17 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         audio_tone_hz: args.audio_tone_hz,
         audio_tone_chunk_ms: args.audio_tone_chunk_ms,
         audio_tone_volume: args.audio_tone_volume,
+        audio_capture: args.audio_capture,
+        audio_capture_source: args.audio_capture_source.clone(),
+        audio_capture_chunk_ms: args.audio_capture_chunk_ms,
+        audio_capture_gain: args.audio_capture_gain,
+        audio_capture_as: args.audio_capture_as.clone(),
+        audio_capture_package: args.audio_capture_package.clone(),
+        mic_open: args.mic_open,
+        mic_send_request_open: args.mic_send_request_open,
+        mic_dump_path: args.mic_dump_path.clone(),
+        mic_ack: args.mic_ack,
+        mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1190,6 +1212,17 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         audio_tone_hz: args.audio_tone_hz,
         audio_tone_chunk_ms: args.audio_tone_chunk_ms,
         audio_tone_volume: args.audio_tone_volume,
+        audio_capture: args.audio_capture,
+        audio_capture_source: args.audio_capture_source.clone(),
+        audio_capture_chunk_ms: args.audio_capture_chunk_ms,
+        audio_capture_gain: args.audio_capture_gain,
+        audio_capture_as: args.audio_capture_as.clone(),
+        audio_capture_package: args.audio_capture_package.clone(),
+        mic_open: args.mic_open,
+        mic_send_request_open: args.mic_send_request_open,
+        mic_dump_path: args.mic_dump_path.clone(),
+        mic_ack: args.mic_ack,
+        mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1251,6 +1284,17 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         audio_tone_hz: args.audio_tone_hz,
         audio_tone_chunk_ms: args.audio_tone_chunk_ms,
         audio_tone_volume: args.audio_tone_volume,
+        audio_capture: args.audio_capture,
+        audio_capture_source: args.audio_capture_source.clone(),
+        audio_capture_chunk_ms: args.audio_capture_chunk_ms,
+        audio_capture_gain: args.audio_capture_gain,
+        audio_capture_as: args.audio_capture_as.clone(),
+        audio_capture_package: args.audio_capture_package.clone(),
+        mic_open: args.mic_open,
+        mic_send_request_open: args.mic_send_request_open,
+        mic_dump_path: args.mic_dump_path.clone(),
+        mic_ack: args.mic_ack,
+        mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1317,6 +1361,17 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut audio_tone_hz: f32 = 440.0;
     let mut audio_tone_chunk_ms: u64 = 20;
     let mut audio_tone_volume: f32 = 0.20;
+    let mut audio_capture = false;
+    let mut audio_capture_source = String::from("remote_submix");
+    let mut audio_capture_chunk_ms: u64 = 20;
+    let mut audio_capture_gain: f32 = 1.0;
+    let mut audio_capture_as = String::from("shell");
+    let mut audio_capture_package = String::from("com.android.shell");
+    let mut mic_open = false;
+    let mut mic_send_request_open = false;
+    let mut mic_dump_path: Option<PathBuf> = None;
+    let mut mic_ack = true;
+    let mut mic_max_unacked: u32 = 8;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
 
@@ -1611,6 +1666,75 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 i += 1;
                 audio_tone_volume = argv.get(i).ok_or("--audio-tone-volume requires 0.0..1.0")?.parse::<f32>()?;
             }
+            "--audio-capture" | "--capture-audio" | "--audio-remote-submix" | "--capture-aaos-audio" => {
+                audio_open = true;
+                audio_capture = true;
+            }
+            "--no-audio-capture" | "--no-capture-audio" => {
+                audio_capture = false;
+            }
+            "--audio-capture-source" | "--audio-source" | "--capture-audio-source" => {
+                i += 1;
+                audio_open = true;
+                audio_capture = true;
+                audio_capture_source = argv.get(i).ok_or("--audio-capture-source requires remote_submix|mic|default|voice_communication|unprocessed")?.to_ascii_lowercase();
+            }
+            "--audio-capture-chunk-ms" | "--capture-audio-chunk-ms" => {
+                i += 1;
+                audio_capture_chunk_ms = argv.get(i).ok_or("--audio-capture-chunk-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--audio-capture-gain" | "--capture-audio-gain" => {
+                i += 1;
+                audio_capture_gain = argv.get(i).ok_or("--audio-capture-gain requires 0.0..4.0")?.parse::<f32>()?;
+            }
+            "--audio-capture-as" | "--capture-audio-as" | "--audio-capture-user" | "--audio-capture-uid" => {
+                i += 1;
+                audio_open = true;
+                audio_capture = true;
+                let value = argv.get(i).ok_or("--audio-capture-as requires shell|root|system|media|audioserver")?.to_ascii_lowercase();
+                audio_capture_as = match value.as_str() {
+                    "shell" | "root" | "system" | "media" | "audioserver" | "audio-server" | "0" | "1000" | "1013" | "1041" => value,
+                    other => return Err(format!("--audio-capture-as unsupported value: {other}; use shell|root|system|media|audioserver").into()),
+                };
+            }
+            "--audio-capture-package" | "--capture-audio-package" | "--audio-package" => {
+                i += 1;
+                audio_open = true;
+                audio_capture = true;
+                audio_capture_package = argv.get(i).ok_or("--audio-capture-package requires package name")?.to_string();
+            }
+            "--mic-open" | "--microphone-open" | "--audio-source-open" | "--hu-mic-open" => {
+                mic_open = true;
+            }
+            "--no-mic-open" | "--no-microphone-open" | "--no-audio-source-open" => {
+                mic_open = false;
+            }
+            "--mic-send-request" | "--mic-send-request-open" | "--mic-request-open" | "--microphone-send-request" => {
+                mic_open = true;
+                mic_send_request_open = true;
+            }
+            "--no-mic-send-request" | "--no-mic-send-request-open" | "--no-mic-request-open" => {
+                mic_send_request_open = false;
+            }
+            "--mic-dump" | "--mic-dump-path" | "--mic-dump-file" | "--microphone-dump" => {
+                i += 1;
+                mic_open = true;
+                mic_dump_path = Some(PathBuf::from(argv.get(i).ok_or("--mic-dump requires PATH")?));
+            }
+            "--no-mic-dump" | "--no-microphone-dump" => {
+                mic_dump_path = None;
+            }
+            "--no-mic-ack" | "--no-microphone-ack" => {
+                mic_ack = false;
+            }
+            "--mic-ack" | "--microphone-ack" => {
+                mic_ack = true;
+            }
+            "--mic-max-unacked" | "--microphone-max-unacked" => {
+                i += 1;
+                mic_open = true;
+                mic_max_unacked = argv.get(i).ok_or("--mic-max-unacked requires 1..4096")?.parse::<u32>()?;
+            }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
             }
@@ -1738,6 +1862,15 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if !(0.0..=1.0).contains(&audio_tone_volume) {
         return Err("--audio-tone-volume must be 0.0..1.0".into());
     }
+    if audio_capture_chunk_ms == 0 || audio_capture_chunk_ms > 200 {
+        return Err("--audio-capture-chunk-ms must be 1..200".into());
+    }
+    if !(0.0..=4.0).contains(&audio_capture_gain) {
+        return Err("--audio-capture-gain must be 0.0..4.0".into());
+    }
+    if mic_max_unacked == 0 || mic_max_unacked > 4096 {
+        return Err("--mic-max-unacked must be 1..4096".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -1785,6 +1918,17 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         audio_tone_hz,
         audio_tone_chunk_ms,
         audio_tone_volume,
+        audio_capture,
+        audio_capture_source,
+        audio_capture_chunk_ms,
+        audio_capture_gain,
+        audio_capture_as,
+        audio_capture_package,
+        mic_open,
+        mic_send_request_open,
+        mic_dump_path,
+        mic_ack,
+        mic_max_unacked,
         quiet_ping_logs,
         log_level,
     })

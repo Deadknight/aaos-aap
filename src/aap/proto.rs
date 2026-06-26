@@ -277,6 +277,24 @@ pub fn describe_media_payload(payload: &[u8]) -> Option<String> {
                 msg.reason()
             ))
         }
+        Some(MediaMessageId::MEDIA_MESSAGE_MICROPHONE_REQUEST) => {
+            let msg = MicrophoneRequest::parse_from_bytes(body).ok()?;
+            Some(format!(
+                "{name} open={} anc={} ec={} max_unacked={}",
+                msg.open(),
+                msg.anc_enabled(),
+                msg.ec_enabled(),
+                msg.max_unacked()
+            ))
+        }
+        Some(MediaMessageId::MEDIA_MESSAGE_MICROPHONE_RESPONSE) => {
+            let msg = MicrophoneResponse::parse_from_bytes(body).ok()?;
+            Some(format!(
+                "{name} status={} session_id={}",
+                msg.status(),
+                msg.session_id()
+            ))
+        }
         Some(other) => Some(format!("{other:?} body_len={}", body.len())),
         None => Some(format!("UNKNOWN_MEDIA_MESSAGE id=0x{id:04x} body_len={}", body.len())),
     }
@@ -629,6 +647,82 @@ pub fn build_media_ack_payload(session_id: i32, ack_counter: u32) -> Result<(Vec
         out,
         format!("MEDIA_MESSAGE_ACK session_id={} ack={}", session_id, ack_counter),
     ))
+}
+
+pub fn build_microphone_request_payload(
+    open: bool,
+    max_unacked: u32,
+    anc_enabled: bool,
+    ec_enabled: bool,
+) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut req = MicrophoneRequest::new();
+    req.set_open(open);
+    req.set_anc_enabled(anc_enabled);
+    req.set_ec_enabled(ec_enabled);
+    req.set_max_unacked(max_unacked as i32);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_MICROPHONE_REQUEST.value() as u16).to_be_bytes());
+    out.extend_from_slice(&req.write_to_bytes()?);
+
+    Ok((
+        out,
+        format!(
+            "MEDIA_MESSAGE_MICROPHONE_REQUEST open={} anc={} ec={} max_unacked={}",
+            open, anc_enabled, ec_enabled, max_unacked
+        ),
+    ))
+}
+
+pub fn parse_microphone_response_payload(payload: &[u8]) -> Option<(i32, i32, String)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != MediaMessageId::MEDIA_MESSAGE_MICROPHONE_RESPONSE.value() as u16 {
+        return None;
+    }
+    let msg = MicrophoneResponse::parse_from_bytes(&payload[2..]).ok()?;
+    let summary = format!(
+        "MEDIA_MESSAGE_MICROPHONE_RESPONSE status={} session_id={}",
+        msg.status(),
+        msg.session_id()
+    );
+    Some((msg.status(), msg.session_id(), summary))
+}
+
+pub fn build_microphone_response_payload(status: i32, session_id: i32) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut resp = MicrophoneResponse::new();
+    resp.set_status(status);
+    resp.set_session_id(session_id);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_MICROPHONE_RESPONSE.value() as u16).to_be_bytes());
+    out.extend_from_slice(&resp.write_to_bytes()?);
+
+    Ok((
+        out,
+        format!("MEDIA_MESSAGE_MICROPHONE_RESPONSE status={} session_id={}", status, session_id),
+    ))
+}
+
+pub fn parse_microphone_request_payload(payload: &[u8]) -> Option<(bool, u32, String)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != MediaMessageId::MEDIA_MESSAGE_MICROPHONE_REQUEST.value() as u16 {
+        return None;
+    }
+    let msg = MicrophoneRequest::parse_from_bytes(&payload[2..]).ok()?;
+    let summary = format!(
+        "MEDIA_MESSAGE_MICROPHONE_REQUEST open={} anc={} ec={} max_unacked={}",
+        msg.open(),
+        msg.anc_enabled(),
+        msg.ec_enabled(),
+        msg.max_unacked()
+    );
+    Some((msg.open(), msg.max_unacked().max(0) as u32, summary))
 }
 
 pub fn smoke_summary() -> String {

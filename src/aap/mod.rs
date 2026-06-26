@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
-use crate::input::{self, AppProcessInputInjector, TouchInjectAction, TouchInjector};
+use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, TouchInjectAction, TouchInjector};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -994,6 +994,17 @@ pub struct TlsHandshakeProbeConfig {
     pub audio_tone_hz: f32,
     pub audio_tone_chunk_ms: u64,
     pub audio_tone_volume: f32,
+    pub audio_capture: bool,
+    pub audio_capture_source: String,
+    pub audio_capture_chunk_ms: u64,
+    pub audio_capture_gain: f32,
+    pub audio_capture_as: String,
+    pub audio_capture_package: String,
+    pub mic_open: bool,
+    pub mic_send_request_open: bool,
+    pub mic_dump_path: Option<PathBuf>,
+    pub mic_ack: bool,
+    pub mic_max_unacked: u32,
     pub quiet_ping_logs: bool,
     pub log_level: String,
 }
@@ -1046,6 +1057,17 @@ impl Default for TlsHandshakeProbeConfig {
             audio_tone_hz: 440.0,
             audio_tone_chunk_ms: 20,
             audio_tone_volume: 0.20,
+            audio_capture: false,
+            audio_capture_source: "remote_submix".to_string(),
+            audio_capture_chunk_ms: 20,
+            audio_capture_gain: 1.0,
+            audio_capture_as: "shell".to_string(),
+            audio_capture_package: "com.android.shell".to_string(),
+            mic_open: false,
+            mic_send_request_open: false,
+            mic_dump_path: None,
+            mic_ack: true,
+            mic_max_unacked: 8,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
         }
@@ -1073,6 +1095,25 @@ struct AudioOutputChannelState {
     tx_phase: f64,
     tx_next_due: Option<Instant>,
     tx_first_logged: bool,
+    first_data_logged: bool,
+    dump_file: Option<File>,
+}
+
+#[derive(Debug)]
+struct MicSourceChannelState {
+    service_id: i32,
+    channel: u8,
+    config: Option<proto::AudioConfigSelection>,
+    opened: bool,
+    setup_sent: bool,
+    start_sent: bool,
+    mic_request_sent: bool,
+    mic_response_seen: bool,
+    session_id: i32,
+    max_unacked: u32,
+    ack_counter: u32,
+    data_packets: u64,
+    data_bytes: u64,
     first_data_logged: bool,
     dump_file: Option<File>,
 }
@@ -1110,6 +1151,16 @@ fn make_audio_dump_file(
         safe_stream
     };
     let path = dir.join(format!("service{}_{}.pcm", service_id, suffix));
+    Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
+}
+
+fn make_mic_dump_file(path: &Option<PathBuf>) -> io::Result<Option<File>> {
+    let Some(path) = path.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
 }
 
@@ -1151,6 +1202,101 @@ fn generate_sine_pcm_s16le(
         }
     }
     out
+}
+
+
+fn audio_chunk_bytes(cfg: Option<&proto::AudioConfigSelection>, chunk_ms: u64) -> usize {
+    let (rate, bits, channels) = audio_cfg_values(cfg);
+    let bytes_per_sample = if bits <= 8 { 1usize } else { 2usize };
+    ((rate.max(1) as u64)
+        .saturating_mul(channels.max(1) as u64)
+        .saturating_mul(bytes_per_sample as u64)
+        .saturating_mul(chunk_ms.max(1))
+        / 1000)
+        .max(bytes_per_sample as u64 * channels.max(1) as u64) as usize
+}
+
+fn apply_pcm_s16le_gain(pcm: &mut [u8], gain: f32) {
+    if (gain - 1.0).abs() < 0.01 {
+        return;
+    }
+    let gain = gain.clamp(0.0, 4.0);
+    for chunk in pcm.chunks_exact_mut(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+        let scaled = (sample * gain).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        let b = scaled.to_le_bytes();
+        chunk[0] = b[0];
+        chunk[1] = b[1];
+    }
+}
+
+fn pump_audio_capture(
+    audio_output_channels: &mut [AudioOutputChannelState],
+    capture: &mut Option<AppProcessAudioCapture>,
+    capture_buffer: &mut Vec<u8>,
+    stream: &mut TcpStream,
+    tls: &mut tls::AapTlsServer,
+    config: &TlsHandshakeProbeConfig,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<usize> {
+    if !config.audio_capture {
+        return Ok(0);
+    }
+    let Some(capture) = capture.as_mut() else {
+        return Ok(0);
+    };
+
+    capture.drain_into(capture_buffer, 32);
+    let mut tx_ssl_frames = 0usize;
+
+    for audio in audio_output_channels.iter_mut() {
+        if !audio.start_sent {
+            continue;
+        }
+        let max_in_flight = audio.max_unacked.max(1).min(8);
+        let chunk_bytes = audio_chunk_bytes(audio.config.as_ref(), config.audio_capture_chunk_ms);
+        while audio.tx_unacked < max_in_flight && capture_buffer.len() >= chunk_bytes {
+            let mut pcm = capture_buffer.drain(..chunk_bytes).collect::<Vec<u8>>();
+            apply_pcm_s16le_gain(&mut pcm, config.audio_capture_gain);
+            let payload = proto::build_media_data_payload(audio.tx_next_pts_us, &pcm);
+            let tx_count = write_encrypted_plaintext_fragmented(
+                stream,
+                tls,
+                audio.channel,
+                &payload,
+                dump,
+                "AUDIO_CAPTURE_MEDIA_MESSAGE_DATA",
+            )?;
+            tx_ssl_frames += tx_count;
+            audio.tx_packets += 1;
+            audio.tx_bytes += pcm.len() as u64;
+            audio.tx_unacked = audio.tx_unacked.saturating_add(1);
+            audio.tx_next_pts_us = audio.tx_next_pts_us.saturating_add(config.audio_capture_chunk_ms.saturating_mul(1000));
+            if !audio.tx_first_logged || session_log_enabled(LOG_NORMAL) {
+                let (rate, bits, channels) = audio_cfg_values(audio.config.as_ref());
+                let line = format!(
+                    "AUDIO_CAPTURE sent service_id={} stream={} packet={} pts_us={} bytes={} format={}Hz/{}bit/{}ch source={} gain={} buffered={} unacked={}/{}",
+                    audio.service_id,
+                    audio.stream_type,
+                    audio.tx_packets,
+                    audio.tx_next_pts_us.saturating_sub(config.audio_capture_chunk_ms.saturating_mul(1000)),
+                    pcm.len(),
+                    rate,
+                    bits,
+                    channels,
+                    config.audio_capture_source,
+                    config.audio_capture_gain,
+                    capture_buffer.len(),
+                    audio.tx_unacked,
+                    max_in_flight
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
+                audio.tx_first_logged = true;
+            }
+        }
+    }
+    Ok(tx_ssl_frames)
 }
 
 fn pump_audio_test_tone(
@@ -1881,6 +2027,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         ),
     )?;
     log_line(&mut dump, &format!("audio_test_tone={} tone_hz={} chunk_ms={} volume={}", config.audio_test_tone, config.audio_tone_hz, config.audio_tone_chunk_ms, config.audio_tone_volume))?;
+    log_line(&mut dump, &format!("audio_capture={} source={} chunk_ms={} gain={} as={} package={}", config.audio_capture, config.audio_capture_source, config.audio_capture_chunk_ms, config.audio_capture_gain, config.audio_capture_as, config.audio_capture_package))?;
+    log_line(&mut dump, &format!("mic_open={} mic_send_request_open={} mic_dump_path={} mic_ack={} mic_max_unacked={}", config.mic_open, config.mic_send_request_open, config.mic_dump_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string()), config.mic_ack, config.mic_max_unacked))?;
     log_line(&mut dump, &format!("quiet_ping_logs={} log_level={}", config.quiet_ping_logs, normalize_session_log_level(&config.log_level)))?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
@@ -1961,9 +2109,15 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_max_unacked: u32 = 1;
     let video_session_id: i32 = 1;
     let mut audio_output_channels: Vec<AudioOutputChannelState> = Vec::new();
+    let mut mic_source_channel: Option<MicSourceChannelState> = None;
+    let mut audio_capture: Option<AppProcessAudioCapture> = None;
+    let mut audio_capture_buffer: Vec<u8> = Vec::new();
     let mut audio_channel_open_requests_sent = 0usize;
     let mut audio_data_packets = 0u64;
     let mut audio_data_bytes = 0u64;
+    let mut mic_channel_open_requests_sent = 0usize;
+    let mut mic_data_packets = 0u64;
+    let mut mic_data_bytes = 0u64;
     let mut video_sender: Option<VideoSender> = if config.video_native {
         Some(VideoSender::Live(VideoLiveSender::new(VideoLiveConfig {
             width: config.video_width,
@@ -2024,8 +2178,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
-                let audio_tone_active = config.audio_test_tone && audio_output_channels.iter().any(|audio| audio.start_sent);
-                if video_start_sent || audio_tone_active {
+                let audio_pump_active = (config.audio_test_tone || config.audio_capture) && audio_output_channels.iter().any(|audio| audio.start_sent);
+                if video_start_sent || audio_pump_active {
                     let mut sent_any = 0usize;
                     if video_start_sent {
                         if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
@@ -2043,6 +2197,17 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
                     let sent = pump_audio_test_tone(
                         &mut audio_output_channels,
+                        &mut stream,
+                        &mut tls,
+                        &config,
+                        &mut dump,
+                    )?;
+                    tx_ssl_frames += sent;
+                    sent_any += sent;
+                    let sent = pump_audio_capture(
+                        &mut audio_output_channels,
+                        &mut audio_capture,
+                        &mut audio_capture_buffer,
                         &mut stream,
                         &mut tls,
                         &config,
@@ -2244,7 +2409,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
                     let input_candidate = summary.input_source.clone();
                     let audio_candidates = summary.audio_media_sinks.clone();
-                    if config.audio_open {
+                    let mic_candidate = summary.media_source.clone();
+                    if config.audio_open || config.mic_open {
                         println!(
                             "selected audio candidates={} filter={} media_source={:?}",
                             audio_candidates.len(),
@@ -2599,6 +2765,65 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             });
                         }
                     }
+                    if config.mic_open {
+                        if let Some(source) = mic_candidate.clone() {
+                            let cfg_text = source.config.as_ref()
+                                .map(|cfg| format!("config_index={} rate={} bits={} channels={}", cfg.config_index, cfg.sampling_rate, cfg.bits, cfg.channels))
+                                .unwrap_or_else(|| "config=none".to_string());
+                            let line = format!(
+                                "MIC_SOURCE_OPEN selected service_id={} type={} {}",
+                                source.service_id, source.available_type, cfg_text
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+
+                            let dump_file = match make_mic_dump_file(&config.mic_dump_path) {
+                                Ok(file) => file,
+                                Err(err) => {
+                                    let line = format!("MIC_DUMP open failed: {err}");
+                                    println!("{line}");
+                                    log_line(&mut dump, &line)?;
+                                    None
+                                }
+                            };
+
+                            let control_payload = proto::build_channel_open_request_control_payload(source.service_id, 0)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            let tx_count = write_encrypted_plaintext_fragmented_with_flags(
+                                &mut stream,
+                                &mut tls,
+                                source.service_id as u8,
+                                FLAG_CONTROL,
+                                &control_payload,
+                                &mut dump,
+                                "MIC_CHANNEL_OPEN_REQUEST",
+                            )?;
+                            tx_ssl_frames += tx_count;
+                            mic_channel_open_requests_sent += 1;
+                            println!("tx encrypted MIC_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={}", source.service_id as u8, source.service_id);
+                            log_line(&mut dump, &format!("tx encrypted MIC_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={}", source.service_id as u8, source.service_id))?;
+                            mic_source_channel = Some(MicSourceChannelState {
+                                service_id: source.service_id,
+                                channel: source.service_id as u8,
+                                config: source.config,
+                                opened: false,
+                                setup_sent: false,
+                                start_sent: false,
+                                mic_request_sent: false,
+                                mic_response_seen: false,
+                                session_id: 200 + source.service_id,
+                                max_unacked: 1,
+                                ack_counter: 0,
+                                data_packets: 0,
+                                data_bytes: 0,
+                                first_data_logged: false,
+                                dump_file,
+                            });
+                        } else {
+                            println!("MIC_SOURCE_OPEN requested but SDR has no MediaSourceService candidate");
+                            log_line(&mut dump, "MIC_SOURCE_OPEN requested but SDR has no MediaSourceService candidate")?;
+                        }
+                    }
                 }
             }
 
@@ -2617,6 +2842,11 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     audio.opened = true;
                     println!("AUDIO_CHANNEL_OPEN_RESPONSE observed service_id={} stream={} opened=true", audio.service_id, audio.stream_type);
                     log_line(&mut dump, &format!("AUDIO_CHANNEL_OPEN_RESPONSE observed service_id={} stream={} opened=true", audio.service_id, audio.stream_type))?;
+                }
+                if let Some(mic) = mic_source_channel.as_mut().filter(|mic| mic.channel == frame.channel) {
+                    mic.opened = true;
+                    println!("MIC_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", mic.service_id);
+                    log_line(&mut dump, &format!("MIC_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", mic.service_id))?;
                 }
             }
 
@@ -2926,6 +3156,133 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
 
+            if let Some(mic) = mic_source_channel.as_mut().filter(|mic| mic.opened && !mic.setup_sent) {
+                // MediaSource / microphone is HU -> device.  Unlike media sinks,
+                // the device side must not send AV setup/start on this channel;
+                // OpenAuto/DHU treats that as an unexpected message.  After the
+                // channel-open response we stay passive and wait for HU-side
+                // MicrophoneRequest and/or raw media data.
+                mic.setup_sent = true;
+                mic.start_sent = true;
+                println!("MIC_CHANNEL_OPEN_RESPONSE accepted; media_source passive mode: not sending MEDIA_MESSAGE_SETUP/START; waiting for HU MICROPHONE_REQUEST/DATA on channel=0x{:02x}", mic.channel);
+                log_line(&mut dump, &format!("MIC_CHANNEL_OPEN_RESPONSE accepted; media_source passive mode: not sending MEDIA_MESSAGE_SETUP/START; waiting for HU MICROPHONE_REQUEST/DATA on channel=0x{:02x}", mic.channel))?;
+                if config.mic_send_request_open && !mic.mic_request_sent {
+                    // Experimental: some HUs/DHU do not begin sending microphone PCM
+                    // just because the media_source channel is open.  Request the HU
+                    // microphone explicitly, but do not send media SETUP/START on this
+                    // source channel (OpenAuto/DHU rejected that as an unexpected
+                    // message).  If the direction is wrong for a HU, it should be easy
+                    // to see from HU logs without disturbing the sink audio path.
+                    let (req_payload, req_summary) = proto::build_microphone_request_payload(
+                        true,
+                        config.mic_max_unacked,
+                        false,
+                        false,
+                    )
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let tx_count = write_encrypted_plaintext_fragmented(
+                        &mut stream,
+                        &mut tls,
+                        mic.channel,
+                        &req_payload,
+                        &mut dump,
+                        "MICROPHONE_REQUEST_OPEN",
+                    )?;
+                    tx_ssl_frames += tx_count;
+                    mic.mic_request_sent = true;
+                    mic.max_unacked = config.mic_max_unacked;
+                    println!("tx encrypted {req_summary} frame(s): count={tx_count} channel=0x{:02x} mode=request-only", mic.channel);
+                    log_line(&mut dump, &format!("tx encrypted {req_summary} frame(s): count={tx_count} channel=0x{:02x} mode=request-only", mic.channel))?;
+                }
+            }
+
+            if let Some(mic) = mic_source_channel.as_mut().filter(|mic| mic.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
+                if let Some((status, session_id, summary)) = proto::parse_microphone_response_payload(&plaintext) {
+                    mic.mic_response_seen = true;
+                    if session_id > 0 {
+                        mic.session_id = session_id;
+                    }
+                    println!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={}", mic.service_id, summary, mic.session_id);
+                    log_line(&mut dump, &format!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={}", mic.service_id, summary, mic.session_id))?;
+                    if status != 0 {
+                        let line = format!("MICROPHONE_RESPONSE non-zero status={} service_id={}", status, mic.service_id);
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
+                }
+                if let Some((open, max_unacked, summary)) = proto::parse_microphone_request_payload(&plaintext) {
+                    println!("MICROPHONE_REQUEST observed from HU service_id={} {}", mic.service_id, summary);
+                    log_line(&mut dump, &format!("MICROPHONE_REQUEST observed from HU service_id={} {}", mic.service_id, summary))?;
+                    if max_unacked > 0 {
+                        mic.max_unacked = max_unacked;
+                    }
+                    let response_status = 0;
+                    let (resp_payload, resp_summary) = proto::build_microphone_response_payload(response_status, mic.session_id)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let tx_count = write_encrypted_plaintext_fragmented(
+                        &mut stream,
+                        &mut tls,
+                        frame.channel,
+                        &resp_payload,
+                        &mut dump,
+                        "MICROPHONE_RESPONSE",
+                    )?;
+                    tx_ssl_frames += tx_count;
+                    println!("tx encrypted {resp_summary} frame(s): count={tx_count} channel=0x{:02x} request_open={}", frame.channel, open);
+                    log_line(&mut dump, &format!("tx encrypted {resp_summary} frame(s): count={tx_count} channel=0x{:02x} request_open={}", frame.channel, open))?;
+                    if !open {
+                        let line = format!("MICROPHONE_REQUEST HU requested close service_id={}", mic.service_id);
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
+                }
+                if let Some((pts_us, pcm)) = proto::parse_media_data_payload(&plaintext) {
+                    mic.data_packets += 1;
+                    mic.data_bytes += pcm.len() as u64;
+                    mic.ack_counter = mic.ack_counter.saturating_add(1);
+                    mic_data_packets += 1;
+                    mic_data_bytes += pcm.len() as u64;
+                    if let Some(file) = mic.dump_file.as_mut() {
+                        file.write_all(pcm)?;
+                    }
+                    if !mic.first_data_logged || session_log_enabled(LOG_NORMAL) {
+                        let cfg_text = mic.config.as_ref()
+                            .map(|cfg| format!("{}Hz/{}bit/{}ch", cfg.sampling_rate, cfg.bits, cfg.channels))
+                            .unwrap_or_else(|| "unknown-format".to_string());
+                        let line = format!(
+                            "MIC_DATA service_id={} packet={} pts_us={} bytes={} total_bytes={} format={} dumped={}",
+                            mic.service_id,
+                            mic.data_packets,
+                            pts_us,
+                            pcm.len(),
+                            mic.data_bytes,
+                            cfg_text,
+                            mic.dump_file.is_some()
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                        mic.first_data_logged = true;
+                    }
+                    if config.mic_ack {
+                        let (ack_payload, summary) = proto::build_media_ack_payload(mic.session_id, mic.ack_counter)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let tx_count = write_encrypted_plaintext_fragmented(
+                            &mut stream,
+                            &mut tls,
+                            frame.channel,
+                            &ack_payload,
+                            &mut dump,
+                            "MIC_MEDIA_MESSAGE_ACK",
+                        )?;
+                        tx_ssl_frames += tx_count;
+                        if session_log_enabled(LOG_VERBOSE) {
+                            println!("tx encrypted MIC {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                            log_line(&mut dump, &format!("tx encrypted MIC {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                        }
+                    }
+                }
+            }
+
             if let Some(index) = audio_output_channels.iter().position(|audio| audio.opened && !audio.setup_sent) {
                 let channel = audio_output_channels[index].channel;
                 let (media_payload, summary) = proto::build_audio_pcm_media_setup_payload()
@@ -2967,16 +3324,48 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     audio_output_channels[index].start_sent = true;
                     println!("tx encrypted AUDIO_MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
                     log_line(&mut dump, &format!("tx encrypted AUDIO_MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
-                    if config.audio_test_tone {
+                    if config.audio_test_tone || config.audio_capture {
                         if !video_pump_timeout_enabled {
                             stream.set_read_timeout(Some(Duration::from_millis(20)))?;
                             video_pump_timeout_enabled = true;
-                            let line = "AUDIO_PUMP enabled: receive timeout reduced to 20ms so generated PCM can be sent between HU frames";
+                            let line = "AUDIO_PUMP enabled: receive timeout reduced to 20ms so generated/captured PCM can be sent between HU frames";
                             println!("{line}");
                             log_line(&mut dump, line)?;
                         }
+                        if config.audio_capture && audio_capture.is_none() {
+                            let (rate, _bits, channels) = audio_cfg_values(audio_output_channels[index].config.as_ref());
+                            match AppProcessAudioCapture::create(
+                                rate,
+                                channels,
+                                &config.audio_capture_source,
+                                config.audio_capture_chunk_ms,
+                                &config.audio_capture_as,
+                                &config.audio_capture_package,
+                            ) {
+                                Ok((capture, report)) => {
+                                    println!("AUDIO_CAPTURE_APP {}", report.trim().replace('\n', " | "));
+                                    log_line(&mut dump, &format!("AUDIO_CAPTURE_APP {}", report.trim().replace('\n', " | ")))?;
+                                    audio_capture = Some(capture);
+                                }
+                                Err(err) => {
+                                    let line = format!("AUDIO_CAPTURE disabled: failed to start app_process AudioRecord capture: {err}");
+                                    println!("{line}");
+                                    log_line(&mut dump, &line)?;
+                                }
+                            }
+                        }
                         let sent = pump_audio_test_tone(
                             &mut audio_output_channels,
+                            &mut stream,
+                            &mut tls,
+                            &config,
+                            &mut dump,
+                        )?;
+                        tx_ssl_frames += sent;
+                        let sent = pump_audio_capture(
+                            &mut audio_output_channels,
+                            &mut audio_capture,
+                            &mut audio_capture_buffer,
                             &mut stream,
                             &mut tls,
                             &config,
@@ -3230,8 +3619,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let elapsed = started.elapsed();
     let audio_tx_packets: u64 = audio_output_channels.iter().map(|audio| audio.tx_packets).sum();
     let audio_tx_bytes: u64 = audio_output_channels.iter().map(|audio| audio.tx_bytes).sum();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), elapsed.as_millis()))?;
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), elapsed.as_millis()))?;
     Ok(())
 }
 

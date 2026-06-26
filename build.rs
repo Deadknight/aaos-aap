@@ -26,6 +26,7 @@ fn generate_protos() {
 
 fn build_inputd_java() {
     println!("cargo:rerun-if-changed=src/inputd/java/com/arda/input/InputServer.java");
+    println!("cargo:rerun-if-changed=src/inputd/java/com/arda/input/AudioCaptureServer.java");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let jar_out = out_dir.join("arda_inputd.jar");
@@ -46,7 +47,16 @@ fn build_inputd_java() {
         panic!("android.jar not found. Install an Android SDK platform or set ANDROID_JAR=/path/to/android.jar")
     });
 
-    let src = PathBuf::from("src/inputd/java/com/arda/input/InputServer.java");
+    let java_src_dir = PathBuf::from("src/inputd/java/com/arda/input");
+    let java_sources = fs::read_dir(&java_src_dir)
+        .expect("read inputd java source dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("java"))
+        .collect::<Vec<_>>();
+    if java_sources.is_empty() {
+        panic!("no Java sources found in {}", java_src_dir.display());
+    }
     let classes_dir = out_dir.join("arda_inputd_classes");
     let dex_dir = out_dir.join("arda_inputd_dex");
     let _ = fs::remove_dir_all(&classes_dir);
@@ -60,7 +70,7 @@ fn build_inputd_java() {
         .arg(&android_jar)
         .arg("-d")
         .arg(&classes_dir)
-        .arg(&src)
+        .args(&java_sources)
         .status()
         .unwrap_or_else(|err| panic!("failed to run javac {javac}: {err}"));
     if !javac_status.success() {

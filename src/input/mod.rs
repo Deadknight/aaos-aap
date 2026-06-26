@@ -5,12 +5,13 @@
 //! virtual direct touchscreen that can emit tap and swipe gestures.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -237,6 +238,222 @@ impl AppProcessInputInjector {
 }
 
 impl Drop for AppProcessInputInjector {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+
+fn append_audio_capture_permission_prep(report: &mut String, package_name: &str) {
+    // app_process runs under the adb shell uid. AudioRecord policy checks often
+    // use uid+package attribution; make the shell package explicit and best-effort
+    // open the relevant app-ops before starting the Java capture process. These
+    // commands are intentionally non-fatal because some AAOS builds do not expose
+    // every permission/op name.
+    let commands: Vec<(&str, Vec<&str>)> = vec![
+        ("/system/bin/pm", vec!["grant", package_name, "android.permission.RECORD_AUDIO"]),
+        ("/system/bin/pm", vec!["grant", package_name, "android.permission.CAPTURE_AUDIO_OUTPUT"]),
+        ("/system/bin/cmd", vec!["appops", "set", package_name, "RECORD_AUDIO", "allow"]),
+        ("/system/bin/cmd", vec!["appops", "set", package_name, "CAPTURE_AUDIO_OUTPUT", "allow"]),
+    ];
+
+    for (bin, args) in commands {
+        match Command::new(bin).args(&args).output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().replace('\n', " ");
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().replace('\n', " ");
+                report.push_str(&format!(
+                    "prep {} {} status={:?} stdout='{}' stderr='{}'\n",
+                    bin,
+                    args.join(" "),
+                    output.status.code(),
+                    stdout,
+                    stderr,
+                ));
+            }
+            Err(err) => {
+                report.push_str(&format!("prep {} {} failed={}\n", bin, args.join(" "), err));
+            }
+        }
+    }
+}
+
+fn normalize_audio_capture_launch_as(value: &str) -> &str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "root" | "0" | "su" => "root",
+        "system" | "1000" => "system",
+        "media" | "1013" => "media",
+        "audioserver" | "audio-server" | "1041" => "audioserver",
+        _ => "shell",
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Long-lived Android audio capture launched through app_process.
+///
+/// The child process uses AudioRecord and writes raw PCM16LE to stdout. Stderr
+/// is inherited for lifecycle/error logs. The Rust side drains stdout on a
+/// background thread so the main AAP loop can package PCM into MEDIA_MESSAGE_DATA.
+pub struct AppProcessAudioCapture {
+    child: Child,
+    rx: mpsc::Receiver<Vec<u8>>,
+    jar_path: PathBuf,
+}
+
+impl AppProcessAudioCapture {
+    pub fn create(
+        sample_rate: u32,
+        channels: u32,
+        source: &str,
+        chunk_ms: u64,
+        launch_as: &str,
+        package_name: &str,
+    ) -> io::Result<(Self, String)> {
+        if INPUTD_JAR_BYTES.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "embedded arda_inputd.jar is empty; rebuild Android target with d8/android.jar available",
+            ));
+        }
+
+        let jar_path = PathBuf::from(INPUTD_JAR_PATH);
+        fs::write(&jar_path, INPUTD_JAR_BYTES)?;
+
+        let mut report = String::new();
+        report.push_str("arda app_process audio capture\n");
+        report.push_str(&format!("jar={} bytes={}\n", jar_path.display(), INPUTD_JAR_BYTES.len()));
+        let launch_as = normalize_audio_capture_launch_as(launch_as);
+        let package_name = if package_name.trim().is_empty() { "com.android.shell" } else { package_name.trim() };
+        report.push_str(&format!("rate={} channels={} source={} chunk_ms={} launch_as={} package={}\n", sample_rate, channels, source, chunk_ms, launch_as, package_name));
+        append_audio_capture_permission_prep(&mut report, package_name);
+
+        let mut base_args = vec![
+            "/".to_string(),
+            "com.arda.input.AudioCaptureServer".to_string(),
+            "--rate".to_string(),
+            sample_rate.to_string(),
+            "--channels".to_string(),
+            channels.to_string(),
+            "--source".to_string(),
+            source.to_string(),
+            "--chunk-ms".to_string(),
+            chunk_ms.to_string(),
+            "--package".to_string(),
+            package_name.to_string(),
+        ];
+
+        let mut child_cmd;
+        let mut child = if launch_as == "shell" {
+            child_cmd = Command::new("/system/bin/app_process");
+            child_cmd.env("CLASSPATH", &jar_path);
+            for arg in &base_args {
+                child_cmd.arg(arg);
+            }
+            child_cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?
+        } else {
+            let uid = match launch_as {
+                "root" => "0",
+                "system" => "1000",
+                "media" => "1013",
+                "audioserver" => "1041",
+                _ => "0",
+            };
+            let mut script = String::new();
+            script.push_str("CLASSPATH=");
+            script.push_str(&shell_quote(&jar_path.to_string_lossy()));
+            script.push_str(" exec /system/bin/app_process");
+            for arg in &base_args {
+                script.push(' ');
+                script.push_str(&shell_quote(arg));
+            }
+            report.push_str(&format!("spawn=/system/bin/su {} sh -c {}\n", uid, script));
+            child_cmd = Command::new("/system/bin/su");
+            child_cmd
+                .arg(uid)
+                .arg("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?
+        };
+
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "app_process audiocap stdout missing")
+        })?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        report.push_str(&format!("pid={}\n", child.id()));
+        thread::sleep(Duration::from_millis(250));
+
+        Ok((Self { child, rx, jar_path }, report))
+    }
+
+    pub fn drain_into(&mut self, dst: &mut Vec<u8>, max_chunks: usize) -> usize {
+        let mut chunks = 0usize;
+        while chunks < max_chunks {
+            match self.rx.try_recv() {
+                Ok(data) => {
+                    dst.extend_from_slice(&data);
+                    chunks += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        chunks
+    }
+
+    pub fn stop(&mut self) {
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    let _ = fs::remove_file(&self.jar_path);
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.jar_path);
+    }
+}
+
+impl Drop for AppProcessAudioCapture {
     fn drop(&mut self) {
         self.stop();
     }

@@ -127,6 +127,9 @@ Commands:
   aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
       Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
 
+  aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-tone-hz 440] [--audio-dump|--audio-dump-dir PATH] [--no-audio-ack]
+      Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
+
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
 
@@ -1057,6 +1060,14 @@ struct AapTlsHandshakeProbeArgs {
     input_inject_mode: String,
     input_app_move_min_ms: u64,
     input_key_inject: bool,
+    audio_open: bool,
+    audio_stream_filter: String,
+    audio_dump_dir: Option<PathBuf>,
+    audio_ack: bool,
+    audio_test_tone: bool,
+    audio_tone_hz: f32,
+    audio_tone_chunk_ms: u64,
+    audio_tone_volume: f32,
     quiet_ping_logs: bool,
     log_level: String,
 }
@@ -1101,6 +1112,14 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         input_inject_mode: args.input_inject_mode,
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
+        audio_open: args.audio_open,
+        audio_stream_filter: args.audio_stream_filter.clone(),
+        audio_dump_dir: args.audio_dump_dir.clone(),
+        audio_ack: args.audio_ack,
+        audio_test_tone: args.audio_test_tone,
+        audio_tone_hz: args.audio_tone_hz,
+        audio_tone_chunk_ms: args.audio_tone_chunk_ms,
+        audio_tone_volume: args.audio_tone_volume,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1163,6 +1182,14 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         input_inject_mode: args.input_inject_mode,
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
+        audio_open: args.audio_open,
+        audio_stream_filter: args.audio_stream_filter.clone(),
+        audio_dump_dir: args.audio_dump_dir.clone(),
+        audio_ack: args.audio_ack,
+        audio_test_tone: args.audio_test_tone,
+        audio_tone_hz: args.audio_tone_hz,
+        audio_tone_chunk_ms: args.audio_tone_chunk_ms,
+        audio_tone_volume: args.audio_tone_volume,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1216,6 +1243,14 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         input_inject_mode: args.input_inject_mode,
         input_app_move_min_ms: args.input_app_move_min_ms,
         input_key_inject: args.input_key_inject,
+        audio_open: args.audio_open,
+        audio_stream_filter: args.audio_stream_filter.clone(),
+        audio_dump_dir: args.audio_dump_dir.clone(),
+        audio_ack: args.audio_ack,
+        audio_test_tone: args.audio_test_tone,
+        audio_tone_hz: args.audio_tone_hz,
+        audio_tone_chunk_ms: args.audio_tone_chunk_ms,
+        audio_tone_volume: args.audio_tone_volume,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1274,6 +1309,14 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut input_inject_mode = String::from("uinput");
     let mut input_app_move_min_ms = 16u64;
     let mut input_key_inject = false;
+    let mut audio_open = false;
+    let mut audio_stream_filter = String::from("all");
+    let mut audio_dump_dir: Option<PathBuf> = None;
+    let mut audio_ack = true;
+    let mut audio_test_tone = false;
+    let mut audio_tone_hz: f32 = 440.0;
+    let mut audio_tone_chunk_ms: u64 = 20;
+    let mut audio_tone_volume: f32 = 0.20;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
 
@@ -1519,6 +1562,55 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--no-input-key-inject" | "--no-inject-input-keys" | "--no-inject-keys" => {
                 input_key_inject = false;
             }
+            "--audio-open" | "--open-audio" | "--media-audio" | "--audio-output" => {
+                audio_open = true;
+            }
+            "--no-audio-open" | "--no-open-audio" | "--no-media-audio" | "--no-audio-output" => {
+                audio_open = false;
+            }
+            "--audio-stream" | "--audio-stream-filter" => {
+                i += 1;
+                audio_stream_filter = argv.get(i).ok_or("--audio-stream requires all|media|guidance|system|telephony")?.to_ascii_lowercase();
+            }
+            "--audio-dump" | "--dump-audio" => {
+                audio_open = true;
+                audio_dump_dir = Some(PathBuf::from("/data/local/tmp/arda-audio"));
+            }
+            "--audio-dump-dir" | "--dump-audio-dir" => {
+                i += 1;
+                audio_open = true;
+                audio_dump_dir = Some(PathBuf::from(argv.get(i).ok_or("--audio-dump-dir requires path")?));
+            }
+            "--no-audio-dump" | "--no-dump-audio" => {
+                audio_dump_dir = None;
+            }
+            "--audio-ack" | "--ack-audio" => {
+                audio_ack = true;
+            }
+            "--no-audio-ack" | "--no-ack-audio" => {
+                audio_ack = false;
+            }
+            "--audio-test-tone" | "--audio-tone" | "--test-audio" | "--send-audio-tone" => {
+                audio_open = true;
+                audio_test_tone = true;
+            }
+            "--no-audio-test-tone" | "--no-audio-tone" | "--no-test-audio" => {
+                audio_test_tone = false;
+            }
+            "--audio-tone-hz" | "--audio-test-tone-hz" | "--tone-hz" => {
+                i += 1;
+                audio_open = true;
+                audio_test_tone = true;
+                audio_tone_hz = argv.get(i).ok_or("--audio-tone-hz requires frequency")?.parse::<f32>()?;
+            }
+            "--audio-tone-chunk-ms" | "--audio-chunk-ms" => {
+                i += 1;
+                audio_tone_chunk_ms = argv.get(i).ok_or("--audio-tone-chunk-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--audio-tone-volume" | "--audio-volume" => {
+                i += 1;
+                audio_tone_volume = argv.get(i).ok_or("--audio-tone-volume requires 0.0..1.0")?.parse::<f32>()?;
+            }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
             }
@@ -1634,6 +1726,18 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if !matches!(video_wm_size_orientation.as_str(), "logical" | "natural" | "auto") {
         return Err("--wm-size-orientation must be logical, natural, or auto".into());
     }
+    if audio_stream_filter.trim().is_empty() {
+        return Err("--audio-stream cannot be empty".into());
+    }
+    if !(1.0..=24_000.0).contains(&audio_tone_hz) {
+        return Err("--audio-tone-hz must be 1..24000".into());
+    }
+    if audio_tone_chunk_ms == 0 || audio_tone_chunk_ms > 200 {
+        return Err("--audio-tone-chunk-ms must be 1..200".into());
+    }
+    if !(0.0..=1.0).contains(&audio_tone_volume) {
+        return Err("--audio-tone-volume must be 0.0..1.0".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -1673,6 +1777,14 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         input_inject_mode,
         input_app_move_min_ms,
         input_key_inject,
+        audio_open,
+        audio_stream_filter,
+        audio_dump_dir,
+        audio_ack,
+        audio_test_tone,
+        audio_tone_hz,
+        audio_tone_chunk_ms,
+        audio_tone_volume,
         quiet_ping_logs,
         log_level,
     })

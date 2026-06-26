@@ -504,18 +504,24 @@ fn summarize_keycodes(keycodes: &[i32]) -> String {
 /// Returned bytes include the 2-byte media message id followed by the protobuf body.
 /// For DHU's first video sink we currently request H.264 baseline, matching the
 /// advertised first video config in ServiceDiscoveryResponse.
-pub fn build_video_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::Error> {
+pub fn build_media_setup_payload(codec_type: MediaCodecType) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let summary = format!("MEDIA_MESSAGE_SETUP type={:?}", codec_type);
     let mut setup = Setup::new();
-    setup.set_type(MediaCodecType::MEDIA_CODEC_VIDEO_H264_BP);
+    setup.set_type(codec_type);
 
     let mut out = Vec::new();
     out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_SETUP.value() as u16).to_be_bytes());
     out.extend_from_slice(&setup.write_to_bytes()?);
 
-    Ok((
-        out,
-        "MEDIA_MESSAGE_SETUP type=MEDIA_CODEC_VIDEO_H264_BP".to_string(),
-    ))
+    Ok((out, summary))
+}
+
+pub fn build_video_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::Error> {
+    build_media_setup_payload(MediaCodecType::MEDIA_CODEC_VIDEO_H264_BP)
+}
+
+pub fn build_audio_pcm_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::Error> {
+    build_media_setup_payload(MediaCodecType::MEDIA_CODEC_AUDIO_PCM)
 }
 
 /// If a video media channel sends MEDIA_MESSAGE_CONFIG/STATUS_READY, build the
@@ -594,6 +600,37 @@ pub fn parse_media_ack_payload(payload: &[u8]) -> Option<(i32, u32, String)> {
     Some((msg.session_id(), msg.ack(), summary))
 }
 
+
+/// Parse inbound MEDIA_MESSAGE_DATA as: 2-byte media id + u64 BE PTS + bytes.
+pub fn parse_media_data_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
+    if payload.len() < 10 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != MediaMessageId::MEDIA_MESSAGE_DATA.value() as u16 {
+        return None;
+    }
+    let pts_us = u64::from_be_bytes([
+        payload[2], payload[3], payload[4], payload[5],
+        payload[6], payload[7], payload[8], payload[9],
+    ]);
+    Some((pts_us, &payload[10..]))
+}
+
+pub fn build_media_ack_payload(session_id: i32, ack_counter: u32) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut ack = Ack::new();
+    ack.set_session_id(session_id);
+    ack.set_ack(ack_counter);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_ACK.value() as u16).to_be_bytes());
+    out.extend_from_slice(&ack.write_to_bytes()?);
+    Ok((
+        out,
+        format!("MEDIA_MESSAGE_ACK session_id={} ack={}", session_id, ack_counter),
+    ))
+}
+
 pub fn smoke_summary() -> String {
     let auth_payload = [0x08, 0x00];
     let auth = describe_control_body(
@@ -610,7 +647,9 @@ pub struct ServiceDiscoverySummary {
     pub one_line: String,
     pub details: Vec<String>,
     pub video_media_sink: Option<MediaSinkSelection>,
+    pub audio_media_sinks: Vec<AudioSinkSelection>,
     pub input_source: Option<InputSourceSelection>,
+    pub media_source: Option<MediaSourceSelection>,
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +661,31 @@ pub struct MediaSinkSelection {
     pub video_configs: usize,
     pub first_video_config: Option<String>,
     pub selected_video_config: Option<VideoConfigSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioSinkSelection {
+    pub service_id: i32,
+    pub available_type: String,
+    pub audio_stream_type: String,
+    pub display_id: u32,
+    pub display_type: String,
+    pub configs: Vec<AudioConfigSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioConfigSelection {
+    pub config_index: usize,
+    pub sampling_rate: u32,
+    pub bits: u32,
+    pub channels: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaSourceSelection {
+    pub service_id: i32,
+    pub available_type: String,
+    pub config: Option<AudioConfigSelection>,
 }
 
 #[derive(Debug, Clone)]
@@ -908,7 +972,9 @@ fn summarize_service_discovery_response_body(
     let msg = ServiceDiscoveryResponse::parse_from_bytes(body)?;
     let mut details = Vec::new();
     let mut video_media_sink = None;
+    let mut audio_media_sinks: Vec<AudioSinkSelection> = Vec::new();
     let mut input_source = None;
+    let mut media_source = None;
 
     details.push(format!(
         "SDR headunit display_name={:?} driver_position={:?} services={}",
@@ -952,12 +1018,45 @@ fn summarize_service_discovery_response_body(
                 let selected_video_config = select_video_config(&sink.video_configs, video_config_policy);
                 video_media_sink = Some(MediaSinkSelection {
                     service_id: svc.id(),
-                    available_type,
+                    available_type: available_type.clone(),
                     display_id: sink.display_id(),
-                    display_type,
+                    display_type: display_type.clone(),
                     video_configs: video_count,
                     first_video_config,
                     selected_video_config,
+                });
+            }
+
+            if audio_count > 0 {
+                let configs = sink
+                    .audio_configs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cfg)| AudioConfigSelection {
+                        config_index: index,
+                        sampling_rate: cfg.sampling_rate(),
+                        bits: cfg.number_of_bits(),
+                        channels: cfg.number_of_channels(),
+                    })
+                    .collect::<Vec<_>>();
+                for cfg in &configs {
+                    details.push(format!(
+                        "    audio sink config[{}] service_id={} stream={:?} rate={} bits={} channels={}",
+                        cfg.config_index,
+                        svc.id(),
+                        sink.audio_type(),
+                        cfg.sampling_rate,
+                        cfg.bits,
+                        cfg.channels
+                    ));
+                }
+                audio_media_sinks.push(AudioSinkSelection {
+                    service_id: svc.id(),
+                    available_type: available_type.clone(),
+                    audio_stream_type: format!("{:?}", sink.audio_type()),
+                    display_id: sink.display_id(),
+                    display_type: display_type.clone(),
+                    configs,
                 });
             }
         }
@@ -1047,6 +1146,28 @@ fn summarize_service_discovery_response_body(
         }
         if let Some(source) = svc.media_source_service.as_ref() {
             kinds.push(format!("media_source type={:?}", source.available_type()));
+            if let Some(cfg) = source.audio_config.as_ref() {
+                details.push(format!(
+                    "    media_source audio config service_id={} type={:?} rate={} bits={} channels={}",
+                    svc.id(),
+                    source.available_type(),
+                    cfg.sampling_rate(),
+                    cfg.number_of_bits(),
+                    cfg.number_of_channels()
+                ));
+            }
+            if media_source.is_none() {
+                media_source = Some(MediaSourceSelection {
+                    service_id: svc.id(),
+                    available_type: format!("{:?}", source.available_type()),
+                    config: source.audio_config.as_ref().map(|cfg| AudioConfigSelection {
+                        config_index: 0,
+                        sampling_rate: cfg.sampling_rate(),
+                        bits: cfg.number_of_bits(),
+                        channels: cfg.number_of_channels(),
+                    }),
+                });
+            }
         }
         if svc.bluetooth_service.is_some() {
             kinds.push("bluetooth".to_string());
@@ -1106,7 +1227,9 @@ fn summarize_service_discovery_response_body(
         one_line,
         details,
         video_media_sink,
+        audio_media_sinks,
         input_source,
+        media_source,
     })
 }
 

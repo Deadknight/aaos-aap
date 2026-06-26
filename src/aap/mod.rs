@@ -6,7 +6,7 @@
 //! service negotiation.
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::raw::c_int;
@@ -986,6 +986,14 @@ pub struct TlsHandshakeProbeConfig {
     pub input_inject_mode: String,
     pub input_app_move_min_ms: u64,
     pub input_key_inject: bool,
+    pub audio_open: bool,
+    pub audio_stream_filter: String,
+    pub audio_dump_dir: Option<PathBuf>,
+    pub audio_ack: bool,
+    pub audio_test_tone: bool,
+    pub audio_tone_hz: f32,
+    pub audio_tone_chunk_ms: u64,
+    pub audio_tone_volume: f32,
     pub quiet_ping_logs: bool,
     pub log_level: String,
 }
@@ -1030,10 +1038,193 @@ impl Default for TlsHandshakeProbeConfig {
             input_inject_mode: "uinput".to_string(),
             input_app_move_min_ms: 16,
             input_key_inject: false,
+            audio_open: false,
+            audio_stream_filter: "all".to_string(),
+            audio_dump_dir: None,
+            audio_ack: true,
+            audio_test_tone: false,
+            audio_tone_hz: 440.0,
+            audio_tone_chunk_ms: 20,
+            audio_tone_volume: 0.20,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
         }
     }
+}
+
+#[derive(Debug)]
+struct AudioOutputChannelState {
+    service_id: i32,
+    channel: u8,
+    stream_type: String,
+    config: Option<proto::AudioConfigSelection>,
+    opened: bool,
+    setup_sent: bool,
+    start_sent: bool,
+    session_id: i32,
+    max_unacked: u32,
+    ack_counter: u32,
+    data_packets: u64,
+    data_bytes: u64,
+    tx_unacked: u32,
+    tx_packets: u64,
+    tx_bytes: u64,
+    tx_next_pts_us: u64,
+    tx_phase: f64,
+    tx_next_due: Option<Instant>,
+    tx_first_logged: bool,
+    first_data_logged: bool,
+    dump_file: Option<File>,
+}
+
+fn audio_stream_matches(filter: &str, stream_type: &str) -> bool {
+    let filter = filter.to_ascii_lowercase();
+    let stream = stream_type.to_ascii_lowercase();
+    match filter.as_str() {
+        "all" | "any" | "*" => true,
+        "media" => stream.contains("media"),
+        "guidance" | "nav" | "navigation" => stream.contains("guidance"),
+        "system" => stream.contains("system"),
+        "telephony" | "phone" | "call" => stream.contains("telephony"),
+        other => stream.contains(other),
+    }
+}
+
+fn make_audio_dump_file(
+    dump_dir: &Option<PathBuf>,
+    service_id: i32,
+    stream_type: &str,
+    cfg: Option<&proto::AudioConfigSelection>,
+) -> io::Result<Option<File>> {
+    let Some(dir) = dump_dir.as_ref() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(dir)?;
+    let safe_stream = stream_type
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect::<String>();
+    let suffix = if let Some(cfg) = cfg {
+        format!("{}_{}hz_{}bit_{}ch", safe_stream, cfg.sampling_rate, cfg.bits, cfg.channels)
+    } else {
+        safe_stream
+    };
+    let path = dir.join(format!("service{}_{}.pcm", service_id, suffix));
+    Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
+}
+
+fn audio_cfg_values(cfg: Option<&proto::AudioConfigSelection>) -> (u32, u32, u32) {
+    let rate = cfg.map(|c| c.sampling_rate).filter(|v| *v > 0).unwrap_or(48_000);
+    let bits = cfg.map(|c| c.bits).filter(|v| *v > 0).unwrap_or(16);
+    let channels = cfg.map(|c| c.channels).filter(|v| *v > 0).unwrap_or(2);
+    (rate, bits, channels)
+}
+
+fn generate_sine_pcm_s16le(
+    cfg: Option<&proto::AudioConfigSelection>,
+    tone_hz: f32,
+    duration_ms: u64,
+    volume: f32,
+    phase: &mut f64,
+) -> Vec<u8> {
+    let (rate, bits, channels) = audio_cfg_values(cfg);
+    let rate = rate.max(1);
+    let channels = channels.max(1);
+    let sample_count = ((rate as u64).saturating_mul(duration_ms).max(1) / 1000).max(1) as usize;
+    let bytes_per_sample = if bits <= 8 { 1usize } else { 2usize };
+    let mut out = Vec::with_capacity(sample_count * channels as usize * bytes_per_sample);
+    let amp = (i16::MAX as f32 * volume.clamp(0.0, 1.0)) as i16;
+    let step = (2.0f64 * std::f64::consts::PI * tone_hz.max(1.0) as f64) / rate as f64;
+    for _ in 0..sample_count {
+        let sample = ((*phase).sin() * amp as f64) as i16;
+        *phase += step;
+        if *phase > 2.0f64 * std::f64::consts::PI {
+            *phase -= 2.0f64 * std::f64::consts::PI;
+        }
+        for _ in 0..channels {
+            if bits <= 8 {
+                let unsigned = ((sample as i32 + 32768) >> 8).clamp(0, 255) as u8;
+                out.push(unsigned);
+            } else {
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn pump_audio_test_tone(
+    audio_output_channels: &mut [AudioOutputChannelState],
+    stream: &mut TcpStream,
+    tls: &mut tls::AapTlsServer,
+    config: &TlsHandshakeProbeConfig,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<usize> {
+    if !config.audio_test_tone {
+        return Ok(0);
+    }
+    let mut tx_ssl_frames = 0usize;
+    let now = Instant::now();
+    for audio in audio_output_channels.iter_mut() {
+        if !audio.start_sent {
+            continue;
+        }
+        if let Some(due) = audio.tx_next_due {
+            if now < due {
+                continue;
+            }
+        }
+        // DHU advertises high max_unacked for audio, but use a small local guard
+        // so a missing ACK cannot flood the TCP/TLS loop with generated PCM.
+        let max_in_flight = audio.max_unacked.max(1).min(8);
+        if audio.tx_unacked >= max_in_flight {
+            continue;
+        }
+        let pcm = generate_sine_pcm_s16le(
+            audio.config.as_ref(),
+            config.audio_tone_hz,
+            config.audio_tone_chunk_ms,
+            config.audio_tone_volume,
+            &mut audio.tx_phase,
+        );
+        let payload = proto::build_media_data_payload(audio.tx_next_pts_us, &pcm);
+        let tx_count = write_encrypted_plaintext_fragmented(
+            stream,
+            tls,
+            audio.channel,
+            &payload,
+            dump,
+            "AUDIO_TEST_TONE_MEDIA_MESSAGE_DATA",
+        )?;
+        tx_ssl_frames += tx_count;
+        audio.tx_packets += 1;
+        audio.tx_bytes += pcm.len() as u64;
+        audio.tx_unacked = audio.tx_unacked.saturating_add(1);
+        audio.tx_next_pts_us = audio.tx_next_pts_us.saturating_add(config.audio_tone_chunk_ms.saturating_mul(1000));
+        audio.tx_next_due = Some(now + Duration::from_millis(config.audio_tone_chunk_ms.max(1)));
+        if !audio.tx_first_logged || session_log_enabled(LOG_NORMAL) {
+            let (rate, bits, channels) = audio_cfg_values(audio.config.as_ref());
+            let line = format!(
+                "AUDIO_TEST_TONE sent service_id={} stream={} packet={} pts_us={} bytes={} format={}Hz/{}bit/{}ch tone_hz={} volume={} unacked={}/{}",
+                audio.service_id,
+                audio.stream_type,
+                audio.tx_packets,
+                audio.tx_next_pts_us.saturating_sub(config.audio_tone_chunk_ms.saturating_mul(1000)),
+                pcm.len(),
+                rate,
+                bits,
+                channels,
+                config.audio_tone_hz,
+                config.audio_tone_volume,
+                audio.tx_unacked,
+                max_in_flight
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            audio.tx_first_logged = true;
+        }
+    }
+    Ok(tx_ssl_frames)
 }
 
 pub fn tls_handshake_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
@@ -1679,6 +1870,17 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             config.input_key_inject
         ),
     )?;
+    log_line(
+        &mut dump,
+        &format!(
+            "audio_open={} audio_stream_filter={} audio_dump_dir={} audio_ack={}",
+            config.audio_open,
+            config.audio_stream_filter,
+            config.audio_dump_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string()),
+            config.audio_ack
+        ),
+    )?;
+    log_line(&mut dump, &format!("audio_test_tone={} tone_hz={} chunk_ms={} volume={}", config.audio_test_tone, config.audio_tone_hz, config.audio_tone_chunk_ms, config.audio_tone_volume))?;
     log_line(&mut dump, &format!("quiet_ping_logs={} log_level={}", config.quiet_ping_logs, normalize_session_log_level(&config.log_level)))?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
@@ -1758,6 +1960,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_start_sent = false;
     let mut video_max_unacked: u32 = 1;
     let video_session_id: i32 = 1;
+    let mut audio_output_channels: Vec<AudioOutputChannelState> = Vec::new();
+    let mut audio_channel_open_requests_sent = 0usize;
+    let mut audio_data_packets = 0u64;
+    let mut audio_data_bytes = 0u64;
     let mut video_sender: Option<VideoSender> = if config.video_native {
         Some(VideoSender::Live(VideoLiveSender::new(VideoLiveConfig {
             width: config.video_width,
@@ -1818,23 +2024,35 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
-                if video_start_sent {
-                    if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
-                        let sent = sender.send_available(
-                            &mut stream,
-                            &mut tls,
-                            video_channel,
-                            video_session_id,
-                            video_max_unacked,
-                            &mut dump,
-                        )?;
-                        tx_ssl_frames += sent;
-                        if sent == 0 {
-                            // Avoid a busy loop when the capture reader has no complete NAL yet
-                            // or flow control is waiting for the next ACK.
-                            thread::sleep(Duration::from_millis(5));
+                let audio_tone_active = config.audio_test_tone && audio_output_channels.iter().any(|audio| audio.start_sent);
+                if video_start_sent || audio_tone_active {
+                    let mut sent_any = 0usize;
+                    if video_start_sent {
+                        if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
+                            let sent = sender.send_available(
+                                &mut stream,
+                                &mut tls,
+                                video_channel,
+                                video_session_id,
+                                video_max_unacked,
+                                &mut dump,
+                            )?;
+                            tx_ssl_frames += sent;
+                            sent_any += sent;
                         }
-                    } else {
+                    }
+                    let sent = pump_audio_test_tone(
+                        &mut audio_output_channels,
+                        &mut stream,
+                        &mut tls,
+                        &config,
+                        &mut dump,
+                    )?;
+                    tx_ssl_frames += sent;
+                    sent_any += sent;
+                    if sent_any == 0 {
+                        // Avoid a busy loop when capture/audio has nothing ready or flow control
+                        // is waiting for the next ACK.
                         thread::sleep(Duration::from_millis(5));
                     }
                     continue;
@@ -2025,6 +2243,21 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
 
                     let input_candidate = summary.input_source.clone();
+                    let audio_candidates = summary.audio_media_sinks.clone();
+                    if config.audio_open {
+                        println!(
+                            "selected audio candidates={} filter={} media_source={:?}",
+                            audio_candidates.len(),
+                            config.audio_stream_filter,
+                            summary.media_source
+                        );
+                        log_line(&mut dump, &format!(
+                            "selected audio candidates={} filter={} media_source={:?}",
+                            audio_candidates.len(),
+                            config.audio_stream_filter,
+                            summary.media_source
+                        ))?;
+                    }
                     if let Some(input) = input_candidate.as_ref() {
                         let touchscreens = input
                             .touchscreens
@@ -2284,6 +2517,88 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             log_line(&mut dump, "INPUT_OPEN requested but SDR has no InputSourceService candidate")?;
                         }
                     }
+                    if config.audio_open {
+                        for audio in audio_candidates {
+                            if !audio_stream_matches(&config.audio_stream_filter, &audio.audio_stream_type) {
+                                let line = format!(
+                                    "AUDIO_OPEN skip service_id={} stream={} filter={}",
+                                    audio.service_id, audio.audio_stream_type, config.audio_stream_filter
+                                );
+                                println!("{line}");
+                                log_line(&mut dump, &line)?;
+                                continue;
+                            }
+                            let first_cfg = audio.configs.first().cloned();
+                            let line = if let Some(cfg) = first_cfg.as_ref() {
+                                format!(
+                                    "AUDIO_OPEN selected service_id={} stream={} type={} config_index={} rate={} bits={} channels={}",
+                                    audio.service_id,
+                                    audio.audio_stream_type,
+                                    audio.available_type,
+                                    cfg.config_index,
+                                    cfg.sampling_rate,
+                                    cfg.bits,
+                                    cfg.channels
+                                )
+                            } else {
+                                format!(
+                                    "AUDIO_OPEN selected service_id={} stream={} type={} config=none",
+                                    audio.service_id, audio.audio_stream_type, audio.available_type
+                                )
+                            };
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+
+                            let dump_file = match make_audio_dump_file(&config.audio_dump_dir, audio.service_id, &audio.audio_stream_type, first_cfg.as_ref()) {
+                                Ok(file) => file,
+                                Err(err) => {
+                                    let line = format!("AUDIO_DUMP open failed service_id={}: {err}", audio.service_id);
+                                    println!("{line}");
+                                    log_line(&mut dump, &line)?;
+                                    None
+                                }
+                            };
+
+                            let control_payload = proto::build_channel_open_request_control_payload(audio.service_id, 0)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            let tx_count = write_encrypted_plaintext_fragmented_with_flags(
+                                &mut stream,
+                                &mut tls,
+                                audio.service_id as u8,
+                                FLAG_CONTROL,
+                                &control_payload,
+                                &mut dump,
+                                "AUDIO_CHANNEL_OPEN_REQUEST",
+                            )?;
+                            tx_ssl_frames += tx_count;
+                            audio_channel_open_requests_sent += 1;
+                            println!("tx encrypted AUDIO_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} stream={}", audio.service_id as u8, audio.service_id, audio.audio_stream_type);
+                            log_line(&mut dump, &format!("tx encrypted AUDIO_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={} stream={}", audio.service_id as u8, audio.service_id, audio.audio_stream_type))?;
+                            audio_output_channels.push(AudioOutputChannelState {
+                                service_id: audio.service_id,
+                                channel: audio.service_id as u8,
+                                stream_type: audio.audio_stream_type,
+                                config: first_cfg,
+                                opened: false,
+                                setup_sent: false,
+                                start_sent: false,
+                                session_id: 100 + audio.service_id,
+                                max_unacked: 1,
+                                ack_counter: 0,
+                                data_packets: 0,
+                                data_bytes: 0,
+                                tx_unacked: 0,
+                                tx_packets: 0,
+                                tx_bytes: 0,
+                                tx_next_pts_us: 0,
+                                tx_phase: 0.0,
+                                tx_next_due: None,
+                                tx_first_logged: false,
+                                first_data_logged: false,
+                                dump_file,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -2297,6 +2612,11 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     input_channel_opened = true;
                     println!("INPUT_CHANNEL_OPEN_RESPONSE observed for selected_input_service_id={selected_input_service_id:?} opened={input_channel_opened}");
                     log_line(&mut dump, &format!("INPUT_CHANNEL_OPEN_RESPONSE observed for selected_input_service_id={selected_input_service_id:?} opened={input_channel_opened}"))?;
+                }
+                if let Some(audio) = audio_output_channels.iter_mut().find(|audio| audio.channel == frame.channel) {
+                    audio.opened = true;
+                    println!("AUDIO_CHANNEL_OPEN_RESPONSE observed service_id={} stream={} opened=true", audio.service_id, audio.stream_type);
+                    log_line(&mut dump, &format!("AUDIO_CHANNEL_OPEN_RESPONSE observed service_id={} stream={} opened=true", audio.service_id, audio.stream_type))?;
                 }
             }
 
@@ -2606,6 +2926,126 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
 
+            if let Some(index) = audio_output_channels.iter().position(|audio| audio.opened && !audio.setup_sent) {
+                let channel = audio_output_channels[index].channel;
+                let (media_payload, summary) = proto::build_audio_pcm_media_setup_payload()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                println!("AUDIO_CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary} channel=0x{channel:02x} stream={}", audio_output_channels[index].stream_type);
+                log_line(&mut dump, &format!("AUDIO_CHANNEL_OPEN_RESPONSE accepted; sending encrypted {summary} channel=0x{channel:02x} stream={}", audio_output_channels[index].stream_type))?;
+                let tx_count = write_encrypted_plaintext_fragmented(
+                    &mut stream,
+                    &mut tls,
+                    channel,
+                    &media_payload,
+                    &mut dump,
+                    "AUDIO_MEDIA_MESSAGE_SETUP",
+                )?;
+                tx_ssl_frames += tx_count;
+                audio_output_channels[index].setup_sent = true;
+                println!("tx encrypted AUDIO_MEDIA_MESSAGE_SETUP frame(s): count={tx_count} channel=0x{channel:02x}");
+                log_line(&mut dump, &format!("tx encrypted AUDIO_MEDIA_MESSAGE_SETUP frame(s): count={tx_count} channel=0x{channel:02x}"))?;
+            }
+
+            if let Some(index) = audio_output_channels.iter().position(|audio| audio.opened && audio.setup_sent && !audio.start_sent && audio.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
+                let session_id = audio_output_channels[index].session_id;
+                if let Some((media_payload, configuration_index, max_unacked, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, session_id)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                {
+                    audio_output_channels[index].max_unacked = max_unacked.max(1);
+                    println!("AUDIO MEDIA_MESSAGE_CONFIG READY observed service_id={} stream={}; sending encrypted {summary}", audio_output_channels[index].service_id, audio_output_channels[index].stream_type);
+                    log_line(&mut dump, &format!("AUDIO MEDIA_MESSAGE_CONFIG READY observed service_id={} stream={}; sending encrypted {summary}", audio_output_channels[index].service_id, audio_output_channels[index].stream_type))?;
+                    log_line(&mut dump, &format!("tx AudioMediaStart plaintext bytes={} session_id={} configuration_index={}", media_payload.len(), session_id, configuration_index))?;
+                    let tx_count = write_encrypted_plaintext_fragmented(
+                        &mut stream,
+                        &mut tls,
+                        frame.channel,
+                        &media_payload,
+                        &mut dump,
+                        "AUDIO_MEDIA_MESSAGE_START",
+                    )?;
+                    tx_ssl_frames += tx_count;
+                    audio_output_channels[index].start_sent = true;
+                    println!("tx encrypted AUDIO_MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                    log_line(&mut dump, &format!("tx encrypted AUDIO_MEDIA_MESSAGE_START frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                    if config.audio_test_tone {
+                        if !video_pump_timeout_enabled {
+                            stream.set_read_timeout(Some(Duration::from_millis(20)))?;
+                            video_pump_timeout_enabled = true;
+                            let line = "AUDIO_PUMP enabled: receive timeout reduced to 20ms so generated PCM can be sent between HU frames";
+                            println!("{line}");
+                            log_line(&mut dump, line)?;
+                        }
+                        let sent = pump_audio_test_tone(
+                            &mut audio_output_channels,
+                            &mut stream,
+                            &mut tls,
+                            &config,
+                            &mut dump,
+                        )?;
+                        tx_ssl_frames += sent;
+                    }
+                }
+            }
+
+            if let Some(index) = audio_output_channels.iter().position(|audio| audio.start_sent && audio.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
+                if let Some((session_id, ack_value, summary)) = proto::parse_media_ack_payload(&plaintext) {
+                    if session_id == audio_output_channels[index].session_id {
+                        let released = ack_value.max(1);
+                        audio_output_channels[index].tx_unacked = audio_output_channels[index].tx_unacked.saturating_sub(released);
+                        if session_log_enabled(LOG_VERBOSE) {
+                            println!("AUDIO_MEDIA_MESSAGE_ACK observed service_id={} stream={} {}; tx_unacked={}", audio_output_channels[index].service_id, audio_output_channels[index].stream_type, summary, audio_output_channels[index].tx_unacked);
+                            log_line(&mut dump, &format!("AUDIO_MEDIA_MESSAGE_ACK observed service_id={} stream={} {}; tx_unacked={}", audio_output_channels[index].service_id, audio_output_channels[index].stream_type, summary, audio_output_channels[index].tx_unacked))?;
+                        }
+                    }
+                }
+                if let Some((pts_us, pcm)) = proto::parse_media_data_payload(&plaintext) {
+                    audio_output_channels[index].data_packets += 1;
+                    audio_output_channels[index].data_bytes += pcm.len() as u64;
+                    audio_output_channels[index].ack_counter = audio_output_channels[index].ack_counter.saturating_add(1);
+                    audio_data_packets += 1;
+                    audio_data_bytes += pcm.len() as u64;
+                    if let Some(file) = audio_output_channels[index].dump_file.as_mut() {
+                        file.write_all(pcm)?;
+                    }
+                    if !audio_output_channels[index].first_data_logged || session_log_enabled(LOG_NORMAL) {
+                        let cfg_text = audio_output_channels[index].config.as_ref()
+                            .map(|cfg| format!("{}Hz/{}bit/{}ch", cfg.sampling_rate, cfg.bits, cfg.channels))
+                            .unwrap_or_else(|| "unknown-format".to_string());
+                        let line = format!(
+                            "AUDIO_DATA service_id={} stream={} packet={} pts_us={} bytes={} total_bytes={} format={} dumped={}",
+                            audio_output_channels[index].service_id,
+                            audio_output_channels[index].stream_type,
+                            audio_output_channels[index].data_packets,
+                            pts_us,
+                            pcm.len(),
+                            audio_output_channels[index].data_bytes,
+                            cfg_text,
+                            audio_output_channels[index].dump_file.is_some()
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                        audio_output_channels[index].first_data_logged = true;
+                    }
+                    if config.audio_ack {
+                        let (ack_payload, summary) = proto::build_media_ack_payload(audio_output_channels[index].session_id, audio_output_channels[index].ack_counter)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let tx_count = write_encrypted_plaintext_fragmented(
+                            &mut stream,
+                            &mut tls,
+                            frame.channel,
+                            &ack_payload,
+                            &mut dump,
+                            "AUDIO_MEDIA_MESSAGE_ACK",
+                        )?;
+                        tx_ssl_frames += tx_count;
+                        if session_log_enabled(LOG_VERBOSE) {
+                            println!("tx encrypted AUDIO {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
+                            log_line(&mut dump, &format!("tx encrypted AUDIO {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                        }
+                    }
+                }
+            }
+
             if video_channel_opened
                 && !video_setup_sent
                 && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
@@ -2788,8 +3228,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     }
 
     let elapsed = started.elapsed();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", elapsed.as_millis()))?;
+    let audio_tx_packets: u64 = audio_output_channels.iter().map(|audio| audio.tx_packets).sum();
+    let audio_tx_bytes: u64 = audio_output_channels.iter().map(|audio| audio.tx_bytes).sum();
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), elapsed.as_millis()))?;
     Ok(())
 }
 

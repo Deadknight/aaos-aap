@@ -120,12 +120,12 @@ Commands:
   aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
       Full AAP session probe: service discovery, video channel open/setup/start, ping responses, optional H264 file send.
 
-  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start]
+  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start] [--display-auto|--display-profile waveshare-79] [--wm-rotation none|auto|0|90|180|270] [--dhu-priority|--wm-size-orientation logical|natural]
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
   aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms and enable startup timing logs.
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -1039,6 +1039,13 @@ struct AapTlsHandshakeProbeArgs {
     video_wm_density_mode: String,
     video_wm_settle_ms: u64,
     video_start_timing: bool,
+    video_first_frame_timeout_ms: u64,
+    video_first_frame_max_restarts: u32,
+    video_native_prewarm_ms: u64,
+    video_display_auto: bool,
+    video_wm_rotation: String,
+    video_wm_force_geometry: bool,
+    video_wm_size_orientation: String,
     video_width: i32,
     video_height: i32,
     video_bit_rate: i32,
@@ -1076,6 +1083,13 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
         video_start_timing: args.video_start_timing,
+        video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
+        video_first_frame_max_restarts: args.video_first_frame_max_restarts,
+        video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_display_auto: args.video_display_auto,
+        video_wm_rotation: args.video_wm_rotation,
+        video_wm_force_geometry: args.video_wm_force_geometry,
+        video_wm_size_orientation: args.video_wm_size_orientation,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1131,6 +1145,13 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
         video_start_timing: args.video_start_timing,
+        video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
+        video_first_frame_max_restarts: args.video_first_frame_max_restarts,
+        video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_display_auto: args.video_display_auto,
+        video_wm_rotation: args.video_wm_rotation,
+        video_wm_force_geometry: args.video_wm_force_geometry,
+        video_wm_size_orientation: args.video_wm_size_orientation,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1177,6 +1198,13 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         video_wm_density_mode: args.video_wm_density_mode,
         video_wm_settle_ms: args.video_wm_settle_ms,
         video_start_timing: args.video_start_timing,
+        video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
+        video_first_frame_max_restarts: args.video_first_frame_max_restarts,
+        video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_display_auto: args.video_display_auto,
+        video_wm_rotation: args.video_wm_rotation,
+        video_wm_force_geometry: args.video_wm_force_geometry,
+        video_wm_size_orientation: args.video_wm_size_orientation,
         video_width: args.video_width,
         video_height: args.video_height,
         video_bit_rate: args.video_bit_rate,
@@ -1192,6 +1220,20 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         log_level: args.log_level.clone(),
     })?;
     Ok(())
+}
+
+fn normalize_wm_rotation_arg(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let lower = value.to_ascii_lowercase();
+    let normalized = match lower.as_str() {
+        "none" | "off" | "disable" | "disabled" => "none",
+        "auto" | "detect" => "auto",
+        "0" | "natural" => "0",
+        "1" | "90" | "cw" | "clockwise" => "90",
+        "2" | "180" | "flip" => "180",
+        "3" | "270" | "ccw" | "counterclockwise" | "counter-clockwise" => "270",
+        other => return Err(format!("unsupported rotation value {other}; use none|auto|0|90|180|270").into()),
+    };
+    Ok(normalized.to_string())
 }
 
 fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandshakeProbeArgs, Box<dyn std::error::Error>> {
@@ -1214,6 +1256,13 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut video_wm_density_mode = String::from("density");
     let mut video_wm_settle_ms = 1200u64;
     let mut video_start_timing = false;
+    let mut video_first_frame_timeout_ms = 0u64;
+    let mut video_first_frame_max_restarts = 0u32;
+    let mut video_native_prewarm_ms = 0u64;
+    let mut video_display_auto = false;
+    let mut video_wm_rotation = String::from("none");
+    let mut video_wm_force_geometry = false;
+    let mut video_wm_size_orientation = String::from("logical");
     let mut video_width = 800i32;
     let mut video_height = 480i32;
     let mut video_bit_rate = 2_500_000i32;
@@ -1296,15 +1345,121 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--fast-start" | "--video-fast-start" => {
                 video_wm_settle_ms = 300;
                 video_start_timing = true;
+                if video_first_frame_timeout_ms == 0 {
+                    video_first_frame_timeout_ms = 8000;
+                }
+                if video_first_frame_max_restarts == 0 {
+                    video_first_frame_max_restarts = 1;
+                }
             }
             "--no-fast-start" | "--safe-start" => {
                 video_wm_settle_ms = 1200;
+                video_first_frame_timeout_ms = 0;
+                video_first_frame_max_restarts = 0;
+                video_native_prewarm_ms = 0;
             }
             "--video-start-timing" | "--startup-timing" | "--latency-log" | "--latency-logs" => {
                 video_start_timing = true;
             }
             "--no-video-start-timing" | "--no-startup-timing" | "--no-latency-log" => {
                 video_start_timing = false;
+            }
+            "--video-first-frame-timeout-ms" | "--first-frame-timeout-ms" => {
+                i += 1;
+                video_first_frame_timeout_ms = argv.get(i).ok_or("--video-first-frame-timeout-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--video-first-frame-restarts" | "--first-frame-restarts" | "--video-capture-restarts" => {
+                i += 1;
+                video_first_frame_max_restarts = argv.get(i).ok_or("--video-first-frame-restarts requires count")?.parse::<u32>()?;
+            }
+            "--no-video-first-frame-restart" | "--no-first-frame-restart" => {
+                video_first_frame_timeout_ms = 0;
+                video_first_frame_max_restarts = 0;
+            }
+            "--video-native-prewarm-ms" | "--native-prewarm-ms" | "--video-prewarm-ms" => {
+                i += 1;
+                video_native_prewarm_ms = argv.get(i).ok_or("--video-native-prewarm-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--video-native-prewarm" | "--native-prewarm" | "--prewarm-video" => {
+                if video_native_prewarm_ms == 0 {
+                    video_native_prewarm_ms = 700;
+                }
+            }
+            "--no-video-native-prewarm" | "--no-native-prewarm" | "--no-prewarm-video" => {
+                video_native_prewarm_ms = 0;
+            }
+            "--display-auto" | "--auto-display" | "--auto-geometry" | "--auto-wm" => {
+                video_display_auto = true;
+                video_apply_wm_config = true;
+            }
+            "--no-display-auto" | "--no-auto-display" | "--no-auto-geometry" | "--no-auto-wm" => {
+                video_display_auto = false;
+            }
+            "--dhu-priority" | "--force-dhu-geometry" | "--force-wm-stream" | "--wm-force-geometry" => {
+                video_apply_wm_config = true;
+                video_wm_force_geometry = true;
+            }
+            "--no-dhu-priority" | "--no-force-dhu-geometry" | "--no-wm-force-geometry" => {
+                video_wm_force_geometry = false;
+            }
+            "--wm-size-orientation" | "--display-size-orientation" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--wm-size-orientation requires logical|natural|auto")?.to_ascii_lowercase();
+                match value.as_str() {
+                    "logical" | "stream" | "display" => video_wm_size_orientation = String::from("logical"),
+                    "natural" | "pre-rotation" | "native" => video_wm_size_orientation = String::from("natural"),
+                    "auto" => video_wm_size_orientation = String::from("auto"),
+                    other => return Err(format!("--wm-size-orientation unsupported value: {other}; use logical, natural, or auto").into()),
+                }
+            }
+            "--wm-natural-size" | "--natural-wm-size" => {
+                video_wm_size_orientation = String::from("natural");
+                video_apply_wm_config = true;
+            }
+            "--wm-logical-size" | "--logical-wm-size" => {
+                video_wm_size_orientation = String::from("logical");
+                video_apply_wm_config = true;
+            }
+            "--wm-rotation" | "--display-rotation" | "--video-wm-rotation" => {
+                i += 1;
+                video_wm_rotation = normalize_wm_rotation_arg(argv.get(i).ok_or("--wm-rotation requires none|auto|0|90|180|270")?)?;
+                if video_wm_rotation != "none" {
+                    video_apply_wm_config = true;
+                    video_display_auto = true;
+                }
+            }
+            "--auto-rotation" | "--wm-auto-rotation" => {
+                video_wm_rotation = String::from("auto");
+                video_apply_wm_config = true;
+                video_display_auto = true;
+            }
+            "--no-wm-rotation" | "--no-display-rotation" => {
+                video_wm_rotation = String::from("none");
+            }
+            "--display-profile" | "--wm-profile" => {
+                i += 1;
+                let profile = argv.get(i).ok_or("--display-profile requires waveshare-79")?.to_ascii_lowercase();
+                match profile.as_str() {
+                    "waveshare-79" | "waveshare_79" | "waveshare7.9" | "waveshare-7.9" | "7.9" => {
+                        video_apply_wm_config = true;
+                        video_display_auto = true;
+                        video_wm_force_geometry = true;
+                        video_wm_size_orientation = String::from("natural");
+                        // The 7.9 HDMI bar panel commonly reports a portrait-oriented scanout;
+                        // in our AAOS/DHU setup the visible content was 90° clockwise, so lock
+                        // Android's logical display 270° to compensate. Override with
+                        // --wm-rotation 90 if your unit is mounted the other way.
+                        video_wm_rotation = String::from("270");
+                    }
+                    other => return Err(format!("--display-profile unsupported value: {other}; use waveshare-79").into()),
+                }
+            }
+            "--waveshare-79" | "--waveshare79" | "--waveshare-7.9" => {
+                video_apply_wm_config = true;
+                video_display_auto = true;
+                video_wm_force_geometry = true;
+                video_wm_size_orientation = String::from("natural");
+                video_wm_rotation = String::from("270");
             }
             "--video-size" | "--live-size" => {
                 i += 1;
@@ -1464,6 +1619,21 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if video_wm_settle_ms > 10_000 {
         return Err("--wm-settle-ms must be 0..10000".into());
     }
+    if video_first_frame_timeout_ms > 60_000 {
+        return Err("--video-first-frame-timeout-ms must be 0..60000".into());
+    }
+    if video_first_frame_max_restarts > 20 {
+        return Err("--video-first-frame-restarts must be 0..20".into());
+    }
+    if video_native_prewarm_ms > 10_000 {
+        return Err("--video-native-prewarm-ms must be 0..10000".into());
+    }
+    if !matches!(video_wm_rotation.as_str(), "none" | "auto" | "0" | "90" | "180" | "270") {
+        return Err("--wm-rotation must be none, auto, 0, 90, 180, or 270".into());
+    }
+    if !matches!(video_wm_size_orientation.as_str(), "logical" | "natural" | "auto") {
+        return Err("--wm-size-orientation must be logical, natural, or auto".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -1485,6 +1655,13 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         video_wm_density_mode,
         video_wm_settle_ms,
         video_start_timing,
+        video_first_frame_timeout_ms,
+        video_first_frame_max_restarts,
+        video_native_prewarm_ms,
+        video_display_auto,
+        video_wm_rotation,
+        video_wm_force_geometry,
+        video_wm_size_orientation,
         video_width,
         video_height,
         video_bit_rate,

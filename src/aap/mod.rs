@@ -968,6 +968,13 @@ pub struct TlsHandshakeProbeConfig {
     pub video_wm_density_mode: String,
     pub video_wm_settle_ms: u64,
     pub video_start_timing: bool,
+    pub video_first_frame_timeout_ms: u64,
+    pub video_first_frame_max_restarts: u32,
+    pub video_native_prewarm_ms: u64,
+    pub video_display_auto: bool,
+    pub video_wm_rotation: String,
+    pub video_wm_force_geometry: bool,
+    pub video_wm_size_orientation: String,
     pub video_width: i32,
     pub video_height: i32,
     pub video_bit_rate: i32,
@@ -1005,6 +1012,13 @@ impl Default for TlsHandshakeProbeConfig {
             video_wm_density_mode: "density".to_string(),
             video_wm_settle_ms: 1200,
             video_start_timing: false,
+            video_first_frame_timeout_ms: 0,
+            video_first_frame_max_restarts: 0,
+            video_native_prewarm_ms: 0,
+            video_display_auto: false,
+            video_wm_rotation: "none".to_string(),
+            video_wm_force_geometry: false,
+            video_wm_size_orientation: "logical".to_string(),
             video_width: 800,
             video_height: 480,
             video_bit_rate: 2_500_000,
@@ -1627,7 +1641,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         log_line(
             &mut dump,
             &format!(
-                "video_native=true size={}x{} bit_rate={} fps={} density={} frame_limit={} auto_config={} policy={} apply_wm={} wm_size_mode={} wm_density_mode={} wm_settle_ms={} video_start_timing={}",
+                "video_native=true size={}x{} bit_rate={} fps={} density={} frame_limit={} auto_config={} policy={} apply_wm={} wm_size_mode={} wm_density_mode={} wm_settle_ms={} video_start_timing={} first_frame_timeout_ms={} first_frame_max_restarts={} native_prewarm_ms={} display_auto={} wm_rotation={} wm_force_geometry={} wm_size_orientation={}",
                 config.video_width,
                 config.video_height,
                 config.video_bit_rate,
@@ -1640,7 +1654,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 config.video_wm_size_mode,
                 config.video_wm_density_mode,
                 config.video_wm_settle_ms,
-                config.video_start_timing
+                config.video_start_timing,
+                config.video_first_frame_timeout_ms,
+                config.video_first_frame_max_restarts,
+                config.video_native_prewarm_ms,
+                config.video_display_auto,
+                config.video_wm_rotation,
+                config.video_wm_force_geometry,
+                config.video_wm_size_orientation
             ),
         )?;
     } else {
@@ -1750,6 +1771,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             wm_density_mode: config.video_wm_density_mode.clone(),
             wm_settle_ms: config.video_wm_settle_ms,
             startup_timing: config.video_start_timing,
+            first_frame_timeout_ms: config.video_first_frame_timeout_ms,
+            first_frame_max_restarts: config.video_first_frame_max_restarts,
+            native_prewarm_ms: config.video_native_prewarm_ms,
+            display_auto: config.video_display_auto,
+            wm_rotation: config.video_wm_rotation.clone(),
+            wm_force_geometry: config.video_wm_force_geometry,
+            wm_size_orientation: config.video_wm_size_orientation.clone(),
         })))
     } else {
         match &config.video_file_path {
@@ -3000,6 +3028,13 @@ struct VideoLiveConfig {
     wm_density_mode: String,
     wm_settle_ms: u64,
     startup_timing: bool,
+    first_frame_timeout_ms: u64,
+    first_frame_max_restarts: u32,
+    native_prewarm_ms: u64,
+    display_auto: bool,
+    wm_rotation: String,
+    wm_force_geometry: bool,
+    wm_size_orientation: String,
 }
 
 #[derive(Debug)]
@@ -3030,6 +3065,96 @@ struct VideoLiveSender {
     first_stdout_at: Option<Instant>,
     first_video_data_sent_at: Option<Instant>,
     first_ack_at: Option<Instant>,
+    first_frame_restart_count: u32,
+    prewarm_done: bool,
+}
+
+
+#[derive(Debug, Clone, Copy)]
+struct WmSizeInfo {
+    physical_width: i32,
+    physical_height: i32,
+    override_width: Option<i32>,
+    override_height: Option<i32>,
+}
+
+fn run_text_command(program: &str, args: &[&str]) -> io::Result<String> {
+    let out = Command::new(program).args(args).output()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    if !out.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.trim().is_empty() {
+            if !text.ends_with('\n') && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(stderr.trim());
+        }
+    }
+    Ok(text)
+}
+
+fn parse_wm_size_line(line: &str) -> Option<(i32, i32)> {
+    let (_, rhs) = line.split_once(':')?;
+    let mut parts = rhs.trim().split('x');
+    let w = parts.next()?.trim().parse::<i32>().ok()?;
+    let h = parts.next()?.trim().parse::<i32>().ok()?;
+    Some((w, h))
+}
+
+fn probe_wm_size() -> Option<(WmSizeInfo, String)> {
+    let text = run_text_command("wm", &["size"]).ok()?;
+    let mut physical = None;
+    let mut override_size = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Physical size:") {
+            physical = parse_wm_size_line(trimmed);
+        } else if trimmed.starts_with("Override size:") {
+            override_size = parse_wm_size_line(trimmed);
+        }
+    }
+    let (physical_width, physical_height) = physical?;
+    let (override_width, override_height) = match override_size {
+        Some((w, h)) => (Some(w), Some(h)),
+        None => (None, None),
+    };
+    Some((
+        WmSizeInfo {
+            physical_width,
+            physical_height,
+            override_width,
+            override_height,
+        },
+        text.trim().replace('\n', " | "),
+    ))
+}
+
+fn rotation_degrees_to_quarter(value: &str, target_width: i32, target_height: i32, wm: Option<WmSizeInfo>) -> Option<&'static str> {
+    match value {
+        "0" => Some("0"),
+        "90" => Some("1"),
+        "180" => Some("2"),
+        "270" => Some("3"),
+        "auto" => {
+            let info = wm?;
+            let target_landscape = target_width >= target_height;
+            let physical_landscape = info.physical_width >= info.physical_height;
+            let target_aspect = target_width.max(1) as f32 / target_height.max(1) as f32;
+            let physical_aspect = info.physical_width.max(1) as f32 / info.physical_height.max(1) as f32;
+            let aspect_mismatch = (target_aspect - physical_aspect).abs() > 0.35;
+            if target_landscape && (!physical_landscape || aspect_mismatch) {
+                // We cannot know the physical mounting direction from software.
+                // 270 is the safer default for the Waveshare 7.9 case observed here
+                // where the visible panel image was clockwise-rotated.
+                Some("3")
+            } else if !target_landscape && physical_landscape {
+                Some("1")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 impl VideoLiveSender {
@@ -3054,6 +3179,8 @@ impl VideoLiveSender {
             first_stdout_at: None,
             first_video_data_sent_at: None,
             first_ack_at: None,
+            first_frame_restart_count: 0,
+            prewarm_done: false,
         }
     }
 
@@ -3088,6 +3215,183 @@ impl VideoLiveSender {
         None
     }
 
+    fn log_display_probe(&self, label: &str, dump: &mut Option<Box<dyn Write>>) -> io::Result<Option<WmSizeInfo>> {
+        if !self.config.display_auto && self.config.wm_rotation == "none" {
+            return Ok(None);
+        }
+        match probe_wm_size() {
+            Some((info, text)) => {
+                let line = format!(
+                    "DISPLAY_AUTO {} wm_size='{}' physical={}x{} override={}",
+                    label,
+                    text,
+                    info.physical_width,
+                    info.physical_height,
+                    match (info.override_width, info.override_height) {
+                        (Some(w), Some(h)) => format!("{}x{}", w, h),
+                        _ => "none".to_string(),
+                    }
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
+                Ok(Some(info))
+            }
+            None => {
+                let line = format!("DISPLAY_AUTO {} wm_size_probe_failed", label);
+                println!("{line}");
+                log_line(dump, &line)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn apply_rotation_if_needed(
+        &self,
+        target_width: i32,
+        target_height: i32,
+        initial_wm: Option<WmSizeInfo>,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if self.config.wm_rotation == "none" {
+            return Ok(());
+        }
+        let Some(quarter) = rotation_degrees_to_quarter(
+            self.config.wm_rotation.as_str(),
+            target_width,
+            target_height,
+            initial_wm,
+        ) else {
+            let line = format!(
+                "DISPLAY_AUTO rotation skipped rotation={} target={}x{} note=no change needed or wm size unavailable",
+                self.config.wm_rotation,
+                target_width,
+                target_height
+            );
+            println!("{line}");
+            return log_line(dump, &line);
+        };
+
+        let status_cmd = Command::new("cmd")
+            .arg("window")
+            .arg("set-user-rotation")
+            .arg("lock")
+            .arg(quarter)
+            .status();
+        let status_accel = Command::new("settings")
+            .arg("put")
+            .arg("system")
+            .arg("accelerometer_rotation")
+            .arg("0")
+            .status();
+        let status_user = Command::new("settings")
+            .arg("put")
+            .arg("system")
+            .arg("user_rotation")
+            .arg(quarter)
+            .status();
+        let line = format!(
+            "DISPLAY_AUTO rotation applied requested={} quarter={} target={}x{} cmd_window={:?} settings_accel={:?} settings_user={:?}",
+            self.config.wm_rotation,
+            quarter,
+            target_width,
+            target_height,
+            status_cmd,
+            status_accel,
+            status_user
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+        thread::sleep(Duration::from_millis(250));
+        Ok(())
+    }
+
+    fn log_wm_command(
+        &self,
+        label: &str,
+        program: &str,
+        args: &[&str],
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        let output = Command::new(program).args(args).output();
+        let line = match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().replace('\n', " | ");
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().replace('\n', " | ");
+                format!(
+                    "WM_CONFIG command {}: {} {} -> status={:?} stdout='{}' stderr='{}'",
+                    label,
+                    program,
+                    args.join(" "),
+                    out.status,
+                    stdout,
+                    stderr
+                )
+            }
+            Err(err) => format!(
+                "WM_CONFIG command {}: {} {} -> error={}",
+                label,
+                program,
+                args.join(" "),
+                err
+            ),
+        };
+        if self.config.display_auto || self.config.wm_force_geometry {
+            println!("{line}");
+        }
+        log_line(dump, &line)
+    }
+
+    fn apply_wm_size_and_density(
+        &self,
+        size_arg: &str,
+        density_arg: &str,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if self.config.wm_force_geometry {
+            // In DHU-priority mode we deliberately ignore the physical HDMI panel.
+            // Reset first, then write the requested override through both frontends
+            // because AAOS builds differ in which path actually updates WindowManager.
+            self.log_wm_command("force-reset", "wm", &["size", "reset"], dump)?;
+            self.log_wm_command("force-reset", "cmd", &["window", "size", "reset"], dump)?;
+            thread::sleep(Duration::from_millis(150));
+            for attempt in 1..=3 {
+                let attempt_label = format!("force-size-attempt-{}", attempt);
+                self.log_wm_command(&attempt_label, "wm", &["size", size_arg], dump)?;
+                self.log_wm_command(&attempt_label, "cmd", &["window", "size", size_arg], dump)?;
+                thread::sleep(Duration::from_millis(250));
+                match probe_wm_size() {
+                    Some((info, text)) => {
+                        let matched = info.override_width == Some(size_arg.split('x').next().unwrap_or("0").parse::<i32>().unwrap_or(0))
+                            && info.override_height == Some(size_arg.split('x').nth(1).unwrap_or("0").parse::<i32>().unwrap_or(0));
+                        let line = format!(
+                            "WM_CONFIG force-verify attempt={} requested={} wm_size='{}' matched={}",
+                            attempt,
+                            size_arg,
+                            text.trim().replace('\n', " | "),
+                            matched
+                        );
+                        println!("{line}");
+                        log_line(dump, &line)?;
+                        if matched {
+                            break;
+                        }
+                    }
+                    None => {
+                        let line = format!("WM_CONFIG force-verify attempt={} requested={} wm_size_probe_failed", attempt, size_arg);
+                        println!("{line}");
+                        log_line(dump, &line)?;
+                    }
+                }
+            }
+            self.log_wm_command("force-density", "wm", &["density", density_arg], dump)?;
+            self.log_wm_command("force-density", "cmd", &["window", "density", density_arg], dump)?;
+        } else {
+            self.log_wm_command("size", "wm", &["size", size_arg], dump)?;
+            self.log_wm_command("density", "wm", &["density", density_arg], dump)?;
+        }
+        Ok(())
+    }
+
     fn wm_density_for_selection(&self, selection: &proto::VideoConfigSelection) -> u32 {
         match self.config.wm_density_mode.as_str() {
             "real" | "real_density" => selection.real_density.max(1),
@@ -3100,6 +3404,25 @@ impl VideoLiveSender {
             "content" | "content_area" => (selection.content_width, selection.content_height, "content"),
             "safe" | "safe_area" => (selection.safe_width, selection.safe_height, "safe"),
             _ => (selection.width, selection.height, "stream"),
+        }
+    }
+
+    fn wm_command_size_for_target(
+        &self,
+        target_width: i32,
+        target_height: i32,
+        initial_wm: Option<WmSizeInfo>,
+    ) -> (i32, i32, &'static str) {
+        let right_angle_rotation = matches!(self.config.wm_rotation.as_str(), "90" | "270")
+            || (self.config.wm_rotation == "auto"
+                && initial_wm.map(|wm| wm.physical_width < wm.physical_height).unwrap_or(false)
+                && target_width >= target_height);
+        match self.config.wm_size_orientation.as_str() {
+            "natural" if right_angle_rotation => (target_height, target_width, "natural-rotated"),
+            "auto" if right_angle_rotation => (target_height, target_width, "auto-natural-rotated"),
+            "natural" => (target_width, target_height, "natural-no-rotation"),
+            "auto" => (target_width, target_height, "auto-logical"),
+            _ => (target_width, target_height, "logical"),
         }
     }
 
@@ -3130,13 +3453,20 @@ impl VideoLiveSender {
 
         let (wm_width, wm_height, size_mode) = self.wm_size_for_selection(selection);
         let wm_density = self.wm_density_for_selection(selection);
+        let initial_wm = self.log_display_probe("before", dump)?;
+        self.apply_rotation_if_needed(wm_width, wm_height, initial_wm, dump)?;
+        let (cmd_w, cmd_h, orientation_mode) = self.wm_command_size_for_target(wm_width, wm_height, initial_wm);
         let line = format!(
-            "WM_CONFIG applying: size={}x{} mode={} density={} density_mode={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
+            "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
             wm_width,
             wm_height,
+            cmd_w,
+            cmd_h,
             size_mode,
+            orientation_mode,
             wm_density,
             self.config.wm_density_mode,
+            self.config.wm_force_geometry,
             selection.width,
             selection.height,
             selection.margin_left,
@@ -3151,12 +3481,10 @@ impl VideoLiveSender {
         println!("{line}");
         log_line(dump, &line)?;
 
-        let size_arg = format!("{}x{}", wm_width, wm_height);
+        let size_arg = format!("{}x{}", cmd_w, cmd_h);
         let density_arg = wm_density.to_string();
-        let status_size = Command::new("wm").arg("size").arg(&size_arg).status();
-        log_line(dump, &format!("WM_CONFIG command: wm size {} -> {:?}", size_arg, status_size))?;
-        let status_density = Command::new("wm").arg("density").arg(&density_arg).status();
-        log_line(dump, &format!("WM_CONFIG command: wm density {} -> {:?}", density_arg, status_density))?;
+        self.apply_wm_size_and_density(&size_arg, &density_arg, dump)?;
+        let _ = self.log_display_probe("after", dump)?;
         self.wm_applied = true;
         Ok(())
     }
@@ -3169,22 +3497,27 @@ impl VideoLiveSender {
             return Ok(());
         }
 
-        let size_arg = format!("{}x{}", self.config.width, self.config.height);
         let density_arg = self.config.density.max(1).to_string();
+        let initial_wm = self.log_display_probe("before", dump)?;
+        self.apply_rotation_if_needed(self.config.width, self.config.height, initial_wm, dump)?;
+        let (cmd_w, cmd_h, orientation_mode) = self.wm_command_size_for_target(self.config.width, self.config.height, initial_wm);
+        let size_arg = format!("{}x{}", cmd_w, cmd_h);
         let line = format!(
-            "WM_CONFIG applying manual native config: size={} density={} size_mode={} density_mode={} note=no SDR auto-config applied",
+            "WM_CONFIG applying manual native config: logical_size={}x{} command_size={} size_orientation={} density={} size_mode={} density_mode={} force_geometry={} note=no SDR auto-config applied",
+            self.config.width,
+            self.config.height,
             size_arg,
+            orientation_mode,
             density_arg,
             self.config.wm_size_mode,
-            self.config.wm_density_mode
+            self.config.wm_density_mode,
+            self.config.wm_force_geometry
         );
         println!("{line}");
         log_line(dump, &line)?;
 
-        let status_size = Command::new("wm").arg("size").arg(&size_arg).status();
-        log_line(dump, &format!("WM_CONFIG command: wm size {} -> {:?}", size_arg, status_size))?;
-        let status_density = Command::new("wm").arg("density").arg(&density_arg).status();
-        log_line(dump, &format!("WM_CONFIG command: wm density {} -> {:?}", density_arg, status_density))?;
+        self.apply_wm_size_and_density(&size_arg, &density_arg, dump)?;
+        let _ = self.log_display_probe("after", dump)?;
         self.wm_applied = true;
         Ok(())
     }
@@ -3256,22 +3589,13 @@ impl VideoLiveSender {
         Ok(())
     }
 
-    fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
-        if self.child.is_some() || self.ended {
-            return Ok(());
-        }
-
-        self.apply_manual_wm_config_if_needed(dump)?;
-        self.settle_after_wm_if_needed(dump)?;
-
+    fn spawn_native_capture_child(&self, stdout: Stdio, seconds: &str) -> io::Result<Child> {
         let exe = env::current_exe()?;
         let size = format!("{}x{}", self.config.width, self.config.height);
         let bit_rate = self.config.bit_rate.to_string();
         let fps = self.config.fps.to_string();
-        // Child lifetime is controlled by this session. 0 means capture until killed.
-        let seconds = String::from("0");
 
-        let mut child = Command::new(exe)
+        Command::new(exe)
             .arg("native-capture")
             .arg("--size")
             .arg(&size)
@@ -3280,13 +3604,71 @@ impl VideoLiveSender {
             .arg("--fps")
             .arg(&fps)
             .arg("--seconds")
-            .arg(&seconds)
+            .arg(seconds)
             .arg("--out")
             .arg("-")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()
+    }
+
+    fn run_prewarm_if_needed(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        if self.prewarm_done || self.config.native_prewarm_ms == 0 {
+            return Ok(());
+        }
+
+        let prewarm_ms = self.config.native_prewarm_ms;
+        let start = Instant::now();
+        let mut child = self
+            .spawn_native_capture_child(Stdio::null(), "0")
+            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture prewarm child: {err}")))?;
+
+        let line = format!(
+            "VIDEO_PREWARM started ms={} size={}x{} bit_rate={} fps={} note=warming native capture/encoder before real AA video stream",
+            prewarm_ms,
+            self.config.width,
+            self.config.height,
+            self.config.bit_rate,
+            self.config.fps
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        thread::sleep(Duration::from_millis(prewarm_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+        self.prewarm_done = true;
+
+        let elapsed_ms = start.elapsed().as_millis();
+        let line = format!(
+            "VIDEO_START_LATENCY prewarm_done_ms={} elapsed_ms={} requested_ms={}",
+            self.ms_since_media_start(Instant::now()),
+            elapsed_ms,
+            prewarm_ms
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+        Ok(())
+    }
+
+    fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        if self.child.is_some() || self.ended {
+            return Ok(());
+        }
+
+        self.apply_manual_wm_config_if_needed(dump)?;
+        self.settle_after_wm_if_needed(dump)?;
+        self.run_prewarm_if_needed(dump)?;
+
+        let size = format!("{}x{}", self.config.width, self.config.height);
+        let bit_rate = self.config.bit_rate.to_string();
+        let fps = self.config.fps.to_string();
+        // Child lifetime is controlled by this session. 0 means capture until killed.
+        let seconds = String::from("0");
+
+        let mut child = self
+            .spawn_native_capture_child(Stdio::piped(), &seconds)
             .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture child: {err}")))?;
 
         let child_spawned_at = Instant::now();
@@ -3363,6 +3745,54 @@ impl VideoLiveSender {
 
         self.child = Some(child);
         self.rx = Some(rx);
+        Ok(())
+    }
+
+
+    fn first_frame_timeout_elapsed(&self) -> bool {
+        if self.frames_sent > 0 || self.config.first_frame_timeout_ms == 0 {
+            return false;
+        }
+        let Some(spawned_at) = self.child_spawned_at else {
+            return false;
+        };
+        spawned_at.elapsed() >= Duration::from_millis(self.config.first_frame_timeout_ms)
+            && self.first_frame_restart_count < self.config.first_frame_max_restarts
+    }
+
+    fn reset_child_for_first_frame_retry(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        self.first_frame_restart_count += 1;
+        let elapsed_ms = self
+            .child_spawned_at
+            .map(|at| at.elapsed().as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "VIDEO_START_LATENCY first_frame_timeout_restart attempt={}/{} elapsed_ms={} timeout_ms={} note=no slice NAL received yet; restarting native capture child",
+            self.first_frame_restart_count,
+            self.config.first_frame_max_restarts,
+            elapsed_ms,
+            self.config.first_frame_timeout_ms
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        self.rx = None;
+        self.codec_config.clear();
+        self.codec_config_sent = false;
+        self.no_codec_config_warned = false;
+        self.next_pts_index = 0;
+        self.unacked = 0;
+        self.highest_ack = 0;
+        self.ended = false;
+        self.child_spawned_at = None;
+        self.first_stdout_at = None;
+        self.first_video_data_sent_at = None;
+        self.first_ack_at = None;
         Ok(())
     }
 
@@ -3519,6 +3949,10 @@ impl VideoLiveSender {
                     break;
                 }
             }
+        }
+
+        if self.first_frame_timeout_elapsed() {
+            self.reset_child_for_first_frame_retry(dump)?;
         }
 
         if self.config.frame_limit > 0 && self.frames_sent >= self.config.frame_limit {

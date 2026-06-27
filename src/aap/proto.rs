@@ -1344,6 +1344,17 @@ pub fn build_channel_open_request_control_payload(
     Ok(payload)
 }
 
+/// Build a MESSAGE_CHANNEL_CLOSE_NOTIFICATION control payload.
+/// Returned bytes include the 2-byte AAP control message id followed by the
+/// empty ChannelCloseNotification protobuf body.
+pub fn build_channel_close_notification_control_payload() -> Result<Vec<u8>, protobuf::Error> {
+    let msg = ChannelCloseNotification::new();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(ControlMessageType::MESSAGE_CHANNEL_CLOSE_NOTIFICATION.value() as u16).to_be_bytes());
+    payload.extend_from_slice(&msg.write_to_bytes()?);
+    Ok(payload)
+}
+
 /// Build a phone-like ServiceDiscoveryRequest control payload.
 /// Returned bytes include the 2-byte AAP control message id followed by the
 /// protobuf body.

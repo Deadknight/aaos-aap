@@ -95,3 +95,12 @@ App-process InputManager injection stays in tree, but it is no longer default. D
 ## v39e note
 
 App-process InputManager injection is no longer treated as the default path. It is kept as explicit `--input-inject-mode app`, starts lazily on the first injected event, and throttles MOVE events with `--input-app-move-min-ms` (default 16ms). This keeps the working drag path available while reducing the chance of AAOS focus/input stack corruption.
+
+## v41j notes
+- First-frame render kick modes were expanded after observing that a real touch immediately wakes the first encoder frame.
+- New safer modes:
+  - `--video-first-frame-kick-cancel`: sends touchscreen DOWN then CANCEL at the kick point, avoiding ACTION_UP/click.
+  - `--video-first-frame-kick-center`: taps stream center automatically using configured video width/height.
+  - `--video-first-frame-kick-wakeup`: sends KEYCODE_WAKEUP (224), lowest UI risk but may not dirty the projection surface on all builds.
+  - `--video-first-frame-kick-mode keyevent --video-first-frame-kick-keycode WAKEUP|SEARCH|HOME|...` accepts simple names.
+- Recommended order for testing: `touch-cancel`, then `wakeup`, then edge tap, then center tap only if safe.

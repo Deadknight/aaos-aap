@@ -125,7 +125,7 @@ Commands:
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
   aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --video-first-frame-kick to synthesize a tiny AAOS input event after native capture starts if the first frame waits for a screen change; modes include edge tap, center tap, center-cancel, center-move-cancel, wm-nudge, touch-cancel, wakeup key, and explicit keyevent. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
 
   aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
@@ -1045,6 +1045,12 @@ struct AapTlsHandshakeProbeArgs {
     video_first_frame_timeout_ms: u64,
     video_first_frame_max_restarts: u32,
     video_native_prewarm_ms: u64,
+    video_first_frame_kick: bool,
+    video_first_frame_kick_delay_ms: u64,
+    video_first_frame_kick_mode: String,
+    video_first_frame_kick_x: i32,
+    video_first_frame_kick_y: i32,
+    video_first_frame_kick_keycode: u32,
     video_display_auto: bool,
     video_wm_rotation: String,
     video_wm_force_geometry: bool,
@@ -1108,6 +1114,12 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
         video_first_frame_max_restarts: args.video_first_frame_max_restarts,
         video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_first_frame_kick: args.video_first_frame_kick,
+        video_first_frame_kick_delay_ms: args.video_first_frame_kick_delay_ms,
+        video_first_frame_kick_mode: args.video_first_frame_kick_mode.clone(),
+        video_first_frame_kick_x: args.video_first_frame_kick_x,
+        video_first_frame_kick_y: args.video_first_frame_kick_y,
+        video_first_frame_kick_keycode: args.video_first_frame_kick_keycode,
         video_display_auto: args.video_display_auto,
         video_wm_rotation: args.video_wm_rotation,
         video_wm_force_geometry: args.video_wm_force_geometry,
@@ -1189,6 +1201,12 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
         video_first_frame_max_restarts: args.video_first_frame_max_restarts,
         video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_first_frame_kick: args.video_first_frame_kick,
+        video_first_frame_kick_delay_ms: args.video_first_frame_kick_delay_ms,
+        video_first_frame_kick_mode: args.video_first_frame_kick_mode.clone(),
+        video_first_frame_kick_x: args.video_first_frame_kick_x,
+        video_first_frame_kick_y: args.video_first_frame_kick_y,
+        video_first_frame_kick_keycode: args.video_first_frame_kick_keycode,
         video_display_auto: args.video_display_auto,
         video_wm_rotation: args.video_wm_rotation,
         video_wm_force_geometry: args.video_wm_force_geometry,
@@ -1261,6 +1279,12 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         video_first_frame_timeout_ms: args.video_first_frame_timeout_ms,
         video_first_frame_max_restarts: args.video_first_frame_max_restarts,
         video_native_prewarm_ms: args.video_native_prewarm_ms,
+        video_first_frame_kick: args.video_first_frame_kick,
+        video_first_frame_kick_delay_ms: args.video_first_frame_kick_delay_ms,
+        video_first_frame_kick_mode: args.video_first_frame_kick_mode.clone(),
+        video_first_frame_kick_x: args.video_first_frame_kick_x,
+        video_first_frame_kick_y: args.video_first_frame_kick_y,
+        video_first_frame_kick_keycode: args.video_first_frame_kick_keycode,
         video_display_auto: args.video_display_auto,
         video_wm_rotation: args.video_wm_rotation,
         video_wm_force_geometry: args.video_wm_force_geometry,
@@ -1315,6 +1339,31 @@ fn normalize_wm_rotation_arg(value: &str) -> Result<String, Box<dyn std::error::
     Ok(normalized.to_string())
 }
 
+
+fn parse_android_keycode(value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let v = value.trim();
+    if let Ok(n) = v.parse::<u32>() {
+        return Ok(n);
+    }
+    let name = v.trim_start_matches("KEYCODE_").to_ascii_uppercase();
+    let code = match name.as_str() {
+        "HOME" => 3,
+        "BACK" => 4,
+        "CALL" => 5,
+        "ENDCALL" => 6,
+        "SEARCH" => 84,
+        "WAKEUP" | "WAKE_UP" => 224,
+        "SOFT_SLEEP" => 276,
+        "MEDIA_PLAY_PAUSE" => 85,
+        "MEDIA_NEXT" => 87,
+        "MEDIA_PREVIOUS" => 88,
+        "MEDIA_PLAY" => 126,
+        "MEDIA_PAUSE" => 127,
+        other => return Err(format!("unsupported keycode name: {other}; use a number or HOME/BACK/SEARCH/WAKEUP/MEDIA_PLAY_PAUSE").into()),
+    };
+    Ok(code)
+}
+
 fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandshakeProbeArgs, Box<dyn std::error::Error>> {
     let mut addr = String::from("0.0.0.0:5277");
     let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log"));
@@ -1338,6 +1387,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut video_first_frame_timeout_ms = 0u64;
     let mut video_first_frame_max_restarts = 0u32;
     let mut video_native_prewarm_ms = 0u64;
+    let mut video_first_frame_kick = false;
+    let mut video_first_frame_kick_delay_ms = 120u64;
+    let mut video_first_frame_kick_mode = String::from("tap");
+    let mut video_first_frame_kick_x = 1i32;
+    let mut video_first_frame_kick_y = 1i32;
+    let mut video_first_frame_kick_keycode = 3u32;
     let mut video_display_auto = false;
     let mut video_wm_rotation = String::from("none");
     let mut video_wm_force_geometry = false;
@@ -1485,6 +1540,77 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--no-video-native-prewarm" | "--no-native-prewarm" | "--no-prewarm-video" => {
                 video_native_prewarm_ms = 0;
+            }
+            "--video-first-frame-kick" | "--first-frame-kick" | "--video-kick-input" | "--kick-video-input" | "--video-kick-tap" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("tap");
+            }
+            "--video-first-frame-kick-center" | "--first-frame-kick-center" | "--video-kick-center" | "--video-kick-tap-center" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("center");
+            }
+            "--video-first-frame-kick-center-cancel" | "--first-frame-kick-center-cancel" | "--video-kick-center-cancel" | "--video-kick-no-click-center" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("center-cancel");
+            }
+            "--video-first-frame-kick-center-move-cancel" | "--first-frame-kick-center-move-cancel" | "--video-kick-center-move-cancel" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("center-move-cancel");
+            }
+            "--video-first-frame-kick-wm-nudge" | "--first-frame-kick-wm-nudge" | "--video-kick-wm-nudge" | "--video-dirty-wm" | "--video-first-frame-dirty" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("wm-nudge");
+            }
+            "--video-first-frame-kick-cancel" | "--first-frame-kick-cancel" | "--video-kick-cancel" | "--video-kick-no-click" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("touch-cancel");
+            }
+            "--video-first-frame-kick-wakeup" | "--first-frame-kick-wakeup" | "--video-kick-wakeup" => {
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("wakeup");
+            }
+            "--no-video-first-frame-kick" | "--no-first-frame-kick" | "--no-video-kick-input" | "--no-kick-video-input" => {
+                video_first_frame_kick = false;
+            }
+            "--video-first-frame-kick-mode" | "--first-frame-kick-mode" | "--video-kick-mode" => {
+                i += 1;
+                video_first_frame_kick = true;
+                let value = argv.get(i).ok_or("--video-first-frame-kick-mode requires tap|center|center-cancel|center-move-cancel|wm-nudge|touch-cancel|wakeup|home|keyevent")?.to_ascii_lowercase();
+                video_first_frame_kick_mode = match value.as_str() {
+                    "tap" | "touch" | "edge" | "corner" => String::from("tap"),
+                    "center" | "centre" | "tap-center" | "center-tap" | "middle" => String::from("center"),
+                    "center-cancel" | "centre-cancel" | "cancel-center" | "middle-cancel" | "center-no-click" | "no-click-center" => String::from("center-cancel"),
+                    "center-move-cancel" | "centre-move-cancel" | "move-cancel-center" | "center-drag-cancel" => String::from("center-move-cancel"),
+                    "wm-nudge" | "dirty" | "wm-dirty" | "window-nudge" | "relayout" | "wm" => String::from("wm-nudge"),
+                    "cancel" | "touch-cancel" | "down-cancel" | "motionevent-cancel" | "no-click" => String::from("touch-cancel"),
+                    "wakeup" | "wake" | "key-wakeup" => String::from("wakeup"),
+                    "home" => String::from("home"),
+                    "key" | "keyevent" => String::from("keyevent"),
+                    other => return Err(format!("--video-first-frame-kick-mode unsupported value: {other}; use tap, center, center-cancel, center-move-cancel, wm-nudge, touch-cancel, wakeup, home, or keyevent").into()),
+                };
+            }
+            "--video-first-frame-kick-delay-ms" | "--first-frame-kick-delay-ms" | "--video-kick-delay-ms" => {
+                i += 1;
+                video_first_frame_kick = true;
+                video_first_frame_kick_delay_ms = argv.get(i).ok_or("--video-first-frame-kick-delay-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--video-first-frame-kick-tap" | "--first-frame-kick-tap" | "--video-kick-tap-at" => {
+                i += 1;
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("tap");
+                let value = argv.get(i).ok_or("--video-first-frame-kick-tap requires X,Y or XxY")?;
+                let normalized = value.replace('x', ",").replace('X', ",").replace(':', ",");
+                let mut parts = normalized.split(',');
+                let x = parts.next().ok_or("--video-first-frame-kick-tap requires X,Y")?.trim().parse::<i32>()?;
+                let y = parts.next().ok_or("--video-first-frame-kick-tap requires X,Y")?.trim().parse::<i32>()?;
+                video_first_frame_kick_x = x;
+                video_first_frame_kick_y = y;
+            }
+            "--video-first-frame-kick-keycode" | "--first-frame-kick-keycode" | "--video-kick-keycode" => {
+                i += 1;
+                video_first_frame_kick = true;
+                video_first_frame_kick_mode = String::from("keyevent");
+                video_first_frame_kick_keycode = parse_android_keycode(argv.get(i).ok_or("--video-first-frame-kick-keycode requires Android keycode/name")?)?;
             }
             "--display-auto" | "--auto-display" | "--auto-geometry" | "--auto-wm" => {
                 video_display_auto = true;
@@ -1844,6 +1970,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if video_native_prewarm_ms > 10_000 {
         return Err("--video-native-prewarm-ms must be 0..10000".into());
     }
+    if video_first_frame_kick_delay_ms > 10_000 {
+        return Err("--video-first-frame-kick-delay-ms must be 0..10000".into());
+    }
+    if video_first_frame_kick_keycode > 1000 {
+        return Err("--video-first-frame-kick-keycode must be 0..1000".into());
+    }
     if !matches!(video_wm_rotation.as_str(), "none" | "auto" | "0" | "90" | "180" | "270") {
         return Err("--wm-rotation must be none, auto, 0, 90, 180, or 270".into());
     }
@@ -1895,6 +2027,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         video_first_frame_timeout_ms,
         video_first_frame_max_restarts,
         video_native_prewarm_ms,
+        video_first_frame_kick,
+        video_first_frame_kick_delay_ms,
+        video_first_frame_kick_mode,
+        video_first_frame_kick_x,
+        video_first_frame_kick_y,
+        video_first_frame_kick_keycode,
         video_display_auto,
         video_wm_rotation,
         video_wm_force_geometry,

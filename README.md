@@ -167,3 +167,16 @@ Useful knobs:
 --input-inject-mode app
 --input-app-move-min-ms 16   # default; use 0 to disable MOVE throttling, 32 to be safer
 ```
+
+### v41j first-frame render kick modes
+
+If native video waits for a screen change before producing the first slice NAL, use one of:
+
+```bash
+--video-first-frame-kick-cancel
+--video-first-frame-kick-center
+--video-first-frame-kick-wakeup
+--video-first-frame-kick-mode keyevent --video-first-frame-kick-keycode WAKEUP
+```
+
+`touch-cancel` is intended to dirty the input/display pipeline without an ACTION_UP click. `center` is a real tap at stream center and can activate UI. `HOME` is supported but not recommended unless explicitly testing navigation behavior.

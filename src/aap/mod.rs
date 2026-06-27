@@ -66,7 +66,9 @@ fn session_log_format(dump: &mut Option<Box<dyn Write>>, min_level: u8, line: St
 }
 
 
+const SIGHUP: c_int = 1;
 const SIGINT: c_int = 2;
+const SIGQUIT: c_int = 3;
 const SIGTERM: c_int = 15;
 
 unsafe extern "C" {
@@ -80,13 +82,19 @@ extern "C" fn handle_session_signal(_signum: c_int) {
 fn install_session_signal_handlers() {
     SESSION_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     unsafe {
+        let _ = signal(SIGHUP, handle_session_signal);
         let _ = signal(SIGINT, handle_session_signal);
+        let _ = signal(SIGQUIT, handle_session_signal);
         let _ = signal(SIGTERM, handle_session_signal);
     }
 }
 
 fn session_shutdown_requested() -> bool {
     SESSION_SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+fn request_session_shutdown() {
+    SESSION_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 pub mod proto;
@@ -971,6 +979,12 @@ pub struct TlsHandshakeProbeConfig {
     pub video_first_frame_timeout_ms: u64,
     pub video_first_frame_max_restarts: u32,
     pub video_native_prewarm_ms: u64,
+    pub video_first_frame_kick: bool,
+    pub video_first_frame_kick_delay_ms: u64,
+    pub video_first_frame_kick_mode: String,
+    pub video_first_frame_kick_x: i32,
+    pub video_first_frame_kick_y: i32,
+    pub video_first_frame_kick_keycode: u32,
     pub video_display_auto: bool,
     pub video_wm_rotation: String,
     pub video_wm_force_geometry: bool,
@@ -1034,6 +1048,12 @@ impl Default for TlsHandshakeProbeConfig {
             video_first_frame_timeout_ms: 0,
             video_first_frame_max_restarts: 0,
             video_native_prewarm_ms: 0,
+            video_first_frame_kick: false,
+            video_first_frame_kick_delay_ms: 120,
+            video_first_frame_kick_mode: "tap".to_string(),
+            video_first_frame_kick_x: 1,
+            video_first_frame_kick_y: 1,
+            video_first_frame_kick_keycode: 3,
             video_display_auto: false,
             video_wm_rotation: "none".to_string(),
             video_wm_force_geometry: false,
@@ -2134,6 +2154,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             first_frame_timeout_ms: config.video_first_frame_timeout_ms,
             first_frame_max_restarts: config.video_first_frame_max_restarts,
             native_prewarm_ms: config.video_native_prewarm_ms,
+            first_frame_kick: config.video_first_frame_kick,
+            first_frame_kick_delay_ms: config.video_first_frame_kick_delay_ms,
+            first_frame_kick_mode: config.video_first_frame_kick_mode.clone(),
+            first_frame_kick_x: config.video_first_frame_kick_x,
+            first_frame_kick_y: config.video_first_frame_kick_y,
+            first_frame_kick_keycode: config.video_first_frame_kick_keycode,
             display_auto: config.video_display_auto,
             wm_rotation: config.video_wm_rotation.clone(),
             wm_force_geometry: config.video_wm_force_geometry,
@@ -3616,6 +3642,124 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         }
     }
 
+    let cleanup_reason = if session_shutdown_requested() { "signal" } else { "session-end" };
+    println!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={}",
+        cleanup_reason,
+        video_channel_opened,
+        input_channel_opened,
+        audio_output_channels.iter().filter(|audio| audio.opened).count(),
+        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false)
+    );
+    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={}",
+        cleanup_reason,
+        video_channel_opened,
+        input_channel_opened,
+        audio_output_channels.iter().filter(|audio| audio.opened).count(),
+        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false)
+    ));
+
+    if let Some(mic) = mic_source_channel.as_mut() {
+        if mic.opened && mic.mic_request_sent {
+            if let Ok((payload, summary)) = proto::build_microphone_request_payload(false, mic.max_unacked.max(1), false, false) {
+                match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, mic.channel, &payload, &mut dump, "MICROPHONE_REQUEST_CLOSE") {
+                    Ok(count) => {
+                        tx_ssl_frames += count;
+                        println!("SESSION_CLEANUP tx encrypted {} frame(s): count={} channel=0x{:02x}", summary, count, mic.channel);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted {} frame(s): count={} channel=0x{:02x}", summary, count, mic.channel));
+                    }
+                    Err(err) => {
+                        println!("SESSION_CLEANUP microphone close request failed channel=0x{:02x}: {}", mic.channel, err);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP microphone close request failed channel=0x{:02x}: {}", mic.channel, err));
+                    }
+                }
+            }
+        }
+        if mic.opened {
+            if let Ok(payload) = proto::build_channel_close_notification_control_payload() {
+                match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, mic.channel, &payload, &mut dump, "MIC_CHANNEL_CLOSE_NOTIFICATION") {
+                    Ok(count) => {
+                        tx_ssl_frames += count;
+                        println!("SESSION_CLEANUP tx encrypted MIC_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, mic.channel);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted MIC_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, mic.channel));
+                    }
+                    Err(err) => {
+                        println!("SESSION_CLEANUP mic channel close failed channel=0x{:02x}: {}", mic.channel, err);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP mic channel close failed channel=0x{:02x}: {}", mic.channel, err));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(payload) = proto::build_channel_close_notification_control_payload() {
+        for audio in audio_output_channels.iter().filter(|audio| audio.opened) {
+            match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, audio.channel, &payload, &mut dump, "AUDIO_CHANNEL_CLOSE_NOTIFICATION") {
+                Ok(count) => {
+                    tx_ssl_frames += count;
+                    println!("SESSION_CLEANUP tx encrypted AUDIO_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x} service_id={} stream={}", count, audio.channel, audio.service_id, audio.stream_type);
+                    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted AUDIO_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x} service_id={} stream={}", count, audio.channel, audio.service_id, audio.stream_type));
+                }
+                Err(err) => {
+                    println!("SESSION_CLEANUP audio channel close failed channel=0x{:02x}: {}", audio.channel, err);
+                    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP audio channel close failed channel=0x{:02x}: {}", audio.channel, err));
+                }
+            }
+        }
+        if input_channel_opened {
+            if let Some(channel) = selected_input_service_id.map(|id| id as u8) {
+                match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, channel, &payload, &mut dump, "INPUT_CHANNEL_CLOSE_NOTIFICATION") {
+                    Ok(count) => {
+                        tx_ssl_frames += count;
+                        println!("SESSION_CLEANUP tx encrypted INPUT_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, channel);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted INPUT_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, channel));
+                    }
+                    Err(err) => {
+                        println!("SESSION_CLEANUP input channel close failed channel=0x{:02x}: {}", channel, err);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP input channel close failed channel=0x{:02x}: {}", channel, err));
+                    }
+                }
+            }
+        }
+        if video_channel_opened {
+            if let Some(channel) = selected_video_service_id.map(|id| id as u8) {
+                match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, channel, &payload, &mut dump, "VIDEO_CHANNEL_CLOSE_NOTIFICATION") {
+                    Ok(count) => {
+                        tx_ssl_frames += count;
+                        println!("SESSION_CLEANUP tx encrypted VIDEO_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, channel);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted VIDEO_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x}", count, channel));
+                    }
+                    Err(err) => {
+                        println!("SESSION_CLEANUP video channel close failed channel=0x{:02x}: {}", channel, err);
+                        let _ = log_line(&mut dump, &format!("SESSION_CLEANUP video channel close failed channel=0x{:02x}: {}", channel, err));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(injector) = input_touch_injector.as_mut() {
+        let _ = injector.force_up();
+        println!("SESSION_CLEANUP uinput force_up sent");
+        let _ = log_line(&mut dump, "SESSION_CLEANUP uinput force_up sent");
+    }
+    if let Some(injector) = input_app_injector.as_mut() {
+        injector.stop();
+        println!("SESSION_CLEANUP app_process input injector stopped");
+        let _ = log_line(&mut dump, "SESSION_CLEANUP app_process input injector stopped");
+    }
+    if let Some(capture) = audio_capture.as_mut() {
+        capture.stop();
+        println!("SESSION_CLEANUP app_process audio capture stopped");
+        let _ = log_line(&mut dump, "SESSION_CLEANUP app_process audio capture stopped");
+    }
+    if let Some(sender) = video_sender.as_mut() {
+        sender.stop();
+        println!("SESSION_CLEANUP video sender stopped");
+        let _ = log_line(&mut dump, "SESSION_CLEANUP video sender stopped");
+    }
+    println!("SESSION_CLEANUP end reason={}", cleanup_reason);
+    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP end reason={}", cleanup_reason));
+
     let elapsed = started.elapsed();
     let audio_tx_packets: u64 = audio_output_channels.iter().map(|audio| audio.tx_packets).sum();
     let audio_tx_bytes: u64 = audio_output_channels.iter().map(|audio| audio.tx_bytes).sum();
@@ -3646,6 +3790,13 @@ impl VideoSender {
                 None
             }
             Self::Live(sender) => sender.on_ack(ack_value),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::File(_) => {}
+            Self::Live(sender) => sender.stop_child(),
         }
     }
 
@@ -3862,6 +4013,12 @@ struct VideoLiveConfig {
     first_frame_timeout_ms: u64,
     first_frame_max_restarts: u32,
     native_prewarm_ms: u64,
+    first_frame_kick: bool,
+    first_frame_kick_delay_ms: u64,
+    first_frame_kick_mode: String,
+    first_frame_kick_x: i32,
+    first_frame_kick_y: i32,
+    first_frame_kick_keycode: u32,
     display_auto: bool,
     wm_rotation: String,
     wm_force_geometry: bool,
@@ -4483,6 +4640,120 @@ impl VideoLiveSender {
         Ok(())
     }
 
+    fn first_frame_kick_point(&self) -> (i32, i32) {
+        let x = self.config.first_frame_kick_x;
+        let y = self.config.first_frame_kick_y;
+        if matches!(
+            self.config.first_frame_kick_mode.as_str(),
+            "center" | "center-cancel" | "center-move-cancel"
+        ) {
+            return ((self.config.width / 2).max(1), (self.config.height / 2).max(1));
+        }
+        (x.max(0), y.max(0))
+    }
+
+    fn first_frame_kick_command(&self) -> (String, Vec<String>) {
+        let (x, y) = self.first_frame_kick_point();
+        match self.config.first_frame_kick_mode.as_str() {
+            "home" => ("/system/bin/input".to_string(), vec!["keyevent".to_string(), "3".to_string()]),
+            "wakeup" => ("/system/bin/input".to_string(), vec!["keyevent".to_string(), "224".to_string()]),
+            "keyevent" => ("/system/bin/input".to_string(), vec!["keyevent".to_string(), self.config.first_frame_kick_keycode.to_string()]),
+            "wm-nudge" => {
+                // Re-apply the current WM override size/density. This usually dirties
+                // WindowManager/SurfaceFlinger without clicking anything in the UI.
+                // It is safer than HOME/center tap, but may be a bit slower than a real touch.
+                let script = r#"
+size="$(/system/bin/wm size 2>/dev/null | /system/bin/sed -n 's/.*Override size: //p' | /system/bin/head -n 1)"
+[ -z "$size" ] && size="$(/system/bin/wm size 2>/dev/null | /system/bin/sed -n 's/.*Physical size: //p' | /system/bin/head -n 1)"
+if [ -n "$size" ]; then
+  /system/bin/wm size "$size" >/dev/null 2>&1 || true
+  /system/bin/cmd window size "$size" >/dev/null 2>&1 || true
+fi
+density="$(/system/bin/wm density 2>/dev/null | /system/bin/sed -n 's/.*Override density: //p' | /system/bin/head -n 1)"
+[ -z "$density" ] && density="$(/system/bin/wm density 2>/dev/null | /system/bin/sed -n 's/.*Physical density: //p' | /system/bin/head -n 1)"
+if [ -n "$density" ]; then
+  /system/bin/wm density "$density" >/dev/null 2>&1 || true
+  /system/bin/cmd window density "$density" >/dev/null 2>&1 || true
+fi
+"#
+                .trim()
+                .to_string();
+                ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
+            }
+            "touch-cancel" | "center-cancel" => {
+                // ACTION_DOWN followed by ACTION_CANCEL dirties the input/display pipeline
+                // without delivering an ACTION_UP click. `center-cancel` uses the fastest
+                // physical-touch location without activating a UI item.
+                let script = format!(
+                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.03; /system/bin/input touchscreen motionevent CANCEL {x} {y}"
+                );
+                ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
+            }
+            "center-move-cancel" => {
+                // Slight MOVE before CANCEL can dirty maps/compositor more reliably than
+                // plain CANCEL, still without ACTION_UP/click. Movement is one pixel.
+                let x2 = x.saturating_add(1);
+                let y2 = y.saturating_add(1);
+                let script = format!(
+                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.02; /system/bin/input touchscreen motionevent MOVE {x2} {y2}; /system/bin/sleep 0.02; /system/bin/input touchscreen motionevent CANCEL {x2} {y2}"
+                );
+                ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
+            }
+            "center" => (
+                "/system/bin/input".to_string(),
+                vec!["tap".to_string(), x.to_string(), y.to_string()],
+            ),
+            _ => (
+                "/system/bin/input".to_string(),
+                vec!["tap".to_string(), x.to_string(), y.to_string()],
+            ),
+        }
+    }
+
+    fn maybe_kick_first_frame(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
+        if !self.config.first_frame_kick {
+            return Ok(());
+        }
+        let delay_ms = self.config.first_frame_kick_delay_ms;
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let (program, args) = self.first_frame_kick_command();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let started = Instant::now();
+        let result = run_text_command(&program, &arg_refs);
+        let elapsed_ms = started.elapsed().as_millis();
+        match result {
+            Ok(text) => {
+                let line = format!(
+                    "VIDEO_FIRST_FRAME_KICK sent mode={} delay_ms={} cmd='{} {}' elapsed_ms={} output='{}'",
+                    self.config.first_frame_kick_mode,
+                    delay_ms,
+                    program,
+                    args.join(" "),
+                    elapsed_ms,
+                    text.trim().replace('\n', " | ")
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
+            }
+            Err(err) => {
+                let line = format!(
+                    "VIDEO_FIRST_FRAME_KICK failed mode={} delay_ms={} cmd='{} {}' elapsed_ms={} error={}",
+                    self.config.first_frame_kick_mode,
+                    delay_ms,
+                    program,
+                    args.join(" "),
+                    elapsed_ms,
+                    err
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
         if self.child.is_some() || self.ended {
             return Ok(());
@@ -4576,6 +4847,7 @@ impl VideoLiveSender {
 
         self.child = Some(child);
         self.rx = Some(rx);
+        self.maybe_kick_first_frame(dump)?;
         Ok(())
     }
 

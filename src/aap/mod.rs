@@ -1018,6 +1018,7 @@ pub struct TlsHandshakeProbeConfig {
     pub mic_send_request_open: bool,
     pub mic_dump_path: Option<PathBuf>,
     pub mic_ack: bool,
+    pub mic_ack_mode: String,
     pub mic_max_unacked: u32,
     pub quiet_ping_logs: bool,
     pub log_level: String,
@@ -1087,6 +1088,7 @@ impl Default for TlsHandshakeProbeConfig {
             mic_send_request_open: false,
             mic_dump_path: None,
             mic_ack: true,
+            mic_ack_mode: "delta".to_string(),
             mic_max_unacked: 8,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
@@ -1132,9 +1134,19 @@ struct MicSourceChannelState {
     session_id: i32,
     max_unacked: u32,
     ack_counter: u32,
+    ack_window_counter: u32,
     data_packets: u64,
     data_bytes: u64,
     first_data_logged: bool,
+    first_ack_logged: bool,
+    level_last_log: Instant,
+    level_first_logged: bool,
+    level_window_packets: u64,
+    level_window_bytes: u64,
+    level_window_samples: u64,
+    level_window_sum_squares: u128,
+    level_window_peak: i32,
+    level_window_nonzero_samples: u64,
     dump_file: Option<File>,
 }
 
@@ -1247,6 +1259,32 @@ fn apply_pcm_s16le_gain(pcm: &mut [u8], gain: f32) {
         let b = scaled.to_le_bytes();
         chunk[0] = b[0];
         chunk[1] = b[1];
+    }
+}
+
+fn pcm_s16le_metrics(pcm: &[u8]) -> (u64, u128, i32, u64) {
+    let mut samples = 0u64;
+    let mut sum_squares = 0u128;
+    let mut peak = 0i32;
+    let mut nonzero_samples = 0u64;
+    for chunk in pcm.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        let abs = sample.unsigned_abs() as i32;
+        if abs > 0 {
+            nonzero_samples = nonzero_samples.saturating_add(1);
+        }
+        peak = peak.max(abs);
+        sum_squares = sum_squares.saturating_add((sample as i128 * sample as i128) as u128);
+        samples = samples.saturating_add(1);
+    }
+    (samples, sum_squares, peak, nonzero_samples)
+}
+
+fn rms_from_sum_squares(sum_squares: u128, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        ((sum_squares as f64) / samples as f64).sqrt()
     }
 }
 
@@ -2048,7 +2086,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     )?;
     log_line(&mut dump, &format!("audio_test_tone={} tone_hz={} chunk_ms={} volume={}", config.audio_test_tone, config.audio_tone_hz, config.audio_tone_chunk_ms, config.audio_tone_volume))?;
     log_line(&mut dump, &format!("audio_capture={} source={} chunk_ms={} gain={} as={} package={}", config.audio_capture, config.audio_capture_source, config.audio_capture_chunk_ms, config.audio_capture_gain, config.audio_capture_as, config.audio_capture_package))?;
-    log_line(&mut dump, &format!("mic_open={} mic_send_request_open={} mic_dump_path={} mic_ack={} mic_max_unacked={}", config.mic_open, config.mic_send_request_open, config.mic_dump_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string()), config.mic_ack, config.mic_max_unacked))?;
+    log_line(&mut dump, &format!("mic_open={} mic_send_request_open={} mic_dump_path={} mic_ack={} mic_ack_mode={} mic_max_unacked={}", config.mic_open, config.mic_send_request_open, config.mic_dump_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string()), config.mic_ack, config.mic_ack_mode, config.mic_max_unacked))?;
     log_line(&mut dump, &format!("quiet_ping_logs={} log_level={}", config.quiet_ping_logs, normalize_session_log_level(&config.log_level)))?;
     log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
     log_line(&mut dump, "")?;
@@ -2837,12 +2875,25 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                 start_sent: false,
                                 mic_request_sent: false,
                                 mic_response_seen: false,
-                                session_id: 200 + source.service_id,
+                                // For HU->device media_source the HU owns the media session id.
+                                // DHU currently replies with session_id=0; using our synthetic
+                                // local id in MEDIA_ACK makes DHU stop after max_unacked packets.
+                                session_id: 0,
                                 max_unacked: 1,
                                 ack_counter: 0,
+                                ack_window_counter: 0,
                                 data_packets: 0,
                                 data_bytes: 0,
                                 first_data_logged: false,
+                                first_ack_logged: false,
+                                level_last_log: Instant::now(),
+                                level_first_logged: false,
+                                level_window_packets: 0,
+                                level_window_bytes: 0,
+                                level_window_samples: 0,
+                                level_window_sum_squares: 0,
+                                level_window_peak: 0,
+                                level_window_nonzero_samples: 0,
                                 dump_file,
                             });
                         } else {
@@ -3225,11 +3276,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             if let Some(mic) = mic_source_channel.as_mut().filter(|mic| mic.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
                 if let Some((status, session_id, summary)) = proto::parse_microphone_response_payload(&plaintext) {
                     mic.mic_response_seen = true;
-                    if session_id > 0 {
-                        mic.session_id = session_id;
-                    }
-                    println!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={}", mic.service_id, summary, mic.session_id);
-                    log_line(&mut dump, &format!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={}", mic.service_id, summary, mic.session_id))?;
+                    let previous_session_id = mic.session_id;
+                    // Keep the HU-provided session id even when it is 0.  DHU reports
+                    // session_id=0 for microphone source, and MEDIA_ACK must use that
+                    // same value; otherwise capture stalls exactly at max_unacked.
+                    mic.session_id = session_id;
+                    println!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={} previous_session_id={}", mic.service_id, summary, mic.session_id, previous_session_id);
+                    log_line(&mut dump, &format!("MICROPHONE_RESPONSE observed service_id={} {}; active_session_id={} previous_session_id={}", mic.service_id, summary, mic.session_id, previous_session_id))?;
                     if status != 0 {
                         let line = format!("MICROPHONE_RESPONSE non-zero status={} service_id={}", status, mic.service_id);
                         println!("{line}");
@@ -3271,6 +3324,40 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if let Some(file) = mic.dump_file.as_mut() {
                         file.write_all(pcm)?;
                     }
+                    let (samples, sum_squares, peak, nonzero_samples) = pcm_s16le_metrics(pcm);
+                    mic.level_window_packets = mic.level_window_packets.saturating_add(1);
+                    mic.level_window_bytes = mic.level_window_bytes.saturating_add(pcm.len() as u64);
+                    mic.level_window_samples = mic.level_window_samples.saturating_add(samples);
+                    mic.level_window_sum_squares = mic.level_window_sum_squares.saturating_add(sum_squares);
+                    mic.level_window_peak = mic.level_window_peak.max(peak);
+                    mic.level_window_nonzero_samples = mic.level_window_nonzero_samples.saturating_add(nonzero_samples);
+                    let now_for_level = Instant::now();
+                    if !mic.level_first_logged || now_for_level.duration_since(mic.level_last_log) >= Duration::from_secs(1) {
+                        let rms = rms_from_sum_squares(mic.level_window_sum_squares, mic.level_window_samples);
+                        let silence = mic.level_window_peak <= 4 || mic.level_window_nonzero_samples == 0;
+                        let line = format!(
+                            "MIC_LEVEL service_id={} packets_window={} total_packets={} bytes_window={} total_bytes={} rms={:.1} peak={} nonzero_samples={} silence={}",
+                            mic.service_id,
+                            mic.level_window_packets,
+                            mic.data_packets,
+                            mic.level_window_bytes,
+                            mic.data_bytes,
+                            rms,
+                            mic.level_window_peak,
+                            mic.level_window_nonzero_samples,
+                            silence
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                        mic.level_first_logged = true;
+                        mic.level_last_log = now_for_level;
+                        mic.level_window_packets = 0;
+                        mic.level_window_bytes = 0;
+                        mic.level_window_samples = 0;
+                        mic.level_window_sum_squares = 0;
+                        mic.level_window_peak = 0;
+                        mic.level_window_nonzero_samples = 0;
+                    }
                     if !mic.first_data_logged || session_log_enabled(LOG_NORMAL) {
                         let cfg_text = mic.config.as_ref()
                             .map(|cfg| format!("{}Hz/{}bit/{}ch", cfg.sampling_rate, cfg.bits, cfg.channels))
@@ -3289,21 +3376,49 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                         log_line(&mut dump, &line)?;
                         mic.first_data_logged = true;
                     }
-                    if config.mic_ack {
-                        let (ack_payload, summary) = proto::build_media_ack_payload(mic.session_id, mic.ack_counter)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        let tx_count = write_encrypted_plaintext_fragmented(
-                            &mut stream,
-                            &mut tls,
-                            frame.channel,
-                            &ack_payload,
-                            &mut dump,
-                            "MIC_MEDIA_MESSAGE_ACK",
-                        )?;
-                        tx_ssl_frames += tx_count;
-                        if session_log_enabled(LOG_VERBOSE) {
-                            println!("tx encrypted MIC {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel);
-                            log_line(&mut dump, &format!("tx encrypted MIC {summary} frame(s): count={tx_count} channel=0x{:02x}", frame.channel))?;
+                    if config.mic_ack && config.mic_ack_mode != "off" {
+                        mic.ack_window_counter = mic.ack_window_counter.saturating_add(1);
+                        let window_size = (mic.max_unacked / 2).clamp(1, 32);
+                        let (should_ack, ack_value) = match config.mic_ack_mode.as_str() {
+                            // OpenAuto/aasdk treats ACK.value as a packet count that releases
+                            // flow-control credit, not as a cumulative sequence number.  For
+                            // per-packet ACK, always release exactly one packet.
+                            "delta" => (true, 1),
+                            "window" => {
+                                if mic.ack_window_counter >= window_size {
+                                    (true, mic.ack_window_counter)
+                                } else {
+                                    (false, 0)
+                                }
+                            }
+                            // Diagnostic old behavior: cumulative value.  DHU tends to stop/close
+                            // early with this mode, but keep it for comparison.
+                            "cumulative" => (true, mic.ack_counter),
+                            // Diagnostic only: unlikely, but useful if a HU expects byte-count credit.
+                            "bytes" => (true, pcm.len().min(u32::MAX as usize) as u32),
+                            _ => (false, 0),
+                        };
+
+                        if should_ack {
+                            let (ack_payload, summary) = proto::build_media_ack_payload(mic.session_id, ack_value)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            let tx_count = write_encrypted_plaintext_fragmented(
+                                &mut stream,
+                                &mut tls,
+                                frame.channel,
+                                &ack_payload,
+                                &mut dump,
+                                "MIC_MEDIA_MESSAGE_ACK",
+                            )?;
+                            tx_ssl_frames += tx_count;
+                            if config.mic_ack_mode == "window" {
+                                mic.ack_window_counter = 0;
+                            }
+                            if !mic.first_ack_logged || mic.ack_counter % 50 == 0 || session_log_enabled(LOG_VERBOSE) {
+                                println!("tx encrypted MIC {summary} mode={} frame(s): count={tx_count} channel=0x{:02x} total_packets={} total_bytes={}", config.mic_ack_mode, frame.channel, mic.data_packets, mic.data_bytes);
+                                log_line(&mut dump, &format!("tx encrypted MIC {summary} mode={} frame(s): count={tx_count} channel=0x{:02x} total_packets={} total_bytes={}", config.mic_ack_mode, frame.channel, mic.data_packets, mic.data_bytes))?;
+                                mic.first_ack_logged = true;
+                            }
                         }
                     }
                 }
@@ -4681,21 +4796,21 @@ fi
                 ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
             }
             "touch-cancel" | "center-cancel" => {
-                // ACTION_DOWN followed by ACTION_CANCEL dirties the input/display pipeline
-                // without delivering an ACTION_UP click. `center-cancel` uses the fastest
-                // physical-touch location without activating a UI item.
+                // Android 11's `input motionevent` only supports DOWN/UP/MOVE, not CANCEL.
+                // The fast path that worked on DHU is effectively a short DOWN-only dirty
+                // pulse: it wakes SurfaceFlinger/encoder without delivering ACTION_UP/click.
+                // Keep the user-facing name center-cancel because it means "no click".
                 let script = format!(
-                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.03; /system/bin/input touchscreen motionevent CANCEL {x} {y}"
+                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.03"
                 );
                 ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
             }
             "center-move-cancel" => {
-                // Slight MOVE before CANCEL can dirty maps/compositor more reliably than
-                // plain CANCEL, still without ACTION_UP/click. Movement is one pixel.
+                // MOVE without ACTION_UP avoids click, while still dirtying maps/compositor.
                 let x2 = x.saturating_add(1);
                 let y2 = y.saturating_add(1);
                 let script = format!(
-                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.02; /system/bin/input touchscreen motionevent MOVE {x2} {y2}; /system/bin/sleep 0.02; /system/bin/input touchscreen motionevent CANCEL {x2} {y2}"
+                    "/system/bin/input touchscreen motionevent DOWN {x} {y}; /system/bin/sleep 0.02; /system/bin/input touchscreen motionevent MOVE {x2} {y2}; /system/bin/sleep 0.02"
                 );
                 ("/system/bin/sh".to_string(), vec!["-c".to_string(), script])
             }

@@ -1084,6 +1084,7 @@ struct AapTlsHandshakeProbeArgs {
     mic_send_request_open: bool,
     mic_dump_path: Option<PathBuf>,
     mic_ack: bool,
+    mic_ack_mode: String,
     mic_max_unacked: u32,
     quiet_ping_logs: bool,
     log_level: String,
@@ -1153,6 +1154,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         mic_send_request_open: args.mic_send_request_open,
         mic_dump_path: args.mic_dump_path.clone(),
         mic_ack: args.mic_ack,
+        mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
@@ -1240,6 +1242,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         mic_send_request_open: args.mic_send_request_open,
         mic_dump_path: args.mic_dump_path.clone(),
         mic_ack: args.mic_ack,
+        mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
@@ -1318,6 +1321,7 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         mic_send_request_open: args.mic_send_request_open,
         mic_dump_path: args.mic_dump_path.clone(),
         mic_ack: args.mic_ack,
+        mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
@@ -1426,6 +1430,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut mic_send_request_open = false;
     let mut mic_dump_path: Option<PathBuf> = None;
     let mut mic_ack = true;
+    let mut mic_ack_mode = String::from("delta");
     let mut mic_max_unacked: u32 = 8;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
@@ -1852,9 +1857,43 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--no-mic-ack" | "--no-microphone-ack" => {
                 mic_ack = false;
+                mic_ack_mode = String::from("off");
             }
             "--mic-ack" | "--microphone-ack" => {
                 mic_ack = true;
+                if mic_ack_mode == "off" {
+                    mic_ack_mode = String::from("delta");
+                }
+            }
+            "--mic-ack-mode" | "--microphone-ack-mode" => {
+                i += 1;
+                mic_open = true;
+                let value = argv.get(i).ok_or("--mic-ack-mode requires delta|one|window|cumulative|bytes|off")?.to_ascii_lowercase();
+                mic_ack_mode = match value.as_str() {
+                    "delta" | "one" | "per-packet" | "each" => String::from("delta"),
+                    "window" | "chunk" | "count" => String::from("window"),
+                    "cumulative" | "total" | "counter" => String::from("cumulative"),
+                    "bytes" | "byte" => String::from("bytes"),
+                    "off" | "none" | "no" => String::from("off"),
+                    other => return Err(format!("--mic-ack-mode unsupported value: {other}; use delta|window|cumulative|bytes|off").into()),
+                };
+                mic_ack = mic_ack_mode != "off";
+            }
+            "--mic-ack-delta" | "--mic-ack-one" | "--mic-ack-each" => {
+                mic_ack = true;
+                mic_ack_mode = String::from("delta");
+            }
+            "--mic-ack-window" => {
+                mic_ack = true;
+                mic_ack_mode = String::from("window");
+            }
+            "--mic-ack-cumulative" | "--mic-ack-counter" => {
+                mic_ack = true;
+                mic_ack_mode = String::from("cumulative");
+            }
+            "--mic-ack-bytes" => {
+                mic_ack = true;
+                mic_ack_mode = String::from("bytes");
             }
             "--mic-max-unacked" | "--microphone-max-unacked" => {
                 i += 1;
@@ -2003,6 +2042,13 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if mic_max_unacked == 0 || mic_max_unacked > 4096 {
         return Err("--mic-max-unacked must be 1..4096".into());
     }
+    match mic_ack_mode.as_str() {
+        "delta" | "window" | "cumulative" | "bytes" | "off" => {}
+        other => return Err(format!("--mic-ack-mode unsupported value: {other}; use delta|window|cumulative|bytes|off").into()),
+    }
+    if mic_ack_mode == "off" {
+        mic_ack = false;
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         addr,
@@ -2066,6 +2112,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         mic_send_request_open,
         mic_dump_path,
         mic_ack,
+        mic_ack_mode,
         mic_max_unacked,
         quiet_ping_logs,
         log_level,

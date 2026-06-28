@@ -1489,10 +1489,58 @@ pub struct DecodedLocationFix {
 }
 
 #[derive(Debug, Clone)]
+pub struct DecodedVehicleProperty {
+    pub signal: &'static str,
+    pub property_name: &'static str,
+    pub property_id: i32,
+    pub area_id: i32,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SensorBatchSummary {
     pub summary: String,
     pub json_line: String,
     pub location: Option<DecodedLocationFix>,
+    pub vhal_props: Vec<DecodedVehicleProperty>,
+}
+
+fn decoded_vhal_prop(
+    signal: &'static str,
+    property_name: &'static str,
+    property_id: i32,
+    area_id: i32,
+    value: impl ToString,
+) -> DecodedVehicleProperty {
+    DecodedVehicleProperty {
+        signal,
+        property_name,
+        property_id,
+        area_id,
+        value: value.to_string(),
+    }
+}
+
+fn android_vehicle_gear_from_aap(gear: Gear) -> Option<i32> {
+    // android.car.VehicleGear constants are bit flags:
+    // UNKNOWN=0, NEUTRAL=1, REVERSE=2, PARK=4, DRIVE=8, FIRST=16, SECOND=32, ...
+    match gear {
+        Gear::GEAR_NEUTRAL => Some(0x0001),
+        Gear::GEAR_REVERSE => Some(0x0002),
+        Gear::GEAR_PARK => Some(0x0004),
+        Gear::GEAR_DRIVE => Some(0x0008),
+        Gear::GEAR_1 => Some(0x0010),
+        Gear::GEAR_2 => Some(0x0020),
+        Gear::GEAR_3 => Some(0x0040),
+        Gear::GEAR_4 => Some(0x0080),
+        Gear::GEAR_5 => Some(0x0100),
+        Gear::GEAR_6 => Some(0x0200),
+        Gear::GEAR_7 => Some(0x0400),
+        Gear::GEAR_8 => Some(0x0800),
+        Gear::GEAR_9 => Some(0x1000),
+        // Android currently exposes up to GEAR_NINTH in android.car.VehicleGear.
+        Gear::GEAR_10 => None,
+    }
 }
 
 pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> {
@@ -1537,11 +1585,13 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
             summary: "SENSOR_MESSAGE_BATCH empty".to_string(),
             json_line: "{\"type\":\"sensor_batch\",\"empty\":true}".to_string(),
             location: None,
+            vhal_props: Vec::new(),
         });
     }
 
     let mut details = Vec::new();
     let mut json_fields = Vec::new();
+    let mut vhal_props = Vec::new();
     json_fields.push("\"type\":\"sensor_batch\"".to_string());
 
     let location = msg.location_data.last().map(|loc| {
@@ -1564,40 +1614,62 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         fix
     });
     if let Some(speed) = msg.speed_data.last() {
-        details.push(format!("speed_mps={:.2}", speed.speed_e3() as f64 / 1000.0));
-        json_fields.push(format!("\"speed_mps\":{:.3}", speed.speed_e3() as f64 / 1000.0));
+        let speed_mps = speed.speed_e3() as f64 / 1000.0;
+        details.push(format!("speed_mps={:.2}", speed_mps));
+        json_fields.push(format!("\"speed_mps\":{:.3}", speed_mps));
+        vhal_props.push(decoded_vhal_prop("PERF_VEHICLE_SPEED", "PERF_VEHICLE_SPEED", 291504647, 0, format!("{:.3}", speed_mps)));
+        vhal_props.push(decoded_vhal_prop("PERF_VEHICLE_SPEED_DISPLAY", "PERF_VEHICLE_SPEED_DISPLAY", 291504648, 0, format!("{:.3}", speed_mps)));
     }
     if let Some(compass) = msg.compass_data.last() {
         details.push(format!("compass_bearing={:.1}", compass.bearing_e6() as f64 / 1_000_000.0));
         json_fields.push(format!("\"compass_bearing_deg\":{:.3}", compass.bearing_e6() as f64 / 1_000_000.0));
     }
     if let Some(rpm) = msg.rpm_data.last() {
-        details.push(format!("rpm={:.0}", rpm.rpm_e3() as f64 / 1000.0));
-        json_fields.push(format!("\"rpm\":{:.3}", rpm.rpm_e3() as f64 / 1000.0));
+        let rpm_value = rpm.rpm_e3() as f64 / 1000.0;
+        details.push(format!("rpm={:.0}", rpm_value));
+        json_fields.push(format!("\"rpm\":{:.3}", rpm_value));
+        vhal_props.push(decoded_vhal_prop("ENGINE_RPM", "ENGINE_RPM", 291504901, 0, format!("{:.3}", rpm_value)));
     }
     if let Some(odo) = msg.odometer_data.last() {
-        details.push(format!("odometer_km={:.1}", odo.kms_e1() as f64 / 10.0));
-        json_fields.push(format!("\"odometer_km\":{:.1}", odo.kms_e1() as f64 / 10.0));
+        let odometer_km = odo.kms_e1() as f64 / 10.0;
+        details.push(format!("odometer_km={:.1}", odometer_km));
+        json_fields.push(format!("\"odometer_km\":{:.1}", odometer_km));
+        vhal_props.push(decoded_vhal_prop("PERF_ODOMETER", "PERF_ODOMETER", 291504644, 0, format!("{:.1}", odometer_km)));
     }
     if let Some(fuel) = msg.fuel_data.last() {
         details.push(format!("fuel={} range={} low={}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
         json_fields.push(format!("\"fuel\":{{\"level\":{},\"range\":{},\"low\":{}}}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
+        // AAP does not state units in this proto. Keep the raw values aligned with
+        // the RemotiveLabs Android mapping, but do not synthesize anything if the HU omits them.
+        vhal_props.push(decoded_vhal_prop("FUEL_LEVEL", "FUEL_LEVEL", 291504903, 0, fuel.fuel_level()));
+        vhal_props.push(decoded_vhal_prop("RANGE_REMAINING", "RANGE_REMAINING", 291504904, 0, fuel.range()));
     }
     if let Some(pb) = msg.parking_brake_data.last() {
-        details.push(format!("parking_brake={}", pb.parking_brake()));
-        json_fields.push(format!("\"parking_brake\":{}", pb.parking_brake()));
+        let value = pb.parking_brake();
+        details.push(format!("parking_brake={}", value));
+        json_fields.push(format!("\"parking_brake\":{}", value));
+        vhal_props.push(decoded_vhal_prop("PARKING_BRAKE_ON", "PARKING_BRAKE_ON", 287310850, 0, value));
     }
     if let Some(gear) = msg.gear_data.last() {
-        details.push(format!("gear={:?}", gear.gear()));
-        json_fields.push(format!("\"gear\":\"{:?}\"", gear.gear()));
+        let aap_gear = gear.gear();
+        details.push(format!("gear={:?}", aap_gear));
+        json_fields.push(format!("\"gear\":\"{:?}\"", aap_gear));
+        if let Some(android_gear) = android_vehicle_gear_from_aap(aap_gear) {
+            vhal_props.push(decoded_vhal_prop("CURRENT_GEAR", "CURRENT_GEAR", 289408001, 0, android_gear));
+            vhal_props.push(decoded_vhal_prop("GEAR_SELECTION", "GEAR_SELECTION", 289408000, 0, android_gear));
+        }
     }
     if let Some(night) = msg.night_mode_data.last() {
-        details.push(format!("night_mode={}", night.night_mode()));
-        json_fields.push(format!("\"night_mode\":{}", night.night_mode()));
+        let value = night.night_mode();
+        details.push(format!("night_mode={}", value));
+        json_fields.push(format!("\"night_mode\":{}", value));
+        vhal_props.push(decoded_vhal_prop("NIGHT_MODE", "NIGHT_MODE", 287310855, 0, value));
     }
     if let Some(env) = msg.environment_data.last() {
-        details.push(format!("env_temp_c={:.1}", env.temperature_e3() as f64 / 1000.0));
-        json_fields.push(format!("\"environment\":{{\"temperature_c\":{:.3},\"pressure\":{},\"rain\":{}}}", env.temperature_e3() as f64 / 1000.0, env.pressure_e3(), env.rain()));
+        let temperature_c = env.temperature_e3() as f64 / 1000.0;
+        details.push(format!("env_temp_c={:.1}", temperature_c));
+        json_fields.push(format!("\"environment\":{{\"temperature_c\":{:.3},\"pressure\":{},\"rain\":{}}}", temperature_c, env.pressure_e3(), env.rain()));
+        vhal_props.push(decoded_vhal_prop("ENV_OUTSIDE_TEMPERATURE", "ENV_OUTSIDE_TEMPERATURE", 291505923, 0, format!("{:.3}", temperature_c)));
     }
     if let Some(status) = msg.driving_status_data.last() {
         details.push(format!("driving_status=0x{:x}", status.status()));
@@ -1625,6 +1697,7 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         ),
         json_line: format!("{{{}}}", json_fields.join(",")),
         location,
+        vhal_props,
     })
 }
 

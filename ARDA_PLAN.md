@@ -139,3 +139,62 @@ Next after test:
 - Verify whether the HU/DHU accepts the batch of sensor requests and which sensors actually stream.
 - If `cmd location` fails, replace shell command forwarding with a small app_process/system LocationManager helper.
 - After GPS/location works, map remaining vehicle sensor data either into AAOS car property/VHAL where available, or keep it on the arda JSON/socket bridge for companion consumers.
+
+## v43 sensor OS/VHAL bridge
+
+Goal: turn the AAP SensorSource batches into AAOS-visible vehicle state, not just JSONL/log output.
+
+Implemented in this patch:
+- Keep `--sensor-forward-os` as the convenient umbrella flag, but make it forward both:
+  - location fixes through `cmd location providers set-test-provider-location`
+  - supported vehicle values through `cmd car_service inject-vhal-event`
+- Add split flags for safer tests:
+  - `--sensor-forward-location` / `--no-sensor-forward-location`
+  - `--sensor-forward-vhal` / `--no-sensor-forward-vhal`
+  - `--sensor-vhal-min-ms N` to rate-limit repeated VHAL injections per signal
+- Add first AAP SensorBatch to VehiclePropertyIds mapping:
+  - speed -> `PERF_VEHICLE_SPEED` and `PERF_VEHICLE_SPEED_DISPLAY`
+  - rpm -> `ENGINE_RPM`
+  - odometer -> `PERF_ODOMETER`
+  - fuel/range -> `FUEL_LEVEL` and `RANGE_REMAINING` using raw AAP values for now
+  - parking brake -> `PARKING_BRAKE_ON`
+  - gear -> `CURRENT_GEAR` and `GEAR_SELECTION`, translating AAP gear enum into `android.car.VehicleGear` bit values
+  - night mode -> `NIGHT_MODE`
+  - environment temperature -> `ENV_OUTSIDE_TEMPERATURE`
+- Add fallback injection command for older AAOS images:
+  - primary: `cmd car_service inject-vhal-event <propertyId> <areaId> <value>`
+  - fallback: `dumpsys activity service com.android.car inject-vhal-event <propertyId> <value>`
+
+Notes from the first test log:
+- HU advertises only location, speed, odometer, night mode, and driving status on this DHU/emulator path.
+- Requests for all advertised sensor types are accepted.
+- The captured stream only showed `NIGHT_MODE` and `DRIVING_STATUS` batches so far; `NIGHT_MODE` can now be injected immediately, while `DRIVING_STATUS` stays log/JSONL-only because it does not map cleanly to a current public `VehiclePropertyIds` entry.
+
+Next after test:
+- Run on the real car/HU and check whether speed/odometer/location batches actually arrive.
+- If `cmd car_service inject-vhal-event` is permission-blocked on the AAOS image, replace shell VHAL injection with a small privileged/app_process car-service helper.
+- For fuel/range, verify actual AAP units from real packets before treating them as Android milliliters/meters in consumers.
+
+## v44 AAOS AOA USB gadget bootstrap
+
+Goal: make the working Raspberry Pi 4 AAOS USB-C Android Open Accessory gadget setup reproducible and bootable.
+
+Verified manually:
+- `dwc2` overlay enables `/sys/class/udc/fe980000.usb`.
+- `configfs` gadget path works on AAOS.
+- `functions/accessory.usb0` can be created.
+- `/proc/misc` exposes `usb_accessory` with minor `122` on the tested image.
+- `/dev/usb_accessory` exists after setup.
+- macOS detects the device as Accessory and AAOS USB debugging still works in this setup.
+
+Implemented in this patch:
+- Add Rust `aaos-aoa-gadget` / alias `usb-gadget-aoa` as a manual diagnostic command, but make normal AAP daemon commands auto-run the gadget preflight first.
+- The daemon now checks whether `/config/usb_gadget/arda` is already bound and complete; if missing, it creates `0x18D1:0x2D00`, `accessory.usb0`, the required absolute configfs symlink, binds to `fe980000.usb`, and ensures `/dev/usb_accessory` from `/proc/misc` when needed. This is idempotent and skips changes when already configured.
+- Add `--check`, `--unbind`, `--no-bind`, and basic identity/UDC options.
+- Keep an optional boot init rc that can run the gadget preflight during `late-init`, while the preferred runtime path is automatic preflight inside normal AAP daemon commands.
+- Add macOS boot partition patch helper for `dwc2.dtbo`, `config.txt`, and `cmdline.txt`.
+- Add ADB installer for `/vendor/bin/arda-senderd` and `/vendor/etc/init/arda-aoa-gadget.rc`.
+- Add `docs/AAOS_AOA_USB_GADGET.md` with the verified setup, install flow, and troubleshooting.
+
+Compatibility note:
+- Treat this as an ARDA Raspberry Pi 4 AAOS image patch, not a universal AAOS patch. Other images may need a different UDC name, a different partition layout, or a kernel with missing accessory gadget support.

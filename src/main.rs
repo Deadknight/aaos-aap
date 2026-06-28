@@ -5,10 +5,13 @@ mod input;
 mod native;
 
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use capture::screenrecord::{ScreenrecordConfig, ScreenrecordSource};
 use h264::annexb::{AnnexBStreamParser, NalStats};
@@ -27,6 +30,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
+    auto_ensure_aaos_aoa_gadget_for_command(&cmd);
+
     match cmd.as_str() {
         "capture-test" => capture_test(args.collect()),
         "nal-info" => nal_info(args.collect()),
@@ -38,6 +43,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-display-capture-test" => native_display_capture_test(args.collect()),
         "native-capture" => native_capture(args.collect()),
         "input-test" => input_test(args.collect()),
+        "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
         "aap-tcp-probe" => aap_tcp_probe(args.collect()),
         "aap-frame-probe" => aap_frame_probe(args.collect()),
         "aap-version-session" => aap_version_session(args.collect()),
@@ -96,6 +102,9 @@ Commands:
   input-test [--size 1280x720] swipe X1 Y1 X2 Y2 [--duration-ms 300] [--steps 20]
       Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
 
+  aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--no-bind] [--check] [--unbind]
+      Creates/binds the AAOS USB-C Android Open Accessory configfs gadget using accessory.usb0 and /dev/usb_accessory. Run as root on AAOS.
+
   aap-tcp-probe [--addr 0.0.0.0:5277] [--dump PATH] [--timeout-ms 60000]
       Raw TCP probe: accepts one client and hex-dumps incoming bytes.
 
@@ -130,8 +139,8 @@ Commands:
   aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
 
-  aap-session-probe ... --sensor-open [--sensor-max-type 21] [--sensor-jsonl PATH] [--sensor-forward-os]
-      Opens the HU SensorSourceService channel, subscribes to advertised sensor types up to 21, decodes SensorBatch messages, optionally writes JSONL, and best-effort forwards LOCATION to AAOS through cmd location.
+  aap-session-probe ... --sensor-open [--sensor-max-type 21] [--sensor-jsonl PATH] [--sensor-forward-os] [--sensor-forward-vhal] [--sensor-vhal-min-ms 500]
+      Opens the HU SensorSourceService channel, subscribes to advertised sensor types up to 21, decodes SensorBatch messages, optionally writes JSONL, and best-effort forwards LOCATION through cmd location plus supported vehicle values through cmd car_service inject-vhal-event.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -144,6 +153,399 @@ Live native capture from Mac:
     | mpv --demuxer=lavf --demuxer-lavf-format=h264 --no-correct-pts --container-fps-override=30 --profile=low-latency -
 "#
     );
+}
+
+
+#[derive(Debug, Clone)]
+struct AaosAoaGadgetArgs {
+    name: String,
+    udc: Option<String>,
+    wait_ms: u64,
+    vendor_id: String,
+    product_id: String,
+    serial: String,
+    manufacturer: String,
+    product: String,
+    max_power: u32,
+    no_bind: bool,
+    check: bool,
+    unbind: bool,
+}
+
+fn aaos_aoa_gadget(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_aaos_aoa_gadget_args(argv)?;
+    let gadget_path = format!("/config/usb_gadget/{}", args.name);
+
+    if args.check {
+        return print_aoa_gadget_status(&gadget_path);
+    }
+
+    if args.unbind {
+        write_configfs_text_ignore(format!("{gadget_path}/UDC"), "\n");
+        println!("aaos-aoa-gadget: unbound {gadget_path}");
+        return print_aoa_gadget_status(&gadget_path);
+    }
+
+    let status = ensure_aaos_aoa_gadget(&args)?;
+    if status.changed {
+        eprintln!("aaos-aoa-gadget: configured and bound to {}", status.bound_udc.as_deref().unwrap_or("<none>"));
+    } else {
+        eprintln!("aaos-aoa-gadget: already configured; no changes needed");
+    }
+    print_aoa_gadget_status(&gadget_path)
+}
+
+fn default_aaos_aoa_gadget_args() -> AaosAoaGadgetArgs {
+    AaosAoaGadgetArgs {
+        name: "arda".to_string(),
+        udc: None,
+        wait_ms: 10_000,
+        vendor_id: "0x18D1".to_string(),
+        product_id: "0x2D00".to_string(),
+        serial: "arda-aaos".to_string(),
+        manufacturer: "aa-proxy".to_string(),
+        product: "AAOS AOA".to_string(),
+        max_power: 500,
+        no_bind: false,
+        check: false,
+        unbind: false,
+    }
+}
+
+fn parse_aaos_aoa_gadget_args(argv: Vec<String>) -> Result<AaosAoaGadgetArgs, Box<dyn std::error::Error>> {
+    let mut args = default_aaos_aoa_gadget_args();
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--name" => {
+                i += 1;
+                args.name = argv.get(i).ok_or("--name requires value")?.clone();
+            }
+            "--udc" => {
+                i += 1;
+                args.udc = Some(argv.get(i).ok_or("--udc requires value")?.clone());
+            }
+            "--wait-ms" => {
+                i += 1;
+                args.wait_ms = argv.get(i).ok_or("--wait-ms requires value")?.parse()?;
+            }
+            "--vendor-id" => {
+                i += 1;
+                args.vendor_id = argv.get(i).ok_or("--vendor-id requires value")?.clone();
+            }
+            "--product-id" => {
+                i += 1;
+                args.product_id = argv.get(i).ok_or("--product-id requires value")?.clone();
+            }
+            "--serial" => {
+                i += 1;
+                args.serial = argv.get(i).ok_or("--serial requires value")?.clone();
+            }
+            "--manufacturer" => {
+                i += 1;
+                args.manufacturer = argv.get(i).ok_or("--manufacturer requires value")?.clone();
+            }
+            "--product" => {
+                i += 1;
+                args.product = argv.get(i).ok_or("--product requires value")?.clone();
+            }
+            "--max-power" => {
+                i += 1;
+                args.max_power = argv.get(i).ok_or("--max-power requires value")?.parse()?;
+            }
+            "--no-bind" => args.no_bind = true,
+            "--check" => args.check = true,
+            "--unbind" => args.unbind = true,
+            "--help" | "-h" => {
+                println!(
+                    "aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--vendor-id 0x18D1] [--product-id 0x2D00] [--serial arda-aaos] [--manufacturer aa-proxy] [--product 'AAOS AOA'] [--max-power 500] [--no-bind] [--check] [--unbind]"
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown aaos-aoa-gadget arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    Ok(args)
+}
+
+#[derive(Debug, Clone)]
+struct AoaGadgetStatus {
+    changed: bool,
+    bound_udc: Option<String>,
+}
+
+fn auto_ensure_aaos_aoa_gadget_for_command(cmd: &str) {
+    if !should_auto_ensure_aaos_aoa_gadget(cmd) || env_flag_disabled("ARDA_AAOS_AOA_AUTO") {
+        return;
+    }
+
+    // Fast no-op on non-AAOS hosts or kernels without a USB device controller.
+    if !Path::new("/sys/class/udc").exists() {
+        return;
+    }
+
+    let mut args = default_aaos_aoa_gadget_args();
+    args.wait_ms = 2_000;
+
+    match ensure_aaos_aoa_gadget(&args) {
+        Ok(status) if status.changed => {
+            eprintln!(
+                "arda aaos-aoa: auto-configured USB accessory gadget on {}",
+                status.bound_udc.as_deref().unwrap_or("<none>")
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // Do not fail the main daemon/probe because of the preflight. Some dev paths
+            // intentionally run over TCP or on images without gadget support.
+            eprintln!("arda aaos-aoa: auto-setup skipped: {err}");
+        }
+    }
+}
+
+fn should_auto_ensure_aaos_aoa_gadget(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "aap-tcp-probe"
+            | "aap-frame-probe"
+            | "aap-version-session"
+            | "aap-ssl-frame-probe"
+            | "aap-tls-handshake-probe"
+            | "aap-tls-plain-probe"
+            | "aap-service-discovery-probe"
+            | "aap-session-probe"
+    )
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "0" | "false" | "off" | "no" | "disabled")
+        }
+        Err(_) => false,
+    }
+}
+
+fn ensure_aaos_aoa_gadget(args: &AaosAoaGadgetArgs) -> Result<AoaGadgetStatus, Box<dyn std::error::Error>> {
+    run_command_ignore("mount", &["-t", "configfs", "none", "/config"]);
+    fs::create_dir_all("/config/usb_gadget")?;
+
+    let gadget_path = format!("/config/usb_gadget/{}", args.name);
+    let udc = match args.udc.clone() {
+        Some(udc) => udc,
+        None => wait_for_udc(Duration::from_millis(args.wait_ms))?,
+    };
+
+    if aaos_aoa_gadget_ready(&gadget_path, &udc) {
+        ensure_usb_accessory_node()?;
+        return Ok(AoaGadgetStatus {
+            changed: false,
+            bound_udc: read_trim(format!("{gadget_path}/UDC")),
+        });
+    }
+
+    if Path::new(&gadget_path).exists() {
+        write_configfs_text_ignore(format!("{gadget_path}/UDC"), "\n");
+        remove_file_ignore(format!("{gadget_path}/configs/c.1/accessory.usb0"));
+    }
+
+    fs::create_dir_all(&gadget_path)?;
+
+    write_configfs_text(format!("{gadget_path}/idVendor"), &format!("{}\n", args.vendor_id))?;
+    write_configfs_text(format!("{gadget_path}/idProduct"), &format!("{}\n", args.product_id))?;
+    write_configfs_text(format!("{gadget_path}/bcdDevice"), "0x0100\n")?;
+    write_configfs_text(format!("{gadget_path}/bcdUSB"), "0x0200\n")?;
+
+    fs::create_dir_all(format!("{gadget_path}/strings/0x409"))?;
+    write_configfs_text(format!("{gadget_path}/strings/0x409/serialnumber"), &format!("{}\n", args.serial))?;
+    write_configfs_text(format!("{gadget_path}/strings/0x409/manufacturer"), &format!("{}\n", args.manufacturer))?;
+    write_configfs_text(format!("{gadget_path}/strings/0x409/product"), &format!("{}\n", args.product))?;
+
+    fs::create_dir_all(format!("{gadget_path}/configs/c.1/strings/0x409"))?;
+    write_configfs_text(format!("{gadget_path}/configs/c.1/strings/0x409/configuration"), "Android Auto Accessory\n")?;
+    write_configfs_text(format!("{gadget_path}/configs/c.1/MaxPower"), &format!("{}\n", args.max_power))?;
+
+    let function_path = format!("{gadget_path}/functions/accessory.usb0");
+    let config_link = format!("{gadget_path}/configs/c.1/accessory.usb0");
+    fs::create_dir_all(&function_path)?;
+    remove_file_ignore(&config_link);
+
+    // This AAOS/configfs combination rejects a relative symlink target with EPERM.
+    // Use the absolute configfs function path, matching the verified manual setup.
+    unix_fs::symlink(&function_path, &config_link)?;
+
+    if !args.no_bind {
+        write_configfs_text(format!("{gadget_path}/UDC"), &format!("{udc}\n"))?;
+    }
+
+    ensure_usb_accessory_node()?;
+    Ok(AoaGadgetStatus {
+        changed: true,
+        bound_udc: read_trim(format!("{gadget_path}/UDC")),
+    })
+}
+
+fn aaos_aoa_gadget_ready(gadget_path: &str, expected_udc: &str) -> bool {
+    let Some(bound_udc) = read_trim(format!("{gadget_path}/UDC")) else {
+        return false;
+    };
+    if bound_udc != expected_udc {
+        return false;
+    }
+
+    let function_path = Path::new(gadget_path).join("functions/accessory.usb0");
+    let config_link = Path::new(gadget_path).join("configs/c.1/accessory.usb0");
+    if !function_path.exists() || !config_link.exists() {
+        return false;
+    }
+
+    Path::new("/dev/usb_accessory").exists() || usb_accessory_minor().ok().flatten().is_some()
+}
+
+fn read_trim<P: AsRef<Path>>(path: P) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn wait_for_udc(timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() <= timeout {
+        if let Some(udc) = first_udc()? {
+            return Ok(udc);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err("no UDC found under /sys/class/udc".into())
+}
+
+fn first_udc() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(entries) = fs::read_dir("/sys/class/udc") else {
+        return Ok(None);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+fn write_configfs_text<P: AsRef<Path>>(path: P, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(path, value)?;
+    Ok(())
+}
+
+fn write_configfs_text_ignore<P: AsRef<Path>>(path: P, value: &str) {
+    let _ = fs::write(path, value);
+}
+
+fn remove_file_ignore<P: AsRef<Path>>(path: P) {
+    let _ = fs::remove_file(path);
+}
+
+fn run_command_ignore(program: &str, args: &[&str]) {
+    let _ = Command::new(program).args(args).status();
+}
+
+fn ensure_usb_accessory_node() -> Result<(), Box<dyn std::error::Error>> {
+    let minor = usb_accessory_minor()?;
+    if let Some(minor) = minor {
+        if !Path::new("/dev/usb_accessory").exists() {
+            let minor_s = minor.to_string();
+            run_command_ignore("mknod", &["/dev/usb_accessory", "c", "10", minor_s.as_str()]);
+        }
+        run_command_ignore("chown", &["root:usb", "/dev/usb_accessory"]);
+        run_command_ignore("chmod", &["660", "/dev/usb_accessory"]);
+    }
+    Ok(())
+}
+
+fn usb_accessory_minor() -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    let Ok(text) = fs::read_to_string("/proc/misc") else {
+        return Ok(None);
+    };
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(minor) = parts.next() else { continue; };
+        let Some(name) = parts.next() else { continue; };
+        let lowered = name.to_ascii_lowercase();
+        if lowered.contains("usb_accessory") || lowered.contains("accessory") || lowered.contains("aoa") {
+            return Ok(Some(minor.parse()?));
+        }
+    }
+    Ok(None)
+}
+
+fn print_aoa_gadget_status(gadget_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("===== aaos-aoa-gadget status =====");
+    println!("gadget={gadget_path}");
+
+    println!("\n===== /sys/class/udc =====");
+    print_dir_names("/sys/class/udc")?;
+
+    println!("\n===== gadget UDC =====");
+    match fs::read_to_string(format!("{gadget_path}/UDC")) {
+        Ok(text) => print!("{}", text),
+        Err(err) => println!("NO_GADGET_UDC ({err})"),
+    }
+
+    println!("\n===== functions =====");
+    print_dir_names(format!("{gadget_path}/functions"))?;
+
+    println!("\n===== config c.1 =====");
+    print_dir_names(format!("{gadget_path}/configs/c.1"))?;
+
+    println!("\n===== /proc/misc accessory =====");
+    let misc = fs::read_to_string("/proc/misc").unwrap_or_default();
+    let mut any = false;
+    for line in misc.lines() {
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("usb") || lowered.contains("access") || lowered.contains("aoa") {
+            println!("{line}");
+            any = true;
+        }
+    }
+    if !any {
+        println!("NO_MISC_USB_ACCESSORY");
+    }
+
+    println!("\n===== /dev/usb_accessory =====");
+    match fs::metadata("/dev/usb_accessory") {
+        Ok(meta) => println!("/dev/usb_accessory exists: mode={:o}", meta.permissions().mode() & 0o7777),
+        Err(_) => println!("NO_DEV_USB_ACCESSORY"),
+    }
+
+    Ok(())
+}
+
+fn print_dir_names<P: AsRef<Path>>(path: P) -> Result<(), Box<dyn std::error::Error>> {
+    let path_ref = path.as_ref();
+    let Ok(entries) = fs::read_dir(path_ref) else {
+        println!("{}: not found or unreadable", path_ref.display());
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            println!("{name} -> {}", target.display());
+        } else if ty.is_dir() {
+            println!("{name}/");
+        } else {
+            println!("{name}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1095,8 +1497,10 @@ struct AapTlsHandshakeProbeArgs {
     sensor_period_ms: i64,
     sensor_jsonl_path: Option<PathBuf>,
     sensor_forward_os: bool,
+    sensor_forward_vhal: bool,
     sensor_location_provider: String,
     sensor_location_min_ms: u64,
+    sensor_vhal_min_ms: u64,
     quiet_ping_logs: bool,
     log_level: String,
 }
@@ -1173,8 +1577,10 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         sensor_period_ms: args.sensor_period_ms,
         sensor_jsonl_path: args.sensor_jsonl_path.clone(),
         sensor_forward_os: args.sensor_forward_os,
+        sensor_forward_vhal: args.sensor_forward_vhal,
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
+        sensor_vhal_min_ms: args.sensor_vhal_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1269,8 +1675,10 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         sensor_period_ms: args.sensor_period_ms,
         sensor_jsonl_path: args.sensor_jsonl_path.clone(),
         sensor_forward_os: args.sensor_forward_os,
+        sensor_forward_vhal: args.sensor_forward_vhal,
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
+        sensor_vhal_min_ms: args.sensor_vhal_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1356,8 +1764,10 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         sensor_period_ms: args.sensor_period_ms,
         sensor_jsonl_path: args.sensor_jsonl_path.clone(),
         sensor_forward_os: args.sensor_forward_os,
+        sensor_forward_vhal: args.sensor_forward_vhal,
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
+        sensor_vhal_min_ms: args.sensor_vhal_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1473,8 +1883,10 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut sensor_period_ms: i64 = -2;
     let mut sensor_jsonl_path: Option<PathBuf> = None;
     let mut sensor_forward_os = false;
+    let mut sensor_forward_vhal = false;
     let mut sensor_location_provider = String::from("arda_gps");
     let mut sensor_location_min_ms: u64 = 1000;
+    let mut sensor_vhal_min_ms: u64 = 500;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
 
@@ -1974,12 +2386,28 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             "--no-sensor-jsonl" => {
                 sensor_jsonl_path = None;
             }
-            "--sensor-forward-os" | "--sensors-forward-os" | "--sensor-location-os" => {
+            "--sensor-forward-os" | "--sensors-forward-os" | "--sensor-os" => {
+                sensor_open = true;
+                sensor_forward_os = true;
+                sensor_forward_vhal = true;
+            }
+            "--sensor-forward-location" | "--sensor-location-os" => {
                 sensor_open = true;
                 sensor_forward_os = true;
             }
-            "--no-sensor-forward-os" | "--no-sensor-location-os" => {
+            "--no-sensor-forward-os" | "--no-sensor-os" => {
                 sensor_forward_os = false;
+                sensor_forward_vhal = false;
+            }
+            "--no-sensor-location-os" | "--no-sensor-forward-location" => {
+                sensor_forward_os = false;
+            }
+            "--sensor-forward-vhal" | "--sensor-vhal-os" | "--sensor-car-service" => {
+                sensor_open = true;
+                sensor_forward_vhal = true;
+            }
+            "--no-sensor-forward-vhal" | "--no-sensor-vhal-os" | "--no-sensor-car-service" => {
+                sensor_forward_vhal = false;
             }
             "--sensor-location-provider" | "--sensor-provider" => {
                 i += 1;
@@ -1990,6 +2418,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 i += 1;
                 sensor_open = true;
                 sensor_location_min_ms = argv.get(i).ok_or("--sensor-location-min-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--sensor-vhal-min-ms" | "--sensor-car-service-min-ms" => {
+                i += 1;
+                sensor_open = true;
+                sensor_forward_vhal = true;
+                sensor_vhal_min_ms = argv.get(i).ok_or("--sensor-vhal-min-ms requires milliseconds")?.parse::<u64>()?;
             }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
@@ -2211,8 +2645,10 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         sensor_period_ms,
         sensor_jsonl_path,
         sensor_forward_os,
+        sensor_forward_vhal,
         sensor_location_provider,
         sensor_location_min_ms,
+        sensor_vhal_min_ms,
         quiet_ping_logs,
         log_level,
     })

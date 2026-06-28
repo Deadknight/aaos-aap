@@ -180,3 +180,76 @@ If native video waits for a screen change before producing the first slice NAL, 
 ```
 
 `touch-cancel` is intended to dirty the input/display pipeline without an ACTION_UP click. `center` is a real tap at stream center and can activate UI. `HOME` is supported but not recommended unless explicitly testing navigation behavior.
+
+## v44 AAOS USB-C AOA gadget bootstrap
+
+The daemon now auto-checks the verified Raspberry Pi 4 AAOS Android Open Accessory USB gadget before AAP listener/session commands. In normal use there is no separate gadget command to run: start `aap-session-probe` / the ARDA daemon as usual, and it will create the gadget only when it is missing.
+
+Auto preflight currently runs for:
+
+```text
+aap-tcp-probe
+aap-frame-probe
+aap-version-session
+aap-ssl-frame-probe
+aap-tls-handshake-probe
+aap-tls-plain-probe
+aap-service-discovery-probe
+aap-session-probe
+```
+
+It can be disabled for debugging with:
+
+```bash
+ARDA_AAOS_AOA_AUTO=0 /vendor/bin/arda-senderd aap-session-probe ...
+```
+
+The manual diagnostic command is still available:
+
+```bash
+adb shell su
+/vendor/bin/arda-senderd aaos-aoa-gadget --check
+/vendor/bin/arda-senderd aaos-aoa-gadget --unbind
+/vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
+```
+
+The auto preflight/manual command creates and binds:
+
+```text
+/config/usb_gadget/arda
+/config/usb_gadget/arda/functions/accessory.usb0
+/config/usb_gadget/arda/configs/c.1/accessory.usb0 -> /config/usb_gadget/arda/functions/accessory.usb0
+/dev/usb_accessory
+```
+
+Useful status commands:
+
+```bash
+/vendor/bin/arda-senderd aaos-aoa-gadget --check
+/vendor/bin/arda-senderd aaos-aoa-gadget --unbind
+```
+
+Installer helpers were added:
+
+```text
+scripts/install-aaos-boot-dwc2-macos.sh
+scripts/install-aaos-aoa-gadget-adb.sh
+docs/AAOS_AOA_USB_GADGET.md
+packaging/vendor/etc/init/arda-aoa-gadget.rc
+packaging/boot/overlays/dwc2.dtbo
+```
+
+Two-step setup for a fresh compatible AAOS SD card:
+
+```bash
+scripts/install-aaos-boot-dwc2-macos.sh /Volumes/boot
+scripts/install-aaos-aoa-gadget-adb.sh target/aarch64-linux-android/release/arda-senderd
+```
+
+After that, any normal AAP daemon launch auto-ensures the gadget first, for example:
+
+```bash
+adb shell su -c '/vendor/bin/arda-senderd aap-session-probe --addr 0.0.0.0:5277 --keys /data/local/tmp/arda-certs'
+```
+
+This is intended for the ARDA Raspberry Pi 4 AAOS image family, not arbitrary AAOS builds. Other images still need kernel/configfs support for `dwc2`, `accessory.usb0`, and `/proc/misc` `usb_accessory`.

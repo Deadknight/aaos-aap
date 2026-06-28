@@ -1,0 +1,9 @@
+service arda_aoa_gadget /vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
+    class late_start
+    user root
+    group root usb shell system
+    oneshot
+    seclabel u:r:su:s0
+
+on late-init
+    start arda_aoa_gadget

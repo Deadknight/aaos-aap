@@ -1026,8 +1026,10 @@ pub struct TlsHandshakeProbeConfig {
     pub sensor_period_ms: i64,
     pub sensor_jsonl_path: Option<PathBuf>,
     pub sensor_forward_os: bool,
+    pub sensor_forward_vhal: bool,
     pub sensor_location_provider: String,
     pub sensor_location_min_ms: u64,
+    pub sensor_vhal_min_ms: u64,
     pub quiet_ping_logs: bool,
     pub log_level: String,
 }
@@ -1104,8 +1106,10 @@ impl Default for TlsHandshakeProbeConfig {
             sensor_period_ms: -2,
             sensor_jsonl_path: None,
             sensor_forward_os: false,
+            sensor_forward_vhal: false,
             sensor_location_provider: "arda_gps".to_string(),
             sensor_location_min_ms: 1000,
+            sensor_vhal_min_ms: 500,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
         }
@@ -1181,22 +1185,34 @@ struct SensorChannelState {
 }
 
 #[derive(Debug)]
+struct SensorVhalLastPush {
+    signal: &'static str,
+    at: Instant,
+}
+
+#[derive(Debug)]
 struct SensorOsForwarder {
-    enabled: bool,
+    location_enabled: bool,
+    vhal_enabled: bool,
     provider: String,
-    initialized: bool,
+    location_initialized: bool,
     last_location_push: Option<Instant>,
-    min_interval: Duration,
+    location_min_interval: Duration,
+    vhal_min_interval: Duration,
+    vhal_last_pushes: Vec<SensorVhalLastPush>,
 }
 
 impl SensorOsForwarder {
     fn new(config: &TlsHandshakeProbeConfig) -> Self {
         Self {
-            enabled: config.sensor_forward_os,
+            location_enabled: config.sensor_forward_os,
+            vhal_enabled: config.sensor_forward_vhal,
             provider: config.sensor_location_provider.clone(),
-            initialized: false,
+            location_initialized: false,
             last_location_push: None,
-            min_interval: Duration::from_millis(config.sensor_location_min_ms),
+            location_min_interval: Duration::from_millis(config.sensor_location_min_ms),
+            vhal_min_interval: Duration::from_millis(config.sensor_vhal_min_ms),
+            vhal_last_pushes: Vec::new(),
         }
     }
 
@@ -1205,19 +1221,19 @@ impl SensorOsForwarder {
         location: &proto::DecodedLocationFix,
         dump: &mut Option<Box<dyn Write>>,
     ) -> io::Result<()> {
-        if !self.enabled {
+        if !self.location_enabled {
             return Ok(());
         }
         let now = Instant::now();
         if let Some(last) = self.last_location_push {
-            if now.duration_since(last) < self.min_interval {
+            if now.duration_since(last) < self.location_min_interval {
                 return Ok(());
             }
         }
-        if !self.initialized {
+        if !self.location_initialized {
             let _ = run_location_cmd(&["providers", "add-test-provider", self.provider.as_str()], dump, "SENSOR_OS_INIT add-test-provider");
             let _ = run_location_cmd(&["providers", "set-test-provider-enabled", self.provider.as_str(), "true"], dump, "SENSOR_OS_INIT enable-provider");
-            self.initialized = true;
+            self.location_initialized = true;
         }
         let location_arg = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
         let accuracy_arg = format!("{:.1}", location.accuracy_m.max(1.0));
@@ -1244,7 +1260,124 @@ impl SensorOsForwarder {
         }
         Ok(())
     }
+
+    fn push_vhal_props(
+        &mut self,
+        props: &[proto::DecodedVehicleProperty],
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if !self.vhal_enabled {
+            return Ok(());
+        }
+        for prop in props {
+            if !self.should_push_vhal(prop.signal) {
+                continue;
+            }
+            let ok = run_car_service_vhal_inject_cmd(prop, dump).unwrap_or(false);
+            self.mark_vhal_attempt(prop.signal);
+            if !ok && session_log_enabled(LOG_NORMAL) {
+                let line = format!(
+                    "SENSOR_OS_VHAL failed prop={}({}) area={} value={} note=cmd_car_service_and_dumpsys_fallback_failed_or_unsupported",
+                    prop.property_name, prop.property_id, prop.area_id, prop.value
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn should_push_vhal(&self, signal: &'static str) -> bool {
+        if self.vhal_min_interval.as_millis() == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        self.vhal_last_pushes
+            .iter()
+            .find(|last| last.signal == signal)
+            .map(|last| now.duration_since(last.at) >= self.vhal_min_interval)
+            .unwrap_or(true)
+    }
+
+    fn mark_vhal_attempt(&mut self, signal: &'static str) {
+        let now = Instant::now();
+        if let Some(last) = self.vhal_last_pushes.iter_mut().find(|last| last.signal == signal) {
+            last.at = now;
+        } else {
+            self.vhal_last_pushes.push(SensorVhalLastPush { signal, at: now });
+        }
+    }
 }
+
+fn run_command_logged(
+    program: &str,
+    args: &[&str],
+    dump: &mut Option<Box<dyn Write>>,
+    label: &str,
+) -> io::Result<bool> {
+    let output = Command::new(program).args(args).output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().replace('\n', " | ");
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().replace('\n', " | ");
+            let ok = output.status.success();
+            let pretty_program = program.strip_prefix("/system/bin/").unwrap_or(program);
+            let line = format!(
+                "{} cmd='{} {}' status={} stdout='{}' stderr='{}'",
+                label,
+                pretty_program,
+                args.join(" "),
+                output.status,
+                stdout,
+                stderr
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            Ok(ok)
+        }
+        Err(err) => {
+            let pretty_program = program.strip_prefix("/system/bin/").unwrap_or(program);
+            let line = format!("{} cmd='{} {}' failed: {}", label, pretty_program, args.join(" "), err);
+            println!("{line}");
+            log_line(dump, &line)?;
+            Err(err)
+        }
+    }
+}
+
+fn run_car_service_vhal_inject_cmd(
+    prop: &proto::DecodedVehicleProperty,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<bool> {
+    let prop_id = prop.property_id.to_string();
+    let area_id = prop.area_id.to_string();
+    let value = prop.value.as_str();
+    let cmd_args = [
+        "car_service",
+        "inject-vhal-event",
+        prop_id.as_str(),
+        area_id.as_str(),
+        value,
+    ];
+    let label = format!("SENSOR_OS_VHAL {}", prop.property_name);
+    match run_command_logged("/system/bin/cmd", &cmd_args, dump, &label) {
+        Ok(true) => Ok(true),
+        Ok(false) | Err(_) => {
+            // Older AAOS docs used dumpsys activity service com.android.car with no explicit
+            // area for global properties. Keep it as a compatibility fallback for userdebug builds.
+            let dumpsys_args = [
+                "activity",
+                "service",
+                "com.android.car",
+                "inject-vhal-event",
+                prop_id.as_str(),
+                value,
+            ];
+            run_command_logged("/system/bin/dumpsys", &dumpsys_args, dump, &format!("SENSOR_OS_VHAL_FALLBACK {}", prop.property_name))
+        }
+    }
+}
+
 
 fn audio_stream_matches(filter: &str, stream_type: &str) -> bool {
     let filter = filter.to_ascii_lowercase();
@@ -1307,31 +1440,10 @@ fn run_location_cmd(
     dump: &mut Option<Box<dyn Write>>,
     label: &str,
 ) -> io::Result<bool> {
-    let output = Command::new("/system/bin/cmd").arg("location").args(args).output();
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().replace('\n', " | ");
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().replace('\n', " | ");
-            let ok = output.status.success();
-            let line = format!(
-                "{} cmd='cmd location {}' status={} stdout='{}' stderr='{}'",
-                label,
-                args.join(" "),
-                output.status,
-                stdout,
-                stderr
-            );
-            println!("{line}");
-            log_line(dump, &line)?;
-            Ok(ok)
-        }
-        Err(err) => {
-            let line = format!("{} cmd='cmd location {}' failed: {}", label, args.join(" "), err);
-            println!("{line}");
-            log_line(dump, &line)?;
-            Err(err)
-        }
-    }
+    let mut cmd_args = Vec::with_capacity(args.len() + 1);
+    cmd_args.push("location");
+    cmd_args.extend_from_slice(args);
+    run_command_logged("/system/bin/cmd", &cmd_args, dump, label)
 }
 
 fn requested_sensor_types(sensor: &SensorChannelState, config: &TlsHandshakeProbeConfig) -> Vec<i32> {
@@ -3719,6 +3831,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if let Some(location) = batch.location.as_ref() {
                         sensor_os_forwarder.push_location(location, &mut dump)?;
                     }
+                    sensor_os_forwarder.push_vhal_props(&batch.vhal_props, &mut dump)?;
                 }
             }
 

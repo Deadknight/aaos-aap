@@ -190,6 +190,48 @@ pub fn keycode_name(code: u32) -> &'static str {
     }
 }
 
+
+
+pub fn sensor_message_name(id: u16) -> &'static str {
+    match SensorMessageId::from_i32(id as i32) {
+        Some(SensorMessageId::SENSOR_MESSAGE_REQUEST) => "SENSOR_MESSAGE_REQUEST",
+        Some(SensorMessageId::SENSOR_MESSAGE_RESPONSE) => "SENSOR_MESSAGE_RESPONSE",
+        Some(SensorMessageId::SENSOR_MESSAGE_BATCH) => "SENSOR_MESSAGE_BATCH",
+        Some(SensorMessageId::SENSOR_MESSAGE_ERROR) => "SENSOR_MESSAGE_ERROR",
+        None => "UNKNOWN_SENSOR_MESSAGE",
+    }
+}
+
+pub fn sensor_type_name(value: i32) -> &'static str {
+    match SensorType::from_i32(value) {
+        Some(SensorType::SENSOR_LOCATION) => "SENSOR_LOCATION",
+        Some(SensorType::SENSOR_COMPASS) => "SENSOR_COMPASS",
+        Some(SensorType::SENSOR_SPEED) => "SENSOR_SPEED",
+        Some(SensorType::SENSOR_RPM) => "SENSOR_RPM",
+        Some(SensorType::SENSOR_ODOMETER) => "SENSOR_ODOMETER",
+        Some(SensorType::SENSOR_FUEL) => "SENSOR_FUEL",
+        Some(SensorType::SENSOR_PARKING_BRAKE) => "SENSOR_PARKING_BRAKE",
+        Some(SensorType::SENSOR_GEAR) => "SENSOR_GEAR",
+        Some(SensorType::SENSOR_OBDII_DIAGNOSTIC_CODE) => "SENSOR_OBDII_DIAGNOSTIC_CODE",
+        Some(SensorType::SENSOR_NIGHT_MODE) => "SENSOR_NIGHT_MODE",
+        Some(SensorType::SENSOR_ENVIRONMENT_DATA) => "SENSOR_ENVIRONMENT_DATA",
+        Some(SensorType::SENSOR_HVAC_DATA) => "SENSOR_HVAC_DATA",
+        Some(SensorType::SENSOR_DRIVING_STATUS_DATA) => "SENSOR_DRIVING_STATUS_DATA",
+        Some(SensorType::SENSOR_DEAD_RECKONING_DATA) => "SENSOR_DEAD_RECKONING_DATA",
+        Some(SensorType::SENSOR_PASSENGER_DATA) => "SENSOR_PASSENGER_DATA",
+        Some(SensorType::SENSOR_DOOR_DATA) => "SENSOR_DOOR_DATA",
+        Some(SensorType::SENSOR_LIGHT_DATA) => "SENSOR_LIGHT_DATA",
+        Some(SensorType::SENSOR_TIRE_PRESSURE_DATA) => "SENSOR_TIRE_PRESSURE_DATA",
+        Some(SensorType::SENSOR_ACCELEROMETER_DATA) => "SENSOR_ACCELEROMETER_DATA",
+        Some(SensorType::SENSOR_GYROSCOPE_DATA) => "SENSOR_GYROSCOPE_DATA",
+        Some(SensorType::SENSOR_GPS_SATELLITE_DATA) => "SENSOR_GPS_SATELLITE_DATA",
+        Some(SensorType::SENSOR_TOLL_CARD) => "SENSOR_TOLL_CARD",
+        Some(SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA) => "SENSOR_VEHICLE_ENERGY_MODEL_DATA",
+        Some(SensorType::SENSOR_TRAILER_DATA) => "SENSOR_TRAILER_DATA",
+        None => "UNKNOWN_SENSOR_TYPE",
+    }
+}
+
 pub fn media_message_name(id: u16) -> &'static str {
     match MediaMessageId::from_i32(id as i32) {
         Some(MediaMessageId::MEDIA_MESSAGE_DATA) => "MEDIA_MESSAGE_DATA",
@@ -744,6 +786,7 @@ pub struct ServiceDiscoverySummary {
     pub audio_media_sinks: Vec<AudioSinkSelection>,
     pub input_source: Option<InputSourceSelection>,
     pub media_source: Option<MediaSourceSelection>,
+    pub sensor_source: Option<SensorSourceSelection>,
 }
 
 #[derive(Debug, Clone)]
@@ -780,6 +823,18 @@ pub struct MediaSourceSelection {
     pub service_id: i32,
     pub available_type: String,
     pub config: Option<AudioConfigSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SensorSourceSelection {
+    pub service_id: i32,
+    pub sensors: Vec<SensorTypeInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SensorTypeInfo {
+    pub value: i32,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1069,6 +1124,7 @@ fn summarize_service_discovery_response_body(
     let mut audio_media_sinks: Vec<AudioSinkSelection> = Vec::new();
     let mut input_source = None;
     let mut media_source = None;
+    let mut sensor_source = None;
 
     details.push(format!(
         "SDR headunit display_name={:?} driver_position={:?} services={}",
@@ -1236,7 +1292,32 @@ fn summarize_service_discovery_response_body(
             }
         }
         if let Some(sensor) = svc.sensor_source_service.as_ref() {
-            kinds.push(format!("sensor_source sensors={}", sensor.sensors.len()));
+            let sensors = sensor
+                .sensors
+                .iter()
+                .map(|entry| {
+                    let ty = entry.sensor_type();
+                    SensorTypeInfo {
+                        value: ty.value(),
+                        name: format!("{:?}", ty),
+                    }
+                })
+                .collect::<Vec<_>>();
+            kinds.push(format!(
+                "sensor_source sensors={} [{}]",
+                sensors.len(),
+                sensors
+                    .iter()
+                    .map(|sensor| format!("{}({})", sensor.name, sensor.value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            if sensor_source.is_none() {
+                sensor_source = Some(SensorSourceSelection {
+                    service_id: svc.id(),
+                    sensors,
+                });
+            }
         }
         if let Some(source) = svc.media_source_service.as_ref() {
             kinds.push(format!("media_source type={:?}", source.available_type()));
@@ -1324,6 +1405,7 @@ fn summarize_service_discovery_response_body(
         audio_media_sinks,
         input_source,
         media_source,
+        sensor_source,
     })
 }
 
@@ -1343,6 +1425,209 @@ pub fn build_channel_open_request_control_payload(
     payload.extend_from_slice(&req.write_to_bytes()?);
     Ok(payload)
 }
+
+pub fn build_sensor_request_payload(
+    sensor_type: i32,
+    min_update_period_ms: i64,
+) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut req = SensorRequest::new();
+    let sensor_enum = SensorType::from_i32(sensor_type).unwrap_or(SensorType::SENSOR_LOCATION);
+    req.set_type(sensor_enum);
+    req.set_min_update_period(min_update_period_ms);
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(SensorMessageId::SENSOR_MESSAGE_REQUEST.value() as u16).to_be_bytes());
+    payload.extend_from_slice(&req.write_to_bytes()?);
+    Ok((
+        payload,
+        format!(
+            "SENSOR_MESSAGE_REQUEST type={}({}) min_update_period_ms={}",
+            sensor_type_name(sensor_type),
+            sensor_type,
+            min_update_period_ms
+        ),
+    ))
+}
+
+pub fn parse_sensor_response_payload(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != SensorMessageId::SENSOR_MESSAGE_RESPONSE.value() as u16 {
+        return None;
+    }
+    let msg = SensorResponse::parse_from_bytes(&payload[2..]).ok()?;
+    Some(format!("SENSOR_MESSAGE_RESPONSE status={:?}", msg.status()))
+}
+
+pub fn parse_sensor_error_payload(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != SensorMessageId::SENSOR_MESSAGE_ERROR.value() as u16 {
+        return None;
+    }
+    let msg = SensorError::parse_from_bytes(&payload[2..]).ok()?;
+    Some(format!(
+        "SENSOR_MESSAGE_ERROR type={}({}) error={:?}",
+        sensor_type_name(msg.sensor_type().value()),
+        msg.sensor_type().value(),
+        msg.sensor_error_type()
+    ))
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedLocationFix {
+    pub latitude_deg: f64,
+    pub longitude_deg: f64,
+    pub accuracy_m: f64,
+    pub altitude_m: f64,
+    pub speed_mps: f64,
+    pub bearing_deg: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SensorBatchSummary {
+    pub summary: String,
+    pub json_line: String,
+    pub location: Option<DecodedLocationFix>,
+}
+
+pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != SensorMessageId::SENSOR_MESSAGE_BATCH.value() as u16 {
+        return None;
+    }
+    let msg = SensorBatch::parse_from_bytes(&payload[2..]).ok()?;
+    let counts = [
+        (1, "location", msg.location_data.len()),
+        (2, "compass", msg.compass_data.len()),
+        (3, "speed", msg.speed_data.len()),
+        (4, "rpm", msg.rpm_data.len()),
+        (5, "odometer", msg.odometer_data.len()),
+        (6, "fuel", msg.fuel_data.len()),
+        (7, "parking_brake", msg.parking_brake_data.len()),
+        (8, "gear", msg.gear_data.len()),
+        (9, "obdii", msg.diagnostics_data.len()),
+        (10, "night", msg.night_mode_data.len()),
+        (11, "environment", msg.environment_data.len()),
+        (12, "hvac", msg.hvac_data.len()),
+        (13, "driving_status", msg.driving_status_data.len()),
+        (14, "dead_reckoning", msg.dead_reckoning_data.len()),
+        (15, "passenger", msg.passenger_data.len()),
+        (16, "door", msg.door_data.len()),
+        (17, "light", msg.light_data.len()),
+        (18, "tire_pressure", msg.tire_pressure_data.len()),
+        (19, "accelerometer", msg.accelerometer_data.len()),
+        (20, "gyroscope", msg.gyroscope_data.len()),
+        (21, "gps_satellite", msg.gps_satellite_data.len()),
+    ];
+    let populated = counts
+        .iter()
+        .filter(|(_, _, count)| *count > 0)
+        .map(|(ty, name, count)| format!("{}:{}={}", ty, name, count))
+        .collect::<Vec<_>>();
+    if populated.is_empty() {
+        return Some(SensorBatchSummary {
+            summary: "SENSOR_MESSAGE_BATCH empty".to_string(),
+            json_line: "{\"type\":\"sensor_batch\",\"empty\":true}".to_string(),
+            location: None,
+        });
+    }
+
+    let mut details = Vec::new();
+    let mut json_fields = Vec::new();
+    json_fields.push("\"type\":\"sensor_batch\"".to_string());
+
+    let location = msg.location_data.last().map(|loc| {
+        let fix = DecodedLocationFix {
+            latitude_deg: loc.latitude_e7() as f64 / 10_000_000.0,
+            longitude_deg: loc.longitude_e7() as f64 / 10_000_000.0,
+            accuracy_m: loc.accuracy_e3() as f64 / 1000.0,
+            altitude_m: loc.altitude_e2() as f64 / 100.0,
+            speed_mps: loc.speed_e3() as f64 / 1000.0,
+            bearing_deg: loc.bearing_e6() as f64 / 1_000_000.0,
+        };
+        details.push(format!(
+            "location(lat={:.7},lon={:.7},acc_m={:.1},alt_m={:.1},speed_mps={:.2},bearing={:.1})",
+            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
+        ));
+        json_fields.push(format!(
+            "\"location\":{{\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{:.3},\"altitude_m\":{:.2},\"speed_mps\":{:.3},\"bearing_deg\":{:.3}}}",
+            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
+        ));
+        fix
+    });
+    if let Some(speed) = msg.speed_data.last() {
+        details.push(format!("speed_mps={:.2}", speed.speed_e3() as f64 / 1000.0));
+        json_fields.push(format!("\"speed_mps\":{:.3}", speed.speed_e3() as f64 / 1000.0));
+    }
+    if let Some(compass) = msg.compass_data.last() {
+        details.push(format!("compass_bearing={:.1}", compass.bearing_e6() as f64 / 1_000_000.0));
+        json_fields.push(format!("\"compass_bearing_deg\":{:.3}", compass.bearing_e6() as f64 / 1_000_000.0));
+    }
+    if let Some(rpm) = msg.rpm_data.last() {
+        details.push(format!("rpm={:.0}", rpm.rpm_e3() as f64 / 1000.0));
+        json_fields.push(format!("\"rpm\":{:.3}", rpm.rpm_e3() as f64 / 1000.0));
+    }
+    if let Some(odo) = msg.odometer_data.last() {
+        details.push(format!("odometer_km={:.1}", odo.kms_e1() as f64 / 10.0));
+        json_fields.push(format!("\"odometer_km\":{:.1}", odo.kms_e1() as f64 / 10.0));
+    }
+    if let Some(fuel) = msg.fuel_data.last() {
+        details.push(format!("fuel={} range={} low={}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
+        json_fields.push(format!("\"fuel\":{{\"level\":{},\"range\":{},\"low\":{}}}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
+    }
+    if let Some(pb) = msg.parking_brake_data.last() {
+        details.push(format!("parking_brake={}", pb.parking_brake()));
+        json_fields.push(format!("\"parking_brake\":{}", pb.parking_brake()));
+    }
+    if let Some(gear) = msg.gear_data.last() {
+        details.push(format!("gear={:?}", gear.gear()));
+        json_fields.push(format!("\"gear\":\"{:?}\"", gear.gear()));
+    }
+    if let Some(night) = msg.night_mode_data.last() {
+        details.push(format!("night_mode={}", night.night_mode()));
+        json_fields.push(format!("\"night_mode\":{}", night.night_mode()));
+    }
+    if let Some(env) = msg.environment_data.last() {
+        details.push(format!("env_temp_c={:.1}", env.temperature_e3() as f64 / 1000.0));
+        json_fields.push(format!("\"environment\":{{\"temperature_c\":{:.3},\"pressure\":{},\"rain\":{}}}", env.temperature_e3() as f64 / 1000.0, env.pressure_e3(), env.rain()));
+    }
+    if let Some(status) = msg.driving_status_data.last() {
+        details.push(format!("driving_status=0x{:x}", status.status()));
+        json_fields.push(format!("\"driving_status\":{}", status.status()));
+    }
+    if let Some(acc) = msg.accelerometer_data.last() {
+        details.push(format!("accel=({:.3},{:.3},{:.3})", acc.acceleration_x_e3() as f64 / 1000.0, acc.acceleration_y_e3() as f64 / 1000.0, acc.acceleration_z_e3() as f64 / 1000.0));
+        json_fields.push(format!("\"accelerometer\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", acc.acceleration_x_e3() as f64 / 1000.0, acc.acceleration_y_e3() as f64 / 1000.0, acc.acceleration_z_e3() as f64 / 1000.0));
+    }
+    if let Some(gyro) = msg.gyroscope_data.last() {
+        details.push(format!("gyro=({:.3},{:.3},{:.3})", gyro.rotation_speed_x_e3() as f64 / 1000.0, gyro.rotation_speed_y_e3() as f64 / 1000.0, gyro.rotation_speed_z_e3() as f64 / 1000.0));
+        json_fields.push(format!("\"gyroscope\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", gyro.rotation_speed_x_e3() as f64 / 1000.0, gyro.rotation_speed_y_e3() as f64 / 1000.0, gyro.rotation_speed_z_e3() as f64 / 1000.0));
+    }
+    if let Some(sat) = msg.gps_satellite_data.last() {
+        details.push(format!("gps_satellites use={} view={} listed={}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
+        json_fields.push(format!("\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{}}}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
+    }
+
+    Some(SensorBatchSummary {
+        summary: format!(
+            "SENSOR_MESSAGE_BATCH counts=[{}]{}{}",
+            populated.join(","),
+            if details.is_empty() { "" } else { " " },
+            details.join(" ")
+        ),
+        json_line: format!("{{{}}}", json_fields.join(",")),
+        location,
+    })
+}
+
 
 /// Build a MESSAGE_CHANNEL_CLOSE_NOTIFICATION control payload.
 /// Returned bytes include the 2-byte AAP control message id followed by the

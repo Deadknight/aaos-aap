@@ -104,3 +104,38 @@ App-process InputManager injection is no longer treated as the default path. It 
   - `--video-first-frame-kick-wakeup`: sends KEYCODE_WAKEUP (224), lowest UI risk but may not dirty the projection surface on all builds.
   - `--video-first-frame-kick-mode keyevent --video-first-frame-kick-keycode WAKEUP|SEARCH|HOME|...` accepts simple names.
 - Recommended order for testing: `touch-cancel`, then `wakeup`, then edge tap, then center tap only if safe.
+
+## bluetoothaaos park note
+
+- AAP mic receive is solved: MIC_DATA arrives, session_id=0 is accepted, and `--mic-ack-mode delta` keeps HU/DHU flow-control open.
+- Bluetooth call routing is parked under the name `bluetoothaaos`.
+- Current blocker: AAOS Bluetooth HFP client sees `AG_CALL_CHANGED`, then `com.android.bluetooth` crashes in `HfpClientDeviceBlock.handleCall()` because `TelecomManager.addNewUnknownCall()` throws `SecurityException: This PhoneAccountHandle is not registered for this user!`.
+- Follow-up direction for bluetoothaaos: add/enable a proper Telecom `PhoneAccount`/`ConnectionService`/`InCallService` path, or patch Bluetooth `HfpClientConnectionService` so the HFP client account is registered for the active user before unknown-call insertion. HAL restart crashes (`H4Protocol::OnDataReady: Unimplemented packet type`) are likely a secondary restart-chain problem and should be revisited after the Telecom account crash is fixed.
+
+## v42 sensor bridge start
+
+Goal: move from mic to the AAP SensorSource channel and capture all HU-provided sensors up to `SENSOR_GPS_SATELLITE_DATA = 21`, then start forwarding usable data into AAOS.
+
+Implemented in this patch:
+- Parse SensorSourceService from ServiceDiscoveryResponse, including the advertised sensor type list.
+- Add sensor channel open support with `--sensor-open`.
+- Add subscription request support for advertised sensor types `1..21` using generated proto structs:
+  - `SENSOR_MESSAGE_REQUEST = 0x8001`
+  - `SENSOR_MESSAGE_RESPONSE = 0x8002`
+  - `SENSOR_MESSAGE_BATCH = 0x8003`
+  - `SENSOR_MESSAGE_ERROR = 0x8004`
+- Add `--sensor-request-all` default behavior when sensor channel is open.
+- Add automatic request periods unless overridden by `--sensor-period-ms`:
+  - location/compass/gps satellite: 1000ms
+  - speed: 500ms
+  - gear/parking/dead-reckoning/accel/gyro: 500ms
+  - fuel/rpm/odometer/environment/hvac/tire: 10000ms
+  - night/driving/passenger/door/light: 0ms event-driven
+- Decode and log SensorBatch for sensor types 1..21.
+- Add optional JSONL capture for all decoded batches: `--sensor-jsonl /data/local/tmp/arda-sensors.jsonl`.
+- Add first OS-forward path for location: `--sensor-forward-os` uses `cmd location providers set-test-provider-location` with provider `arda_gps` by default. This is intentionally best-effort; if `cmd location` syntax/permission differs on this AAOS image, logs will show the failure and the next step is an app_process LocationManager injector.
+
+Next after test:
+- Verify whether the HU/DHU accepts the batch of sensor requests and which sensors actually stream.
+- If `cmd location` fails, replace shell command forwarding with a small app_process/system LocationManager helper.
+- After GPS/location works, map remaining vehicle sensor data either into AAOS car property/VHAL where available, or keep it on the arda JSON/socket bridge for companion consumers.

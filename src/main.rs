@@ -130,6 +130,9 @@ Commands:
   aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
 
+  aap-session-probe ... --sensor-open [--sensor-max-type 21] [--sensor-jsonl PATH] [--sensor-forward-os]
+      Opens the HU SensorSourceService channel, subscribes to advertised sensor types up to 21, decodes SensorBatch messages, optionally writes JSONL, and best-effort forwards LOCATION to AAOS through cmd location.
+
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
 
@@ -1086,6 +1089,14 @@ struct AapTlsHandshakeProbeArgs {
     mic_ack: bool,
     mic_ack_mode: String,
     mic_max_unacked: u32,
+    sensor_open: bool,
+    sensor_request_all: bool,
+    sensor_max_type: i32,
+    sensor_period_ms: i64,
+    sensor_jsonl_path: Option<PathBuf>,
+    sensor_forward_os: bool,
+    sensor_location_provider: String,
+    sensor_location_min_ms: u64,
     quiet_ping_logs: bool,
     log_level: String,
 }
@@ -1156,6 +1167,14 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         mic_ack: args.mic_ack,
         mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
+        sensor_open: args.sensor_open,
+        sensor_request_all: args.sensor_request_all,
+        sensor_max_type: args.sensor_max_type,
+        sensor_period_ms: args.sensor_period_ms,
+        sensor_jsonl_path: args.sensor_jsonl_path.clone(),
+        sensor_forward_os: args.sensor_forward_os,
+        sensor_location_provider: args.sensor_location_provider.clone(),
+        sensor_location_min_ms: args.sensor_location_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1244,6 +1263,14 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         mic_ack: args.mic_ack,
         mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
+        sensor_open: args.sensor_open,
+        sensor_request_all: args.sensor_request_all,
+        sensor_max_type: args.sensor_max_type,
+        sensor_period_ms: args.sensor_period_ms,
+        sensor_jsonl_path: args.sensor_jsonl_path.clone(),
+        sensor_forward_os: args.sensor_forward_os,
+        sensor_location_provider: args.sensor_location_provider.clone(),
+        sensor_location_min_ms: args.sensor_location_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1323,6 +1350,14 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         mic_ack: args.mic_ack,
         mic_ack_mode: args.mic_ack_mode.clone(),
         mic_max_unacked: args.mic_max_unacked,
+        sensor_open: args.sensor_open,
+        sensor_request_all: args.sensor_request_all,
+        sensor_max_type: args.sensor_max_type,
+        sensor_period_ms: args.sensor_period_ms,
+        sensor_jsonl_path: args.sensor_jsonl_path.clone(),
+        sensor_forward_os: args.sensor_forward_os,
+        sensor_location_provider: args.sensor_location_provider.clone(),
+        sensor_location_min_ms: args.sensor_location_min_ms,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -1432,6 +1467,14 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut mic_ack = true;
     let mut mic_ack_mode = String::from("delta");
     let mut mic_max_unacked: u32 = 8;
+    let mut sensor_open = false;
+    let mut sensor_request_all = true;
+    let mut sensor_max_type: i32 = 21;
+    let mut sensor_period_ms: i64 = -2;
+    let mut sensor_jsonl_path: Option<PathBuf> = None;
+    let mut sensor_forward_os = false;
+    let mut sensor_location_provider = String::from("arda_gps");
+    let mut sensor_location_min_ms: u64 = 1000;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
 
@@ -1900,6 +1943,54 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 mic_open = true;
                 mic_max_unacked = argv.get(i).ok_or("--mic-max-unacked requires 1..4096")?.parse::<u32>()?;
             }
+            "--sensor-open" | "--sensors-open" | "--open-sensors" => {
+                sensor_open = true;
+            }
+            "--no-sensor-open" | "--no-sensors-open" => {
+                sensor_open = false;
+            }
+            "--sensor-request-all" | "--sensors-request-all" | "--sensor-all" => {
+                sensor_open = true;
+                sensor_request_all = true;
+            }
+            "--no-sensor-request-all" | "--no-sensor-all" => {
+                sensor_request_all = false;
+            }
+            "--sensor-max-type" | "--sensors-max-type" => {
+                i += 1;
+                sensor_open = true;
+                sensor_max_type = argv.get(i).ok_or("--sensor-max-type requires 1..21")?.parse::<i32>()?;
+            }
+            "--sensor-period-ms" | "--sensors-period-ms" => {
+                i += 1;
+                sensor_open = true;
+                sensor_period_ms = argv.get(i).ok_or("--sensor-period-ms requires milliseconds, 0 event-driven, -1 stop, -2 auto")?.parse::<i64>()?;
+            }
+            "--sensor-jsonl" | "--sensor-jsonl-path" | "--sensors-jsonl" => {
+                i += 1;
+                sensor_open = true;
+                sensor_jsonl_path = Some(PathBuf::from(argv.get(i).ok_or("--sensor-jsonl requires PATH")?));
+            }
+            "--no-sensor-jsonl" => {
+                sensor_jsonl_path = None;
+            }
+            "--sensor-forward-os" | "--sensors-forward-os" | "--sensor-location-os" => {
+                sensor_open = true;
+                sensor_forward_os = true;
+            }
+            "--no-sensor-forward-os" | "--no-sensor-location-os" => {
+                sensor_forward_os = false;
+            }
+            "--sensor-location-provider" | "--sensor-provider" => {
+                i += 1;
+                sensor_open = true;
+                sensor_location_provider = argv.get(i).ok_or("--sensor-location-provider requires provider name")?.to_string();
+            }
+            "--sensor-location-min-ms" | "--sensor-os-min-ms" => {
+                i += 1;
+                sensor_open = true;
+                sensor_location_min_ms = argv.get(i).ok_or("--sensor-location-min-ms requires milliseconds")?.parse::<u64>()?;
+            }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
             }
@@ -2114,6 +2205,14 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         mic_ack,
         mic_ack_mode,
         mic_max_unacked,
+        sensor_open,
+        sensor_request_all,
+        sensor_max_type,
+        sensor_period_ms,
+        sensor_jsonl_path,
+        sensor_forward_os,
+        sensor_location_provider,
+        sensor_location_min_ms,
         quiet_ping_logs,
         log_level,
     })

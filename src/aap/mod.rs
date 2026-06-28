@@ -1020,6 +1020,14 @@ pub struct TlsHandshakeProbeConfig {
     pub mic_ack: bool,
     pub mic_ack_mode: String,
     pub mic_max_unacked: u32,
+    pub sensor_open: bool,
+    pub sensor_request_all: bool,
+    pub sensor_max_type: i32,
+    pub sensor_period_ms: i64,
+    pub sensor_jsonl_path: Option<PathBuf>,
+    pub sensor_forward_os: bool,
+    pub sensor_location_provider: String,
+    pub sensor_location_min_ms: u64,
     pub quiet_ping_logs: bool,
     pub log_level: String,
 }
@@ -1090,6 +1098,14 @@ impl Default for TlsHandshakeProbeConfig {
             mic_ack: true,
             mic_ack_mode: "delta".to_string(),
             mic_max_unacked: 8,
+            sensor_open: false,
+            sensor_request_all: true,
+            sensor_max_type: 21,
+            sensor_period_ms: -2,
+            sensor_jsonl_path: None,
+            sensor_forward_os: false,
+            sensor_location_provider: "arda_gps".to_string(),
+            sensor_location_min_ms: 1000,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
         }
@@ -1150,6 +1166,86 @@ struct MicSourceChannelState {
     dump_file: Option<File>,
 }
 
+#[derive(Debug)]
+struct SensorChannelState {
+    service_id: i32,
+    channel: u8,
+    sensors: Vec<proto::SensorTypeInfo>,
+    opened: bool,
+    requests_sent: bool,
+    requests_attempted: u64,
+    responses_seen: u64,
+    batches_seen: u64,
+    errors_seen: u64,
+    jsonl_file: Option<File>,
+}
+
+#[derive(Debug)]
+struct SensorOsForwarder {
+    enabled: bool,
+    provider: String,
+    initialized: bool,
+    last_location_push: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl SensorOsForwarder {
+    fn new(config: &TlsHandshakeProbeConfig) -> Self {
+        Self {
+            enabled: config.sensor_forward_os,
+            provider: config.sensor_location_provider.clone(),
+            initialized: false,
+            last_location_push: None,
+            min_interval: Duration::from_millis(config.sensor_location_min_ms),
+        }
+    }
+
+    fn push_location(
+        &mut self,
+        location: &proto::DecodedLocationFix,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_location_push {
+            if now.duration_since(last) < self.min_interval {
+                return Ok(());
+            }
+        }
+        if !self.initialized {
+            let _ = run_location_cmd(&["providers", "add-test-provider", self.provider.as_str()], dump, "SENSOR_OS_INIT add-test-provider");
+            let _ = run_location_cmd(&["providers", "set-test-provider-enabled", self.provider.as_str(), "true"], dump, "SENSOR_OS_INIT enable-provider");
+            self.initialized = true;
+        }
+        let location_arg = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
+        let accuracy_arg = format!("{:.1}", location.accuracy_m.max(1.0));
+        let args = [
+            "providers",
+            "set-test-provider-location",
+            self.provider.as_str(),
+            "--location",
+            location_arg.as_str(),
+            "--accuracy",
+            accuracy_arg.as_str(),
+        ];
+        match run_location_cmd(&args, dump, "SENSOR_OS_LOCATION") {
+            Ok(true) => {
+                self.last_location_push = Some(now);
+            }
+            Ok(false) | Err(_) => {
+                let fallback = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
+                let fallback_args = ["set-location", fallback.as_str()];
+                if run_location_cmd(&fallback_args, dump, "SENSOR_OS_LOCATION fallback").unwrap_or(false) {
+                    self.last_location_push = Some(now);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn audio_stream_matches(filter: &str, stream_type: &str) -> bool {
     let filter = filter.to_ascii_lowercase();
     let stream = stream_type.to_ascii_lowercase();
@@ -1194,6 +1290,79 @@ fn make_mic_dump_file(path: &Option<PathBuf>) -> io::Result<Option<File>> {
         fs::create_dir_all(parent)?;
     }
     Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
+}
+
+fn make_sensor_jsonl_file(path: &Option<PathBuf>) -> io::Result<Option<File>> {
+    let Some(path) = path.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
+}
+
+fn run_location_cmd(
+    args: &[&str],
+    dump: &mut Option<Box<dyn Write>>,
+    label: &str,
+) -> io::Result<bool> {
+    let output = Command::new("/system/bin/cmd").arg("location").args(args).output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().replace('\n', " | ");
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().replace('\n', " | ");
+            let ok = output.status.success();
+            let line = format!(
+                "{} cmd='cmd location {}' status={} stdout='{}' stderr='{}'",
+                label,
+                args.join(" "),
+                output.status,
+                stdout,
+                stderr
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            Ok(ok)
+        }
+        Err(err) => {
+            let line = format!("{} cmd='cmd location {}' failed: {}", label, args.join(" "), err);
+            println!("{line}");
+            log_line(dump, &line)?;
+            Err(err)
+        }
+    }
+}
+
+fn requested_sensor_types(sensor: &SensorChannelState, config: &TlsHandshakeProbeConfig) -> Vec<i32> {
+    if !config.sensor_request_all {
+        return Vec::new();
+    }
+    let mut values = if sensor.sensors.is_empty() {
+        (1..=config.sensor_max_type.max(1)).collect::<Vec<_>>()
+    } else {
+        sensor.sensors.iter().map(|s| s.value).collect::<Vec<_>>()
+    };
+    values.sort_unstable();
+    values.dedup();
+    values
+        .into_iter()
+        .filter(|value| *value >= 1 && *value <= config.sensor_max_type && *value <= 21)
+        .collect()
+}
+
+fn sensor_request_period_ms(sensor_type: i32, config: &TlsHandshakeProbeConfig) -> i64 {
+    if config.sensor_period_ms >= -1 {
+        return config.sensor_period_ms;
+    }
+    match sensor_type {
+        1 | 2 | 21 => 1000,
+        3 => 500,
+        7 | 8 | 14 | 19 | 20 => 500,
+        4 | 5 | 6 | 11 | 12 | 18 => 10_000,
+        10 | 13 | 15 | 16 | 17 => 0,
+        _ => 1000,
+    }
 }
 
 fn audio_cfg_values(cfg: Option<&proto::AudioConfigSelection>) -> (u32, u32, u32) {
@@ -2168,6 +2337,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let video_session_id: i32 = 1;
     let mut audio_output_channels: Vec<AudioOutputChannelState> = Vec::new();
     let mut mic_source_channel: Option<MicSourceChannelState> = None;
+    let mut sensor_channel: Option<SensorChannelState> = None;
+    let mut sensor_os_forwarder = SensorOsForwarder::new(&config);
     let mut audio_capture: Option<AppProcessAudioCapture> = None;
     let mut audio_capture_buffer: Vec<u8> = Vec::new();
     let mut audio_channel_open_requests_sent = 0usize;
@@ -2176,6 +2347,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut mic_channel_open_requests_sent = 0usize;
     let mut mic_data_packets = 0u64;
     let mut mic_data_bytes = 0u64;
+    let mut sensor_channel_open_requests_sent = 0usize;
+    let mut sensor_requests_sent = 0u64;
+    let mut sensor_batches_seen = 0u64;
+    let mut sensor_errors_seen = 0u64;
     let mut video_sender: Option<VideoSender> = if config.video_native {
         Some(VideoSender::Live(VideoLiveSender::new(VideoLiveConfig {
             width: config.video_width,
@@ -2474,6 +2649,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     let input_candidate = summary.input_source.clone();
                     let audio_candidates = summary.audio_media_sinks.clone();
                     let mic_candidate = summary.media_source.clone();
+                    let sensor_candidate = summary.sensor_source.clone();
                     if config.audio_open || config.mic_open {
                         println!(
                             "selected audio candidates={} filter={} media_source={:?}",
@@ -2487,6 +2663,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             config.audio_stream_filter,
                             summary.media_source
                         ))?;
+                    }
+                    if config.sensor_open {
+                        println!("selected sensor source={:?}", sensor_candidate);
+                        log_line(&mut dump, &format!("selected sensor source={:?}", sensor_candidate))?;
                     }
                     if let Some(input) = input_candidate.as_ref() {
                         let touchscreens = input
@@ -2901,6 +3081,63 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             log_line(&mut dump, "MIC_SOURCE_OPEN requested but SDR has no MediaSourceService candidate")?;
                         }
                     }
+                    if config.sensor_open {
+                        if let Some(source) = sensor_candidate.clone() {
+                            let sensor_list = source
+                                .sensors
+                                .iter()
+                                .map(|s| format!("{}({})", s.name, s.value))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let line = format!(
+                                "SENSOR_SOURCE_OPEN selected service_id={} sensors=[{}]",
+                                source.service_id, sensor_list
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+
+                            let jsonl_file = match make_sensor_jsonl_file(&config.sensor_jsonl_path) {
+                                Ok(file) => file,
+                                Err(err) => {
+                                    let line = format!("SENSOR_JSONL open failed: {err}");
+                                    println!("{line}");
+                                    log_line(&mut dump, &line)?;
+                                    None
+                                }
+                            };
+
+                            let control_payload = proto::build_channel_open_request_control_payload(source.service_id, 0)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            let tx_count = write_encrypted_plaintext_fragmented_with_flags(
+                                &mut stream,
+                                &mut tls,
+                                source.service_id as u8,
+                                FLAG_CONTROL,
+                                &control_payload,
+                                &mut dump,
+                                "SENSOR_CHANNEL_OPEN_REQUEST",
+                            )?;
+                            tx_ssl_frames += tx_count;
+                            sensor_channel_open_requests_sent += 1;
+                            println!("tx encrypted SENSOR_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={}", source.service_id as u8, source.service_id);
+                            log_line(&mut dump, &format!("tx encrypted SENSOR_CHANNEL_OPEN_REQUEST frame(s): count={tx_count} channel=0x{:02x} service_id={}", source.service_id as u8, source.service_id))?;
+                            sensor_channel = Some(SensorChannelState {
+                                service_id: source.service_id,
+                                channel: source.service_id as u8,
+                                sensors: source.sensors,
+                                opened: false,
+                                requests_sent: false,
+                                requests_attempted: 0,
+                                responses_seen: 0,
+                                batches_seen: 0,
+                                errors_seen: 0,
+                                jsonl_file,
+                            });
+                        } else {
+                            println!("SENSOR_OPEN requested but SDR has no SensorSourceService candidate");
+                            log_line(&mut dump, "SENSOR_OPEN requested but SDR has no SensorSourceService candidate")?;
+                        }
+                    }
                 }
             }
 
@@ -2924,6 +3161,41 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     mic.opened = true;
                     println!("MIC_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", mic.service_id);
                     log_line(&mut dump, &format!("MIC_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", mic.service_id))?;
+                }
+                if let Some(sensor) = sensor_channel.as_mut().filter(|sensor| sensor.channel == frame.channel) {
+                    sensor.opened = true;
+                    println!("SENSOR_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", sensor.service_id);
+                    log_line(&mut dump, &format!("SENSOR_CHANNEL_OPEN_RESPONSE observed service_id={} opened=true", sensor.service_id))?;
+                }
+            }
+
+            if let Some(sensor) = sensor_channel.as_mut().filter(|sensor| sensor.opened && !sensor.requests_sent) {
+                let requested_types = requested_sensor_types(sensor, &config);
+                if requested_types.is_empty() {
+                    let line = "SENSOR_REQUEST skipped: no advertised/requestable sensor types <= configured max";
+                    println!("{line}");
+                    log_line(&mut dump, line)?;
+                    sensor.requests_sent = true;
+                } else {
+                    for sensor_type in requested_types {
+                        let period = sensor_request_period_ms(sensor_type, &config);
+                        let (sensor_payload, summary) = proto::build_sensor_request_payload(sensor_type, period)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let tx_count = write_encrypted_plaintext_fragmented(
+                            &mut stream,
+                            &mut tls,
+                            sensor.channel,
+                            &sensor_payload,
+                            &mut dump,
+                            "SENSOR_MESSAGE_REQUEST",
+                        )?;
+                        tx_ssl_frames += tx_count;
+                        sensor.requests_attempted += 1;
+                        sensor_requests_sent += 1;
+                        println!("tx encrypted {summary} frame(s): count={tx_count} channel=0x{:02x}", sensor.channel);
+                        log_line(&mut dump, &format!("tx encrypted {summary} frame(s): count={tx_count} channel=0x{:02x}", sensor.channel))?;
+                    }
+                    sensor.requests_sent = true;
                 }
             }
 
@@ -3424,6 +3696,32 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
 
+            if let Some(sensor) = sensor_channel.as_mut().filter(|sensor| sensor.opened && sensor.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
+                if let Some(summary) = proto::parse_sensor_response_payload(&plaintext) {
+                    sensor.responses_seen += 1;
+                    println!("SENSOR_RESPONSE observed service_id={} {summary}", sensor.service_id);
+                    log_line(&mut dump, &format!("SENSOR_RESPONSE observed service_id={} {summary}", sensor.service_id))?;
+                }
+                if let Some(summary) = proto::parse_sensor_error_payload(&plaintext) {
+                    sensor.errors_seen += 1;
+                    sensor_errors_seen += 1;
+                    println!("SENSOR_ERROR observed service_id={} {summary}", sensor.service_id);
+                    log_line(&mut dump, &format!("SENSOR_ERROR observed service_id={} {summary}", sensor.service_id))?;
+                }
+                if let Some(batch) = proto::parse_sensor_batch_payload(&plaintext) {
+                    sensor.batches_seen += 1;
+                    sensor_batches_seen += 1;
+                    println!("SENSOR_BATCH observed service_id={} batch={} {}", sensor.service_id, sensor.batches_seen, batch.summary);
+                    log_line(&mut dump, &format!("SENSOR_BATCH observed service_id={} batch={} {}", sensor.service_id, sensor.batches_seen, batch.summary))?;
+                    if let Some(file) = sensor.jsonl_file.as_mut() {
+                        writeln!(file, "{}", batch.json_line)?;
+                    }
+                    if let Some(location) = batch.location.as_ref() {
+                        sensor_os_forwarder.push_location(location, &mut dump)?;
+                    }
+                }
+            }
+
             if let Some(index) = audio_output_channels.iter().position(|audio| audio.opened && !audio.setup_sent) {
                 let channel = audio_output_channels[index].channel;
                 let (media_payload, summary) = proto::build_audio_pcm_media_setup_payload()
@@ -3758,19 +4056,21 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     }
 
     let cleanup_reason = if session_shutdown_requested() { "signal" } else { "session-end" };
-    println!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={}",
+    println!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={} sensor_opened={}",
         cleanup_reason,
         video_channel_opened,
         input_channel_opened,
         audio_output_channels.iter().filter(|audio| audio.opened).count(),
-        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false)
+        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false),
+        sensor_channel.as_ref().map(|sensor| sensor.opened).unwrap_or(false)
     );
-    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={}",
+    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={} sensor_opened={}",
         cleanup_reason,
         video_channel_opened,
         input_channel_opened,
         audio_output_channels.iter().filter(|audio| audio.opened).count(),
-        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false)
+        mic_source_channel.as_ref().map(|mic| mic.opened).unwrap_or(false),
+        sensor_channel.as_ref().map(|sensor| sensor.opened).unwrap_or(false)
     ));
 
     if let Some(mic) = mic_source_channel.as_mut() {
@@ -3807,6 +4107,19 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     }
 
     if let Ok(payload) = proto::build_channel_close_notification_control_payload() {
+        if let Some(sensor) = sensor_channel.as_ref().filter(|sensor| sensor.opened) {
+            match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, sensor.channel, &payload, &mut dump, "SENSOR_CHANNEL_CLOSE_NOTIFICATION") {
+                Ok(count) => {
+                    tx_ssl_frames += count;
+                    println!("SESSION_CLEANUP tx encrypted SENSOR_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x} service_id={}", count, sensor.channel, sensor.service_id);
+                    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP tx encrypted SENSOR_CHANNEL_CLOSE_NOTIFICATION frame(s): count={} channel=0x{:02x} service_id={}", count, sensor.channel, sensor.service_id));
+                }
+                Err(err) => {
+                    println!("SESSION_CLEANUP sensor channel close failed channel=0x{:02x}: {}", sensor.channel, err);
+                    let _ = log_line(&mut dump, &format!("SESSION_CLEANUP sensor channel close failed channel=0x{:02x}: {}", sensor.channel, err));
+                }
+            }
+        }
         for audio in audio_output_channels.iter().filter(|audio| audio.opened) {
             match write_encrypted_plaintext_fragmented(&mut stream, &mut tls, audio.channel, &payload, &mut dump, "AUDIO_CHANNEL_CLOSE_NOTIFICATION") {
                 Ok(count) => {
@@ -3878,8 +4191,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let elapsed = started.elapsed();
     let audio_tx_packets: u64 = audio_output_channels.iter().map(|audio| audio.tx_packets).sum();
     let audio_tx_bytes: u64 = audio_output_channels.iter().map(|audio| audio.tx_bytes).sum();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), elapsed.as_millis()))?;
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis()))?;
     Ok(())
 }
 

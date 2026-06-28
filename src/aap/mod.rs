@@ -73,6 +73,7 @@ const SIGTERM: c_int = 15;
 
 unsafe extern "C" {
     fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 extern "C" fn handle_session_signal(_signum: c_int) {
@@ -5165,8 +5166,7 @@ impl VideoLiveSender {
         log_line(dump, &line)?;
 
         thread::sleep(Duration::from_millis(prewarm_ms));
-        let _ = child.kill();
-        let _ = child.wait();
+        Self::terminate_native_capture_child(&mut child, Duration::from_millis(1500));
         self.prewarm_done = true;
 
         let elapsed_ms = start.elapsed().as_millis();
@@ -5323,7 +5323,7 @@ fi
         }
 
         let Some(mut stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            Self::terminate_native_capture_child(&mut child, Duration::from_millis(1500));
             return Err(io::Error::new(io::ErrorKind::Other, "native-capture child stdout missing"));
         };
 
@@ -5421,8 +5421,7 @@ fi
         log_line(dump, &line)?;
 
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            Self::terminate_native_capture_child(child, Duration::from_millis(1500));
         }
         self.child = None;
         self.rx = None;
@@ -5609,10 +5608,37 @@ fi
         Ok(tx_frames)
     }
 
+    fn terminate_native_capture_child(child: &mut Child, graceful_timeout: Duration) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+
+        // std::process::Child::kill() is SIGKILL on Android/Linux.  SIGKILL
+        // tears down the native virtual-display capture without running its
+        // destroyDisplay / MediaCodec cleanup path, which can leave
+        // SurfaceFlinger/BufferQueue in a bad state for the next session.
+        // Ask the child to exit first; only fall back to SIGKILL if it does not
+        // finish promptly.
+        unsafe {
+            let _ = kill(child.id() as c_int, SIGTERM);
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < graceful_timeout {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(40)),
+                Err(_) => break,
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     fn stop_child(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            Self::terminate_native_capture_child(child, Duration::from_millis(2500));
         }
         self.child = None;
         self.ended = true;

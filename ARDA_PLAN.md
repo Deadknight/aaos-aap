@@ -198,3 +198,24 @@ Implemented in this patch:
 
 Compatibility note:
 - Treat this as an ARDA Raspberry Pi 4 AAOS image patch, not a universal AAOS patch. Other images may need a different UDC name, a different partition layout, or a kernel with missing accessory gadget support.
+
+## v45 native capture graceful teardown
+
+Goal: stop repeated AAP sessions from leaving native virtual-display / MediaCodec state half-torn-down on AAOS.
+
+Observation from tests:
+- Second run could freeze the physical monitor and DHU for ~20-30s even though the internal AA video timer later showed a fast first encoded frame.
+- Logcat around repeated native capture showed `BufferQueue has been abandoned`, `CompositionEngine ... arda-native-display-capture ... dequeueBuffer failed`, and `v3d_bo_from_cache(): wait failed: EINVAL`, which points at the native virtual-display capture being killed before its cleanup path ran.
+
+Implemented:
+- Do not use immediate `Child::kill()` for the live native-capture process during normal session cleanup or first-frame retry.
+- Send SIGTERM first and wait briefly, falling back to SIGKILL only if the child does not exit.
+- Add SIGTERM/SIGINT/SIGHUP handling inside native display capture:
+  - the native-capture parent forwards the signal to the forked display-capture child,
+  - the child exits its drain loop cleanly,
+  - `destroyDisplay`, `signalEndOfInputStream`, output close, and private handle cleanup still run.
+- Shorten EOS wait on requested stop so Ctrl-C/session-end does not hang for a long time.
+
+Next after test:
+- Repeat three back-to-back runs and check for `stop requested: leaving drain loop for graceful cleanup` and `destroyDisplay: OK` in `/data/local/tmp/arda-display-capture-test.log`.
+- If the monitor still freezes, add an even safer mode that stops live video by sending AA channel-close before stopping native capture and/or disables first-frame retry hard restarts.

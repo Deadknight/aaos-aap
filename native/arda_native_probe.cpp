@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -19,6 +20,28 @@
 #endif
 
 namespace {
+
+#if defined(__ANDROID__)
+volatile sig_atomic_t g_native_capture_stop_requested = 0;
+volatile sig_atomic_t g_native_capture_child_pid = -1;
+
+void native_capture_signal_handler(int signum) {
+    g_native_capture_stop_requested = 1;
+    pid_t child = static_cast<pid_t>(g_native_capture_child_pid);
+    if (child > 0) {
+        // Async-signal-safe.  The native-capture parent forwards TERM/INT to
+        // the forked display-capture child so the child can destroy the virtual
+        // display and close MediaCodec cleanly.
+        kill(child, signum);
+    }
+}
+
+void install_native_capture_signal_handlers() {
+    signal(SIGTERM, native_capture_signal_handler);
+    signal(SIGINT, native_capture_signal_handler);
+    signal(SIGHUP, native_capture_signal_handler);
+}
+#endif
 
 struct Buffer {
     char* data;
@@ -1053,8 +1076,12 @@ int native_display_capture_test_android_child(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture child v13-native-capture\n");
-    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture child v13-native-capture\n");
+    g_native_capture_stop_requested = 0;
+    g_native_capture_child_pid = -1;
+    install_native_capture_signal_handlers();
+
+    append(report, "arda native display capture child v14-graceful-stop\n");
+    log_file_append_path(kDisplayCaptureLogPath, "arda native display capture child v14-graceful-stop\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "size=%dx%d bit_rate=%d fps=%d seconds=%d\n", width, height, bit_rate, fps, seconds);
     append(report, "out=%s\n\n", out_path ? out_path : "(null)");
@@ -1289,13 +1316,19 @@ int native_display_capture_test_android_child(
     int key_buffers = 0;
     const int drain_loops = run_forever ? -1 : fps * seconds * 4;
     for (int i = 0; run_forever || i < drain_loops; i++) {
+        if (g_native_capture_stop_requested) {
+            append(report, "stop requested: leaving drain loop for graceful cleanup\n");
+            log_file_append_path(kDisplayCaptureLogPath, "stop requested: leaving drain loop for graceful cleanup\n");
+            break;
+        }
         int drain_status = drain_codec_output_to_file(
             owner.codec, out, report, false, &output_eos_seen,
             &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
         );
         if (drain_status != 0) {
-            close_output_stream(out);
-            return -14;
+            append(report, "drain failed status=%d; continuing to display/codec cleanup\n", drain_status);
+            log_file_append_path(kDisplayCaptureLogPath, "drain failed status=%d; continuing to display/codec cleanup\n", drain_status);
+            break;
         }
         struct timespec ts;
         ts.tv_sec = 0;
@@ -1314,7 +1347,8 @@ int native_display_capture_test_android_child(
     if (st == AMEDIA_OK) {
         append(report, "signalEndOfInputStream: OK\n");
         int wait_loops = 0;
-        while (!output_eos_seen && wait_loops < 200) {
+        const int max_eos_wait_loops = g_native_capture_stop_requested ? 12 : 200;
+        while (!output_eos_seen && wait_loops < max_eos_wait_loops) {
             int drain_status = drain_codec_output_to_file(
                 owner.codec, out, report, true, &output_eos_seen,
                 &output_buffers, &codec_config_buffers, &key_buffers, &encoded_bytes
@@ -1363,11 +1397,14 @@ int native_display_capture_test_android(
     int seconds,
     Buffer* report
 ) {
-    append(report, "arda native display capture parent v13-native-capture\n");
+    append(report, "arda native display capture parent v14-graceful-stop\n");
     append(report, "pid=%ld uid=%ld euid=%ld\n", static_cast<long>(getpid()), static_cast<long>(getuid()), static_cast<long>(geteuid()));
     append(report, "child_log=%s\n\n", kDisplayCaptureLogPath);
 
     log_file_reset_path(kDisplayCaptureLogPath);
+    g_native_capture_stop_requested = 0;
+    g_native_capture_child_pid = -1;
+    install_native_capture_signal_handlers();
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -1376,6 +1413,7 @@ int native_display_capture_test_android(
     }
 
     if (pid == 0) {
+        g_native_capture_child_pid = -1;
         char child_buf[64 * 1024];
         child_buf[0] = '\0';
         Buffer child_report{child_buf, sizeof(child_buf), 0};
@@ -1385,14 +1423,26 @@ int native_display_capture_test_android(
         _exit(rc == 0 ? 0 : 100);
     }
 
+    g_native_capture_child_pid = pid;
+
     int status = 0;
-    pid_t waited = waitpid(pid, &status, 0);
-    if (waited < 0) {
+    pid_t waited = -1;
+    while (true) {
+        waited = waitpid(pid, &status, 0);
+        if (waited >= 0) break;
+        if (errno == EINTR) {
+            if (g_native_capture_stop_requested) {
+                kill(pid, SIGTERM);
+            }
+            continue;
+        }
         append(report, "waitpid: FAIL errno=%d %s\n", errno, strerror(errno));
         append(report, "\nchild log so far:\n");
         append_file_to_report(report, kDisplayCaptureLogPath);
+        g_native_capture_child_pid = -1;
         return -61;
     }
+    g_native_capture_child_pid = -1;
 
     append(report, "child_status_raw=%d\n", status);
     if (WIFEXITED(status)) {

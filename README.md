@@ -253,3 +253,16 @@ adb shell su -c '/vendor/bin/arda-senderd aap-session-probe --addr 0.0.0.0:5277 
 ```
 
 This is intended for the ARDA Raspberry Pi 4 AAOS image family, not arbitrary AAOS builds. Other images still need kernel/configfs support for `dwc2`, `accessory.usb0`, and `/proc/misc` `usb_accessory`.
+
+
+## v46 AAOS Google Maps Automotive notes
+
+Adds documentation for the recovery-less Google Maps Automotive / GApps experiment on the ARDA Raspberry Pi 4 AAOS image:
+
+```text
+docs/AAOS_GOOGLE_MAPS_AUTOMOTIVE.md
+```
+
+Key result: Google Maps Automotive became usable only after keeping GMS/GSF enabled and adding explicit Dalvik heap settings to `/system/build.prop`. Before the heap fix, Maps was clamped around 16 MB Java heap and spammed blocking GC; after tuning, Maps CPU dropped to a reasonable startup load and the UI became responsive enough to open Maps settings/location.
+
+The doc also records external push/download links for the tested MindTheGapps Android 11 ARM64 package and Google Maps Automotive APKMirror package, plus the exact push/install/rescue commands.

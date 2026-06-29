@@ -8,9 +8,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::fs as unix_fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use capture::screenrecord::{ScreenrecordConfig, ScreenrecordSource};
@@ -170,29 +170,48 @@ struct AaosAoaGadgetArgs {
     no_bind: bool,
     check: bool,
     unbind: bool,
+    quiet: bool,
 }
 
 fn aaos_aoa_gadget(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_aaos_aoa_gadget_args(argv)?;
+    let args = parse_aaos_aoa_gadget_args(argv.clone())?;
     let gadget_path = format!("/config/usb_gadget/{}", args.name);
 
     if args.check {
         return print_aoa_gadget_status(&gadget_path);
     }
 
-    if args.unbind {
-        write_configfs_text_ignore(format!("{gadget_path}/UDC"), "\n");
-        println!("aaos-aoa-gadget: unbound {gadget_path}");
+    if !is_effective_root() {
+        let mut root_argv = argv;
+        if !args.quiet && !root_argv.iter().any(|arg| arg == "--quiet") {
+            root_argv.push("--quiet".to_string());
+        }
+        run_aaos_aoa_gadget_as_root(&root_argv)?;
+        if args.quiet {
+            return Ok(());
+        }
         return print_aoa_gadget_status(&gadget_path);
     }
 
-    let status = ensure_aaos_aoa_gadget(&args)?;
-    if status.changed {
-        eprintln!("aaos-aoa-gadget: configured and bound to {}", status.bound_udc.as_deref().unwrap_or("<none>"));
-    } else {
-        eprintln!("aaos-aoa-gadget: already configured; no changes needed");
+    if args.unbind {
+        write_configfs_text_ignore(format!("{gadget_path}/UDC"), "\n");
+        if !args.quiet {
+            println!("aaos-aoa-gadget: unbound {gadget_path}");
+            return print_aoa_gadget_status(&gadget_path);
+        }
+        return Ok(());
     }
-    print_aoa_gadget_status(&gadget_path)
+
+    let status = ensure_aaos_aoa_gadget(&args)?;
+    if !args.quiet {
+        if status.changed {
+            eprintln!("aaos-aoa-gadget: configured and bound to {}", status.bound_udc.as_deref().unwrap_or("<none>"));
+        } else {
+            eprintln!("aaos-aoa-gadget: already configured; no changes needed");
+        }
+        print_aoa_gadget_status(&gadget_path)?;
+    }
+    Ok(())
 }
 
 fn default_aaos_aoa_gadget_args() -> AaosAoaGadgetArgs {
@@ -209,6 +228,7 @@ fn default_aaos_aoa_gadget_args() -> AaosAoaGadgetArgs {
         no_bind: false,
         check: false,
         unbind: false,
+        quiet: false,
     }
 }
 
@@ -257,9 +277,10 @@ fn parse_aaos_aoa_gadget_args(argv: Vec<String>) -> Result<AaosAoaGadgetArgs, Bo
             "--no-bind" => args.no_bind = true,
             "--check" => args.check = true,
             "--unbind" => args.unbind = true,
+            "--quiet" => args.quiet = true,
             "--help" | "-h" => {
                 println!(
-                    "aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--vendor-id 0x18D1] [--product-id 0x2D00] [--serial arda-aaos] [--manufacturer aa-proxy] [--product 'AAOS AOA'] [--max-power 500] [--no-bind] [--check] [--unbind]"
+                    "aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--vendor-id 0x18D1] [--product-id 0x2D00] [--serial arda-aaos] [--manufacturer aa-proxy] [--product 'AAOS AOA'] [--max-power 500] [--no-bind] [--check] [--unbind] [--quiet]"
                 );
                 std::process::exit(0);
             }
@@ -290,7 +311,7 @@ fn auto_ensure_aaos_aoa_gadget_for_command(cmd: &str) {
     let mut args = default_aaos_aoa_gadget_args();
     args.wait_ms = 2_000;
 
-    match ensure_aaos_aoa_gadget(&args) {
+    match ensure_aaos_aoa_gadget_maybe_root(&args) {
         Ok(status) if status.changed => {
             eprintln!(
                 "arda aaos-aoa: auto-configured USB accessory gadget on {}",
@@ -330,9 +351,143 @@ fn env_flag_disabled(name: &str) -> bool {
     }
 }
 
+fn ensure_aaos_aoa_gadget_maybe_root(args: &AaosAoaGadgetArgs) -> Result<AoaGadgetStatus, Box<dyn std::error::Error>> {
+    let mut effective_args = args.clone();
+    if effective_args.udc.is_none() {
+        effective_args.udc = Some(wait_for_udc(Duration::from_millis(effective_args.wait_ms))?);
+    }
+
+    let udc = effective_args.udc.as_deref().unwrap_or_default();
+    let gadget_path = format!("/config/usb_gadget/{}", effective_args.name);
+    let needs_root_fix = !aaos_aoa_gadget_ready(&gadget_path, udc) || !usb_accessory_node_permissions_ok();
+
+    if needs_root_fix && !is_effective_root() {
+        let root_argv = aoa_gadget_args_to_argv(&effective_args, true);
+        run_aaos_aoa_gadget_as_root(&root_argv)?;
+        return Ok(AoaGadgetStatus {
+            changed: true,
+            bound_udc: read_trim(format!("{gadget_path}/UDC")),
+        });
+    }
+
+    ensure_aaos_aoa_gadget(&effective_args)
+}
+
+fn aoa_gadget_args_to_argv(args: &AaosAoaGadgetArgs, quiet: bool) -> Vec<String> {
+    let mut argv = vec![
+        "--name".to_string(),
+        args.name.clone(),
+        "--wait-ms".to_string(),
+        args.wait_ms.to_string(),
+        "--vendor-id".to_string(),
+        args.vendor_id.clone(),
+        "--product-id".to_string(),
+        args.product_id.clone(),
+        "--serial".to_string(),
+        args.serial.clone(),
+        "--manufacturer".to_string(),
+        args.manufacturer.clone(),
+        "--product".to_string(),
+        args.product.clone(),
+        "--max-power".to_string(),
+        args.max_power.to_string(),
+    ];
+    if let Some(udc) = &args.udc {
+        argv.push("--udc".to_string());
+        argv.push(udc.clone());
+    }
+    if args.no_bind {
+        argv.push("--no-bind".to_string());
+    }
+    if args.unbind {
+        argv.push("--unbind".to_string());
+    }
+    if quiet || args.quiet {
+        argv.push("--quiet".to_string());
+    }
+    argv
+}
+
+fn run_aaos_aoa_gadget_as_root(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let exe = env::current_exe()
+        .ok()
+        .or_else(|| env::args().next().map(PathBuf::from))
+        .ok_or("cannot resolve arda-senderd path for root re-exec")?;
+    let exe_s = exe.to_string_lossy();
+    let mut parts = vec![shell_quote(exe_s.as_ref()), "aaos-aoa-gadget".to_string()];
+    parts.extend(argv.iter().map(|arg| shell_quote(arg)));
+    let command_line = parts.join(" ");
+
+    let output = Command::new("su")
+        .args(["-c", command_line.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "root aaos-aoa-gadget failed: status={} stdout='{}' stderr='{}'",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn is_effective_root() -> bool {
+    effective_uid().map(|uid| uid == 0).unwrap_or(false)
+}
+
+fn effective_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            let _real = parts.next()?;
+            let effective = parts.next()?;
+            return effective.parse().ok();
+        }
+    }
+    None
+}
+
+fn ensure_configfs_usb_gadget_mounted() -> Result<(), Box<dyn std::error::Error>> {
+    if Path::new("/config/usb_gadget").exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all("/config")?;
+    run_command_ignore("mount", &["-t", "configfs", "configfs", "/config"]);
+
+    if Path::new("/config/usb_gadget").exists() {
+        Ok(())
+    } else {
+        Err("configfs is not mounted at /config or /config/usb_gadget is unavailable".into())
+    }
+}
+
 fn ensure_aaos_aoa_gadget(args: &AaosAoaGadgetArgs) -> Result<AoaGadgetStatus, Box<dyn std::error::Error>> {
-    run_command_ignore("mount", &["-t", "configfs", "none", "/config"]);
-    fs::create_dir_all("/config/usb_gadget")?;
+    ensure_configfs_usb_gadget_mounted()?;
 
     let gadget_path = format!("/config/usb_gadget/{}", args.name);
     let udc = match args.udc.clone() {
@@ -452,7 +607,20 @@ fn remove_file_ignore<P: AsRef<Path>>(path: P) {
 }
 
 fn run_command_ignore(program: &str, args: &[&str]) {
-    let _ = Command::new(program).args(args).status();
+    let _ = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn usb_accessory_node_permissions_ok() -> bool {
+    let Ok(meta) = fs::metadata("/dev/usb_accessory") else {
+        return false;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    meta.uid() == 0 && mode == 0o660
 }
 
 fn ensure_usb_accessory_node() -> Result<(), Box<dyn std::error::Error>> {

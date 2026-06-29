@@ -219,3 +219,25 @@ Implemented:
 Next after test:
 - Repeat three back-to-back runs and check for `stop requested: leaving drain loop for graceful cleanup` and `destroyDisplay: OK` in `/data/local/tmp/arda-display-capture-test.log`.
 - If the monitor still freezes, add an even safer mode that stops live video by sending AA channel-close before stopping native capture and/or disables first-frame retry hard restarts.
+
+## v46 AOA preflight root elevation
+
+Goal: keep normal `aap-session-probe` runs clean by doing the USB accessory/configfs preflight as root instead of trying privileged file operations as the shell user.
+
+Observation from test:
+- `aap-session-probe` auto-preflight ran as `shell` and printed:
+  - `mount: bad /etc/fstab: No such file or directory`
+  - `chown: '/dev/usb_accessory' to 'root:usb': Operation not permitted`
+  - `chmod: chmod '/dev/usb_accessory' to 20660: Operation not permitted`
+- The session still worked, but those errors are noisy and could hide real setup failures.
+
+Implemented:
+- Auto AOA preflight now checks whether the gadget is ready and whether `/dev/usb_accessory` has root-owned `0660` permissions.
+- If a fix is needed and the current process is not root, it re-runs only the `aaos-aoa-gadget` setup through `su -c ... --quiet`.
+- Manual `aaos-aoa-gadget` / `usb-gadget-aoa` also self-elevates through `su -c` when called from a non-root shell, while `--check` remains a read-only status command.
+- Configfs mount now avoids the Android `mount`/fstab noise when `/config/usb_gadget` already exists, and uses `mount -t configfs configfs /config` only if needed.
+- Best-effort helper commands (`mount`, `mknod`, `chown`, `chmod`) no longer inherit stdout/stderr, so expected no-op failures do not pollute the AAP session log.
+
+Next after test:
+- Run `aap-session-probe` from the normal `adb shell` path and verify the old mount/chown/chmod permission lines are gone.
+- Confirm `aaos-aoa-gadget --check` still prints status without requiring root.

@@ -213,6 +213,14 @@ adb shell su
 /vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
 ```
 
+From a non-root `adb shell`, the manual setup command now self-elevates with `su -c` when it needs to change configfs or `/dev/usb_accessory`:
+
+```bash
+/vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
+```
+
+If the process is not root and the gadget/dev node needs changes, ARDA re-runs only the `aaos-aoa-gadget` preflight through `su -c ... --quiet`, so normal `aap-session-probe` logs should not contain shell-user `mount`/`chown`/`chmod` permission noise.
+
 The auto preflight/manual command creates and binds:
 
 ```text

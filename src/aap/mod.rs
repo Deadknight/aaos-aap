@@ -1,21 +1,21 @@
-//! Minimal AAP/TCP transport probes.
+//! ARDA Android Auto Projection (AAP) transport/session implementation.
 //!
-//! This is not Android Auto protocol yet. It is the first network transport
-//! scaffold: bind a TCP port on AAOS, accept a client, and capture whatever
-//! bytes arrive so the next step can implement the actual message framing and
-//! service negotiation.
+//! The full session can use either the historical TCP debug listener or the
+//! AAOS device-side Android Open Accessory character device exposed by the
+//! platform USB gadget (`/dev/usb_accessory`).
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_long};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, atomic::{AtomicBool, AtomicU8, Ordering}};
+use std::sync::{mpsc, Arc, atomic::{AtomicBool, AtomicU8, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::capture::screenrecord::preferred_codec_name;
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
 use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, TouchInjectAction, TouchInjector};
 
@@ -66,19 +66,29 @@ fn session_log_format(dump: &mut Option<Box<dyn Write>>, min_level: u8, line: St
 }
 
 
+
 const SIGHUP: c_int = 1;
 const SIGINT: c_int = 2;
 const SIGQUIT: c_int = 3;
+const SIGUSR1: c_int = 10;
 const SIGTERM: c_int = 15;
+const USB_ACCESSORY_BULK_BUFFER_SIZE: usize = 16 * 1024;
+
+type PthreadT = c_long;
 
 unsafe extern "C" {
     fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn siginterrupt(signum: c_int, flag: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn pthread_self() -> PthreadT;
+    fn pthread_kill(thread: PthreadT, sig: c_int) -> c_int;
 }
 
 extern "C" fn handle_session_signal(_signum: c_int) {
     SESSION_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
+
+extern "C" fn handle_usb_reader_interrupt(_signum: c_int) {}
 
 fn install_session_signal_handlers() {
     SESSION_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
@@ -88,6 +98,16 @@ fn install_session_signal_handlers() {
         let _ = signal(SIGQUIT, handle_session_signal);
         let _ = signal(SIGTERM, handle_session_signal);
     }
+}
+
+fn install_usb_reader_interrupt_handler() -> io::Result<()> {
+    unsafe {
+        let _ = signal(SIGUSR1, handle_usb_reader_interrupt);
+        if siginterrupt(SIGUSR1, 1) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn session_shutdown_requested() -> bool {
@@ -101,6 +121,276 @@ fn request_session_shutdown() {
 pub mod proto;
 mod fragment;
 mod tls;
+
+#[derive(Debug)]
+enum UsbReadEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(io::Error),
+}
+
+#[derive(Debug)]
+struct UsbAccessoryStream {
+    file: File,
+    read_timeout: Option<Duration>,
+    read_rx: mpsc::Receiver<UsbReadEvent>,
+    read_pending: Vec<u8>,
+    read_pending_offset: usize,
+    reader_stop: Arc<AtomicBool>,
+    reader_pthread: PthreadT,
+    reader_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UsbAccessoryStream {
+    fn open(path: &PathBuf) -> io::Result<Self> {
+        install_usb_reader_interrupt_handler()?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("cannot open USB accessory {} read/write: {err}", path.display()),
+                )
+            })?;
+        let mut reader_file = file.try_clone().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot clone USB accessory fd {} for reader: {err}", path.display()),
+            )
+        })?;
+
+        let (read_tx, read_rx) = mpsc::channel::<UsbReadEvent>();
+        let (tid_tx, tid_rx) = mpsc::sync_channel::<PthreadT>(1);
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let reader_stop_thread = Arc::clone(&reader_stop);
+
+        let reader_thread = thread::Builder::new()
+            .name("arda-usb-rx".to_string())
+            .spawn(move || {
+                let tid = unsafe { pthread_self() };
+                if tid_tx.send(tid).is_err() {
+                    return;
+                }
+
+                let mut buf = vec![0u8; USB_ACCESSORY_BULK_BUFFER_SIZE];
+                loop {
+                    if reader_stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match reader_file.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = read_tx.send(UsbReadEvent::Eof);
+                            break;
+                        }
+                        Ok(size) => {
+                            if read_tx.send(UsbReadEvent::Data(buf[..size].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                            if reader_stop_thread.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = read_tx.send(UsbReadEvent::Error(err));
+                            break;
+                        }
+                    }
+                }
+            })?;
+
+        let reader_pthread = tid_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "USB accessory reader thread exited before publishing pthread id",
+            )
+        })?;
+
+        Ok(Self {
+            file,
+            read_timeout: None,
+            read_rx,
+            read_pending: Vec::new(),
+            read_pending_offset: 0,
+            reader_stop,
+            reader_pthread,
+            reader_thread: Some(reader_thread),
+        })
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    fn next_read_event(&self) -> io::Result<UsbReadEvent> {
+        match self.read_timeout {
+            Some(timeout) => match self.read_rx.recv_timeout(timeout) {
+                Ok(event) => Ok(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "USB accessory read timed out",
+                )),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "USB accessory reader thread disconnected",
+                )),
+            },
+            None => self.read_rx.recv().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "USB accessory reader thread disconnected",
+                )
+            }),
+        }
+    }
+
+    fn copy_pending(&mut self, buf: &mut [u8]) -> usize {
+        let available = self.read_pending.len().saturating_sub(self.read_pending_offset);
+        let size = available.min(buf.len());
+        buf[..size].copy_from_slice(
+            &self.read_pending[self.read_pending_offset..self.read_pending_offset + size],
+        );
+        self.read_pending_offset += size;
+        if self.read_pending_offset == self.read_pending.len() {
+            self.read_pending.clear();
+            self.read_pending_offset = 0;
+        }
+        size
+    }
+
+    fn stop_reader(&mut self) {
+        self.reader_stop.store(true, Ordering::SeqCst);
+        unsafe {
+            let _ = pthread_kill(self.reader_pthread, SIGUSR1);
+        }
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for UsbAccessoryStream {
+    fn drop(&mut self) {
+        self.stop_reader();
+    }
+}
+
+impl Read for UsbAccessoryStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.read_pending_offset < self.read_pending.len() {
+            return Ok(self.copy_pending(buf));
+        }
+
+        match self.next_read_event()? {
+            UsbReadEvent::Data(data) => {
+                self.read_pending = data;
+                self.read_pending_offset = 0;
+                Ok(self.copy_pending(buf))
+            }
+            UsbReadEvent::Eof => Ok(0),
+            UsbReadEvent::Error(err) => Err(err),
+        }
+    }
+}
+
+impl Write for UsbAccessoryStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[derive(Debug)]
+enum SessionStream {
+    Tcp(TcpStream),
+    Usb(UsbAccessoryStream),
+}
+
+impl SessionStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            Self::Usb(stream) => {
+                stream.set_read_timeout(timeout);
+                Ok(())
+            }
+        }
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+            // /dev/usb_accessory is a character device and has no socket timeout
+            // option. A blocking reader thread feeds timed reads to the session loop; accessory writes stay blocking.
+            Self::Usb(_) => {
+                let _ = timeout;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Read for SessionStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buf),
+            Self::Usb(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for SessionStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buf),
+            Self::Usb(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            Self::Usb(stream) => stream.flush(),
+        }
+    }
+}
+
+fn open_session_stream(config: &TlsHandshakeProbeConfig) -> io::Result<(SessionStream, String, String)> {
+    match config.transport.as_str() {
+        "tcp" => {
+            let listener = TcpListener::bind(&config.addr)?;
+            println!("listening on {}", listener.local_addr()?);
+            println!("waiting for one client...");
+            let (stream, peer) = listener.accept()?;
+            let local = listener.local_addr()?.to_string();
+            Ok((SessionStream::Tcp(stream), local, peer.to_string()))
+        }
+        "usb" | "usb-accessory" | "accessory" | "hu-usb" => {
+            println!("opening HU-side USB accessory transport: {}", config.usb_path.display());
+            println!("waiting for AAP bytes from USB host/head unit...");
+            let stream = UsbAccessoryStream::open(&config.usb_path)?;
+            Ok((
+                SessionStream::Usb(stream),
+                format!("usb:{}", config.usb_path.display()),
+                "usb-host".to_string(),
+            ))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported AAP transport {other}; use tcp or usb-accessory"),
+        )),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TcpProbeConfig {
@@ -410,7 +700,7 @@ impl FrameReader {
         Self { buf: Vec::new(), max_bytes }
     }
 
-    fn read_frame(&mut self, stream: &mut TcpStream) -> io::Result<Option<AapFrame>> {
+    fn read_frame<R: Read + ?Sized>(&mut self, stream: &mut R) -> io::Result<Option<AapFrame>> {
         loop {
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
@@ -480,7 +770,7 @@ fn log_line(dump: &mut Option<Box<dyn Write>>, line: &str) -> io::Result<()> {
 fn describe_frame(
     index: usize,
     total_bytes: usize,
-    peer: SocketAddr,
+    peer: impl std::fmt::Display,
     frame: &AapFrame,
     out: &mut dyn Write,
 ) -> io::Result<()> {
@@ -688,7 +978,7 @@ fn build_version_response(major: u16, minor: u16, status: u16) -> Vec<u8> {
     payload
 }
 
-fn write_frame(stream: &mut TcpStream, frame: &AapFrame) -> io::Result<()> {
+fn write_frame<W: Write + ?Sized>(stream: &mut W, frame: &AapFrame) -> io::Result<()> {
     if frame.payload.len() > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -958,6 +1248,8 @@ fn tls_record_hint(data: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct TlsHandshakeProbeConfig {
+    pub transport: String,
+    pub usb_path: PathBuf,
     pub addr: String,
     pub dump_path: Option<PathBuf>,
     pub timeout_ms: u64,
@@ -1038,6 +1330,8 @@ pub struct TlsHandshakeProbeConfig {
 impl Default for TlsHandshakeProbeConfig {
     fn default() -> Self {
         Self {
+            transport: "tcp".to_string(),
+            usb_path: PathBuf::from("/dev/usb_accessory"),
             addr: "0.0.0.0:5277".to_string(),
             dump_path: Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log")),
             timeout_ms: 60_000,
@@ -1570,11 +1864,11 @@ fn rms_from_sum_squares(sum_squares: u128, samples: u64) -> f64 {
     }
 }
 
-fn pump_audio_capture(
+fn pump_audio_capture<W: Write + ?Sized>(
     audio_output_channels: &mut [AudioOutputChannelState],
     capture: &mut Option<AppProcessAudioCapture>,
     capture_buffer: &mut Vec<u8>,
-    stream: &mut TcpStream,
+    stream: &mut W,
     tls: &mut tls::AapTlsServer,
     config: &TlsHandshakeProbeConfig,
     dump: &mut Option<Box<dyn Write>>,
@@ -1639,9 +1933,9 @@ fn pump_audio_capture(
     Ok(tx_ssl_frames)
 }
 
-fn pump_audio_test_tone(
+fn pump_audio_test_tone<W: Write + ?Sized>(
     audio_output_channels: &mut [AudioOutputChannelState],
-    stream: &mut TcpStream,
+    stream: &mut W,
     tls: &mut tls::AapTlsServer,
     config: &TlsHandshakeProbeConfig,
     dump: &mut Option<Box<dyn Write>>,
@@ -2221,7 +2515,7 @@ fn is_ping_response_payload(payload: &[u8]) -> bool {
 
 fn log_decrypted_payload(
     dump: &mut Option<Box<dyn Write>>,
-    peer: SocketAddr,
+    peer: impl std::fmt::Display,
     channel: u8,
     flags: u8,
     index: usize,
@@ -2269,7 +2563,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     install_session_signal_handlers();
     set_session_log_level(&config.log_level);
     println!("arda aap service discovery probe");
-    println!("addr={}", config.addr);
+    println!("transport={}", config.transport);
+    if config.transport != "tcp" {
+        println!("usb_path={}", config.usb_path.display());
+    } else {
+        println!("addr={}", config.addr);
+    }
     println!("timeout_ms={}", config.timeout_ms);
     println!("max_bytes={}", config.max_bytes);
     println!("max_frames={}", config.max_frames);
@@ -2283,12 +2582,9 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     }
     println!();
 
-    let listener = TcpListener::bind(&config.addr)?;
-    println!("listening on {}", listener.local_addr()?);
-    println!("waiting for one client...");
-
-    let (mut stream, peer) = listener.accept()?;
-    println!("client connected: {peer}");
+    let (mut stream, local_label, peer_label) = open_session_stream(&config)?;
+    let peer = peer_label.as_str();
+    println!("transport ready: local={local_label} peer={peer}");
     stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)))?;
 
@@ -2304,7 +2600,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     };
 
     log_line(&mut dump, "arda aap service discovery probe")?;
-    log_line(&mut dump, &format!("local={}", listener.local_addr()?))?;
+    log_line(&mut dump, &format!("transport={}", config.transport))?;
+    log_line(&mut dump, &format!("local={local_label}"))?;
     log_line(&mut dump, &format!("peer={peer}"))?;
     log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
     log_line(&mut dump, &format!("keys={}", config.keys_path.display()))?;
@@ -2370,7 +2667,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     log_line(&mut dump, &format!("audio_capture={} source={} chunk_ms={} gain={} as={} package={}", config.audio_capture, config.audio_capture_source, config.audio_capture_chunk_ms, config.audio_capture_gain, config.audio_capture_as, config.audio_capture_package))?;
     log_line(&mut dump, &format!("mic_open={} mic_send_request_open={} mic_dump_path={} mic_ack={} mic_ack_mode={} mic_max_unacked={}", config.mic_open, config.mic_send_request_open, config.mic_dump_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string()), config.mic_ack, config.mic_ack_mode, config.mic_max_unacked))?;
     log_line(&mut dump, &format!("quiet_ping_logs={} log_level={}", config.quiet_ping_logs, normalize_session_log_level(&config.log_level)))?;
-    log_line(&mut dump, "role=phone-like TCP server + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE")?;
+    log_line(&mut dump, &format!("role=phone-like AAP endpoint over {} + TLS server; sends encrypted ServiceDiscoveryRequest after AUTH_COMPLETE", config.transport))?;
     log_line(&mut dump, "")?;
 
     let started = Instant::now();
@@ -4365,9 +4662,9 @@ impl VideoSender {
         }
     }
 
-    fn send_available(
+    fn send_available<W: Write + ?Sized>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut W,
         tls: &mut tls::AapTlsServer,
         channel: u8,
         session_id: i32,
@@ -4450,9 +4747,9 @@ impl VideoFileSender {
         self.unacked = self.unacked.saturating_sub(released);
     }
 
-    fn send_available(
+    fn send_available<W: Write + ?Sized>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut W,
         tls: &mut tls::AapTlsServer,
         channel: u8,
         session_id: i32,
@@ -5119,27 +5416,36 @@ impl VideoLiveSender {
         Ok(())
     }
 
-    fn spawn_native_capture_child(&self, stdout: Stdio, seconds: &str) -> io::Result<Child> {
-        let exe = env::current_exe()?;
+    fn spawn_screenrecord_capture_child(&self, stdout: Stdio, seconds: &str) -> io::Result<Child> {
         let size = format!("{}x{}", self.config.width, self.config.height);
         let bit_rate = self.config.bit_rate.to_string();
-        let fps = self.config.fps.to_string();
+        let codec_name = preferred_codec_name();
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("/data/local/tmp/arda-screenrecord-live.stderr.log")
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
 
-        Command::new(exe)
-            .arg("native-capture")
+        // Android 16's platform screenrecord already owns the matching
+        // SurfaceFlinger -> virtual display -> MediaCodec surface path.  Keep
+        // the Rust/AAP side responsible only for Annex-B parsing and AA media
+        // flow control instead of dlsym'ing private libgui C++ ABI symbols.
+        Command::new("/system/bin/screenrecord")
+            .arg("--output-format=h264")
             .arg("--size")
             .arg(&size)
             .arg("--bit-rate")
             .arg(&bit_rate)
-            .arg("--fps")
-            .arg(&fps)
-            .arg("--seconds")
+            .arg("--time-limit")
             .arg(seconds)
-            .arg("--out")
+            .arg("--codec-name")
+            .arg(&codec_name)
             .arg("-")
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
     }
 
@@ -5151,22 +5457,23 @@ impl VideoLiveSender {
         let prewarm_ms = self.config.native_prewarm_ms;
         let start = Instant::now();
         let mut child = self
-            .spawn_native_capture_child(Stdio::null(), "0")
-            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture prewarm child: {err}")))?;
+            .spawn_screenrecord_capture_child(Stdio::null(), "0")
+            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn screenrecord prewarm child: {err}")))?;
 
         let line = format!(
-            "VIDEO_PREWARM started ms={} size={}x{} bit_rate={} fps={} note=warming native capture/encoder before real AA video stream",
+            "VIDEO_PREWARM started ms={} size={}x{} bit_rate={} fps={} codec={} note=warming platform screenrecord/encoder before real AA video stream",
             prewarm_ms,
             self.config.width,
             self.config.height,
             self.config.bit_rate,
-            self.config.fps
+            self.config.fps,
+            preferred_codec_name()
         );
         println!("{line}");
         log_line(dump, &line)?;
 
         thread::sleep(Duration::from_millis(prewarm_ms));
-        Self::terminate_native_capture_child(&mut child, Duration::from_millis(1500));
+        Self::terminate_screenrecord_capture_child(&mut child, Duration::from_millis(1500));
         self.prewarm_done = true;
 
         let elapsed_ms = start.elapsed().as_millis();
@@ -5311,8 +5618,8 @@ fi
         let seconds = String::from("0");
 
         let mut child = self
-            .spawn_native_capture_child(Stdio::piped(), &seconds)
-            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn native-capture child: {err}")))?;
+            .spawn_screenrecord_capture_child(Stdio::piped(), &seconds)
+            .map_err(|err| io::Error::new(err.kind(), format!("failed to spawn screenrecord capture child: {err}")))?;
 
         let child_spawned_at = Instant::now();
         self.child_spawned_at = Some(child_spawned_at);
@@ -5323,8 +5630,8 @@ fi
         }
 
         let Some(mut stdout) = child.stdout.take() else {
-            Self::terminate_native_capture_child(&mut child, Duration::from_millis(1500));
-            return Err(io::Error::new(io::ErrorKind::Other, "native-capture child stdout missing"));
+            Self::terminate_screenrecord_capture_child(&mut child, Duration::from_millis(1500));
+            return Err(io::Error::new(io::ErrorKind::Other, "screenrecord capture child stdout missing"));
         };
 
         let (tx, rx) = mpsc::channel::<LiveNalEvent>();
@@ -5376,15 +5683,16 @@ fi
         });
 
         let line = format!(
-            "VIDEO_NATIVE started child: size={} bit_rate={} fps={} frame_limit={}",
+            "VIDEO_NATIVE started child: size={} bit_rate={} fps={} codec={} frame_limit={}",
             size,
             bit_rate,
             fps,
+            preferred_codec_name(),
             self.config.frame_limit
         );
         println!("{line}");
         log_line(dump, &line)?;
-        log_line(dump, "VIDEO_NATIVE child_log=/data/local/tmp/arda-display-capture-test.log")?;
+        log_line(dump, &format!("VIDEO_NATIVE backend=platform-screenrecord codec={} stderr_log=/data/local/tmp/arda-screenrecord-live.stderr.log", preferred_codec_name()))?;
 
         self.child = Some(child);
         self.rx = Some(rx);
@@ -5411,7 +5719,7 @@ fi
             .map(|at| at.elapsed().as_millis())
             .unwrap_or(0);
         let line = format!(
-            "VIDEO_START_LATENCY first_frame_timeout_restart attempt={}/{} elapsed_ms={} timeout_ms={} note=no slice NAL received yet; restarting native capture child",
+            "VIDEO_START_LATENCY first_frame_timeout_restart attempt={}/{} elapsed_ms={} timeout_ms={} note=no slice NAL received yet; restarting screenrecord capture child",
             self.first_frame_restart_count,
             self.config.first_frame_max_restarts,
             elapsed_ms,
@@ -5421,7 +5729,7 @@ fi
         log_line(dump, &line)?;
 
         if let Some(child) = self.child.as_mut() {
-            Self::terminate_native_capture_child(child, Duration::from_millis(1500));
+            Self::terminate_screenrecord_capture_child(child, Duration::from_millis(1500));
         }
         self.child = None;
         self.rx = None;
@@ -5439,9 +5747,9 @@ fi
         Ok(())
     }
 
-    fn send_available(
+    fn send_available<W: Write + ?Sized>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut W,
         tls: &mut tls::AapTlsServer,
         channel: u8,
         session_id: i32,
@@ -5608,19 +5916,17 @@ fi
         Ok(tx_frames)
     }
 
-    fn terminate_native_capture_child(child: &mut Child, graceful_timeout: Duration) {
+    fn terminate_screenrecord_capture_child(child: &mut Child, graceful_timeout: Duration) {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
 
-        // std::process::Child::kill() is SIGKILL on Android/Linux.  SIGKILL
-        // tears down the native virtual-display capture without running its
-        // destroyDisplay / MediaCodec cleanup path, which can leave
-        // SurfaceFlinger/BufferQueue in a bad state for the next session.
-        // Ask the child to exit first; only fall back to SIGKILL if it does not
-        // finish promptly.
+        // Platform screenrecord installs graceful handlers for SIGINT/SIGHUP.
+        // Do not send SIGTERM here: current AOSP screenrecord does not catch it.
+        // Let screenrecord destroy its virtual display and stop/release the
+        // encoder first, then use SIGKILL only as a bounded fallback.
         unsafe {
-            let _ = kill(child.id() as c_int, SIGTERM);
+            let _ = kill(child.id() as c_int, SIGINT);
         }
 
         let start = Instant::now();
@@ -5638,7 +5944,7 @@ fi
 
     fn stop_child(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            Self::terminate_native_capture_child(child, Duration::from_millis(2500));
+            Self::terminate_screenrecord_capture_child(child, Duration::from_millis(2500));
         }
         self.child = None;
         self.ended = true;
@@ -5751,8 +6057,8 @@ fn is_control_message(payload: &[u8], id: u16) -> bool {
 }
 
 
-fn write_encrypted_plaintext_fragmented(
-    stream: &mut TcpStream,
+fn write_encrypted_plaintext_fragmented<W: Write + ?Sized>(
+    stream: &mut W,
     tls: &mut tls::AapTlsServer,
     channel: u8,
     plaintext: &[u8],
@@ -5770,8 +6076,8 @@ fn write_encrypted_plaintext_fragmented(
     )
 }
 
-fn write_encrypted_plaintext_fragmented_with_flags(
-    stream: &mut TcpStream,
+fn write_encrypted_plaintext_fragmented_with_flags<W: Write + ?Sized>(
+    stream: &mut W,
     tls: &mut tls::AapTlsServer,
     channel: u8,
     base_flags: u8,

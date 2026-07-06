@@ -181,87 +181,58 @@ If native video waits for a screen change before producing the first slice NAL, 
 
 `touch-cancel` is intended to dirty the input/display pipeline without an ACTION_UP click. `center` is a real tap at stream center and can activate UI. `HOME` is supported but not recommended unless explicitly testing navigation behavior.
 
-## v44 AAOS USB-C AOA gadget bootstrap
+## v44 AAOS USB-C AOA gadget bootstrap — legacy/manual path
 
-The daemon now auto-checks the verified Raspberry Pi 4 AAOS Android Open Accessory USB gadget before AAP listener/session commands. In normal use there is no separate gadget command to run: start `aap-session-probe` / the ARDA daemon as usual, and it will create the gadget only when it is missing.
+The original v44 code auto-created/rebound a custom configfs AOA gadget before every AAP probe. That behavior was useful on the older image, but the current AAOS image already initializes USB accessory support.
 
-Auto preflight currently runs for:
+As of v52, normal AAP commands **do not mutate USB gadget state and do not run `su` preflight attempts**. The old helper remains only for manual recovery on legacy images:
+
+```bash
+arda-senderd aaos-aoa-gadget --check
+arda-senderd aaos-aoa-gadget --unbind
+arda-senderd aaos-aoa-gadget --udc fe980000.usb
+```
+
+For the current image use the read-only check:
+
+```bash
+arda-senderd usb-accessory-status
+```
+
+The current baseline consumes the HU-side `/dev/usb_accessory` gadget stream directly with `transport.mode = "usb-accessory"` in `config.toml`. See:
 
 ```text
-aap-tcp-probe
-aap-frame-probe
-aap-version-session
-aap-ssl-frame-probe
-aap-tls-handshake-probe
-aap-tls-plain-probe
-aap-service-discovery-probe
-aap-session-probe
-```
-
-It can be disabled for debugging with:
-
-```bash
-ARDA_AAOS_AOA_AUTO=0 /vendor/bin/arda-senderd aap-session-probe ...
-```
-
-The manual diagnostic command is still available:
-
-```bash
-adb shell su
-/vendor/bin/arda-senderd aaos-aoa-gadget --check
-/vendor/bin/arda-senderd aaos-aoa-gadget --unbind
-/vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
-```
-
-From a non-root `adb shell`, the manual setup command now self-elevates with `su -c` when it needs to change configfs or `/dev/usb_accessory`:
-
-```bash
-/vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
-```
-
-If the process is not root and the gadget/dev node needs changes, ARDA re-runs only the `aaos-aoa-gadget` preflight through `su -c ... --quiet`, so normal `aap-session-probe` logs should not contain shell-user `mount`/`chown`/`chmod` permission noise.
-
-The auto preflight/manual command creates and binds:
-
-```text
-/config/usb_gadget/arda
-/config/usb_gadget/arda/functions/accessory.usb0
-/config/usb_gadget/arda/configs/c.1/accessory.usb0 -> /config/usb_gadget/arda/functions/accessory.usb0
-/dev/usb_accessory
-```
-
-Useful status commands:
-
-```bash
-/vendor/bin/arda-senderd aaos-aoa-gadget --check
-/vendor/bin/arda-senderd aaos-aoa-gadget --unbind
-```
-
-Installer helpers were added:
-
-```text
-scripts/install-aaos-boot-dwc2-macos.sh
-scripts/install-aaos-aoa-gadget-adb.sh
+docs/ARDA_TEST_PROFILES.md
 docs/AAOS_AOA_USB_GADGET.md
-packaging/vendor/etc/init/arda-aoa-gadget.rc
-packaging/boot/overlays/dwc2.dtbo
 ```
 
-Two-step setup for a fresh compatible AAOS SD card:
+## v52 config profile + direct USB AAP transport
+
+The long bring-up command is now stored in repository-root `config.toml`. The baseline uses platform `screenrecord` H.264, Waveshare 7.9 geometry, app/framework input injection, unlimited video frames, and direct `/dev/usb_accessory` AAP transport.
+
+Push the profile and run:
 
 ```bash
-scripts/install-aaos-boot-dwc2-macos.sh /Volumes/boot
-scripts/install-aaos-aoa-gadget-adb.sh target/aarch64-linux-android/release/arda-senderd
+adb push config.toml /data/local/tmp/arda-config.toml
+adb shell /data/local/tmp/arda-senderd usb-accessory-status
+adb shell /data/local/tmp/arda-senderd config-check /data/local/tmp/arda-config.toml
+adb shell /data/local/tmp/arda-senderd aap-run
 ```
 
-After that, any normal AAP daemon launch auto-ensures the gadget first, for example:
+For the normal Mac test workflow, use the repository helper instead of reconstructing the long command:
 
 ```bash
-adb shell su -c '/vendor/bin/arda-senderd aap-session-probe --addr 0.0.0.0:5277 --keys /data/local/tmp/arda-certs'
+./scripts/arda-usb-run.sh
 ```
 
-This is intended for the ARDA Raspberry Pi 4 AAOS image family, not arbitrary AAOS builds. Other images still need kernel/configfs support for `dwc2`, `accessory.usb0`, and `/proc/misc` `usb_accessory`.
+Pass `--build` to compile first, or append one-off config overrides after `--`:
 
+```bash
+./scripts/arda-usb-run.sh --build
+./scripts/arda-usb-run.sh -- --log-level summary
+```
+
+Explicit CLI flags override config values for one-off A/B tests. TCP remains available as a debugging fallback with `--transport tcp --addr 0.0.0.0:5277`.
 
 ## v46 AAOS Google Maps Automotive notes
 
@@ -274,3 +245,102 @@ docs/AAOS_GOOGLE_MAPS_AUTOMOTIVE.md
 Key result: Google Maps Automotive became usable only after keeping GMS/GSF enabled and adding explicit Dalvik heap settings to `/system/build.prop`. Before the heap fix, Maps was clamped around 16 MB Java heap and spammed blocking GC; after tuning, Maps CPU dropped to a reasonable startup load and the UI became responsive enough to open Maps settings/location.
 
 The doc also records external push/download links for the tested MindTheGapps Android 11 ARM64 package and Google Maps Automotive APKMirror package, plus the exact push/install/rescue commands.
+
+## v47 AAOS phone internet bridge bootstrap
+
+Adds first-step AAOS-side helpers for getting the Raspberry Pi 4 AAOS image online through a phone.
+
+Primary MVP mode: phone opens a normal mobile hotspot, AAOS joins it as a Wi-Fi client:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-join \
+  --ssid ARDA-Phone \
+  --psk 'change-me-1234' \
+  --security wpa2
+
+adb shell /data/local/tmp/arda-senderd net-status
+```
+
+Cleanup:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-disconnect --ssid ARDA-Phone
+adb shell /data/local/tmp/arda-senderd net-proxy-clear
+```
+
+Proxy experiment mode: companion app exposes an HTTP proxy on the phone-side Wi-Fi address, then AAOS sets Android global HTTP proxy:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-proxy --host 192.168.43.1 --port 8080
+```
+
+Reverse mode is also sketched for experiments: AAOS opens a SoftAP, phone joins that AP, and the phone companion binds outbound sockets to cellular while accepting proxy traffic from AAOS. First try the saved Hotspot settings config shown in the AAOS UI:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-ap-start --force-unsafe-softap --use-saved-config --wait-ms 8000
+adb shell /data/local/tmp/arda-senderd net-ap-stop
+```
+
+Custom SSID/password is still available when the image honors shell SoftAP config:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-ap-start --force-unsafe-softap --ssid ARDA-AAOS --psk arda-aaos-1234 --security wpa2 --wait-ms 8000
+```
+
+`net-ap-start` is intentionally experimental and disabled by default because shell SoftAP support depends on the AAOS Wi-Fi framework/HAL image; pass `--force-unsafe-softap` only when testing with ADB rescue ready. See:
+
+```text
+docs/AAOS_PHONE_INTERNET_BRIDGE.md
+```
+
+### v48 AAOS SoftAP/tether diagnostics
+
+After testing on the Raspberry Pi AAOS image, `cmd wifi start-softap` can return success while the Settings Hotspot UI still appears disabled. `net-status` now prints SoftAP/tethering diagnostics from `dumpsys wifi`, `dumpsys connectivity`, and all Wi-Fi/AP-like interfaces so this can be verified from ADB.
+
+`net-ap-start` has two unsafe test paths, both requiring `--force-unsafe-softap`:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-ap-start --force-unsafe-softap --use-saved-config --wait-ms 8000
+adb shell /data/local/tmp/arda-senderd net-ap-start --force-unsafe-softap --ssid ARDA-AAOS --psk arda-aaos-1234 --security wpa2 --wait-ms 8000
+```
+
+The first path starts the Hotspot settings UI configuration through Connectivity tethering when the image supports it; the second path keeps the previous custom shell SoftAP experiment. `net-join` also no longer treats `Wifi is not connected` as a successful connection match.
+
+### v49 SoftAP bootloop guard and Wi-Fi rescue
+
+Testing showed that the Raspberry Pi AAOS image can accept `startSoftAp` but fail later at hostapd/HAL setup. In that state the device can enter an Android userspace restart loop until Wi-Fi config stores are moved out of the way.
+
+To avoid accidental repeats, `net-ap-start` is now disabled by default. It only runs with an explicit unsafe flag:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-ap-start --force-unsafe-softap --use-saved-config --wait-ms 8000
+```
+
+Do not put this in init on the current image. The safe direction is still:
+
+```text
+phone hotspot -> AAOS net-join
+```
+
+Recovery helper if SoftAP/Wi-Fi state poisons boot again:
+
+```bash
+adb wait-for-device
+adb root
+adb wait-for-device
+adb shell /data/local/tmp/arda-senderd net-wifi-rescue
+adb reboot
+```
+
+or, with explicit stop plus rescue:
+
+```bash
+adb shell /data/local/tmp/arda-senderd net-ap-stop --rescue-configs
+adb reboot
+```
+
+Reverse mode remains a valid future architecture once AP mode is fixed:
+
+```text
+AAOS AP always on -> phone joins AAOS -> companion proxy listens on Wi-Fi -> companion outbound binds to cellular -> AAOS uses HTTP/SOCKS/tun2socks
+```

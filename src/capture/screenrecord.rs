@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::OpenOptions;
 use std::io;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
@@ -10,6 +11,15 @@ pub struct ScreenrecordConfig {
     pub bit_rate: u32,
     pub seconds: u32,
     pub display_id: Option<String>,
+    pub codec_name: Option<String>,
+}
+
+pub fn preferred_codec_name() -> String {
+    env::var("ARDA_SCREENRECORD_CODEC")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "c2.android.avc.encoder".to_string())
 }
 
 pub struct ScreenrecordSource {
@@ -27,6 +37,10 @@ impl ScreenrecordSource {
             .arg(config.bit_rate.to_string())
             .arg("--time-limit")
             .arg(config.seconds.to_string());
+
+        if let Some(codec_name) = config.codec_name {
+            cmd.arg("--codec-name").arg(codec_name);
+        }
 
         if let Some(display_id) = config.display_id {
             cmd.arg("--display-id").arg(display_id);

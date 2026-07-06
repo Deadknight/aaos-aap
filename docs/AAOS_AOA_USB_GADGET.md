@@ -1,12 +1,24 @@
 # ARDA AAOS AOA USB Gadget
 
+> **Current v52 behavior:** the current ARDA AAOS image already initializes USB accessory support. Normal AAP commands no longer create, bind, repair, or `su`-reexec a gadget. `aap-run` consumes `/dev/usb_accessory` directly. Use `usb-accessory-status` for a read-only check. The configfs bootstrap commands in this document are retained for older/foreign images only.
+
 This note documents the AAOS/Raspberry Pi 4 USB-C gadget path used by ARDA.
 
-The goal is to make the Pi USB-C port expose the Android Open Accessory function required by the AAP/Android Auto daemon:
+The goal is to document the Pi's **device-side/HU-facing** Android Open Accessory path used by ARDA:
 
 ```text
-dwc2 peripheral mode -> configfs usb_gadget -> accessory.usb0 -> /dev/usb_accessory
+car or DHU (USB host)
+        ↓
+Pi USB-C peripheral/gadget
+        ↓
+platform accessory function
+        ↓
+/dev/usb_accessory
+        ↓
+arda-senderd AAP endpoint
 ```
+
+The `nusb`/AOA host code seen in `aa-proxy-rs` serves the opposite role: the proxy acting as USB host toward a wired Android phone. ARDA itself is the phone-like AAP endpoint, so the normal ARDA path opens `/dev/usb_accessory` instead.
 
 ## Verified image
 
@@ -62,28 +74,35 @@ Only add `dwc2.dtbo` and append the missing boot/config arguments first.
 
 ## Runtime behavior
 
-The Rust daemon auto-checks this gadget before AAP listener/session commands and creates it only when it is missing. Normal use does not require a separate gadget command.
+On the current image, USB gadget ownership belongs to the platform/init configuration. ARDA does not auto-bootstrap it.
 
-Auto preflight runs before these commands:
-
-```text
-aap-tcp-probe
-aap-frame-probe
-aap-version-session
-aap-ssl-frame-probe
-aap-tls-handshake-probe
-aap-tls-plain-probe
-aap-service-discovery-probe
-aap-session-probe
-```
-
-Disable the preflight for debugging with:
+Read-only status:
 
 ```sh
-ARDA_AAOS_AOA_AUTO=0 arda-senderd aap-session-probe ...
+arda-senderd usb-accessory-status
 ```
 
-The manual command remains available for diagnostics or one-off setup:
+The current AAP baseline opens the accessory character device directly:
+
+```text
+/dev/usb_accessory
+```
+
+The transport is selected in `config.toml`:
+
+```toml
+[transport]
+mode = "usb-accessory"
+usb_path = "/dev/usb_accessory"
+```
+
+Normal start:
+
+```sh
+arda-senderd aap-run
+```
+
+The legacy gadget mutation command is still available for older images or manual recovery, but it is never invoked automatically:
 
 ```sh
 arda-senderd aaos-aoa-gadget --check
@@ -91,72 +110,21 @@ arda-senderd aaos-aoa-gadget --unbind
 arda-senderd aaos-aoa-gadget --udc fe980000.usb
 ```
 
-Default gadget values:
-
-```text
-gadget name: arda
-idVendor:    0x18D1
-idProduct:   0x2D00
-serial:      arda-aaos
-manufacturer: aa-proxy
-product:     AAOS AOA
-function:    accessory.usb0
-```
-
-The auto preflight/manual command does the same setup that was validated manually:
-
-```text
-mount configfs if needed
-create /config/usb_gadget/arda
-create functions/accessory.usb0
-link it into configs/c.1 using an absolute configfs symlink
-bind to fe980000.usb
-ensure /dev/usb_accessory exists when /proc/misc exposes usb_accessory
-```
-
-The absolute symlink is intentional. On this image, relative symlinks such as this failed:
-
-```sh
-ln -s functions/accessory.usb0 configs/c.1/accessory.usb0
-```
-
-The working form is:
-
-```sh
-ln -s /config/usb_gadget/arda/functions/accessory.usb0 /config/usb_gadget/arda/configs/c.1/accessory.usb0
-```
-
 ## Boot/service integration
 
-If ARDA already has an init service that starts `arda-senderd aap-session-probe ...`, no separate gadget service is required; the daemon preflight will run first. The included `arda-aoa-gadget.rc` remains useful as an optional boot preflight for images where you want `/dev/usb_accessory` ready even before starting the main AAP daemon.
+For the current AAOS image, do **not** install a separate ARDA gadget init service. The platform USB stack already handles accessory negotiation and exposes `/dev/usb_accessory`.
 
-Install the binary as:
-
-```text
-/vendor/bin/arda-senderd
-```
-
-Install this init rc file as:
+Normal ARDA startup is therefore:
 
 ```text
-/vendor/etc/init/arda-aoa-gadget.rc
+platform USB/init owns gadget state
+        ↓
+arda-senderd usb-accessory-status   # read-only diagnostic
+        ↓
+arda-senderd aap-run                # opens /dev/usb_accessory
 ```
 
-Content:
-
-```rc
-service arda_aoa_gadget /vendor/bin/arda-senderd aaos-aoa-gadget --udc fe980000.usb
-    class late_start
-    user root
-    group root usb shell system
-    oneshot
-    seclabel u:r:su:s0
-
-on late-init
-    start arda_aoa_gadget
-```
-
-On this userdebug AAOS image the `u:r:su:s0` label works. On a different build without `su`, the init service may need a proper device-specific SELinux domain or the `seclabel` line removed/changed.
+The old `arda-aoa-gadget.rc`, configfs mutation helper, and install script are retained only for historical/foreign images where the platform does not expose a working accessory function. They are not part of the current baseline.
 
 ## Install helpers
 

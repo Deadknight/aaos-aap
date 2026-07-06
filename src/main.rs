@@ -1,5 +1,6 @@
 mod aap;
 mod capture;
+mod config;
 mod h264;
 mod input;
 mod native;
@@ -7,14 +8,22 @@ mod native;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::raw::c_int;
 use std::os::unix::fs as unix_fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use capture::screenrecord::{ScreenrecordConfig, ScreenrecordSource};
+use capture::screenrecord::{preferred_codec_name, ScreenrecordConfig, ScreenrecordSource};
 use h264::annexb::{AnnexBStreamParser, NalStats};
+
+const SIGTERM: c_int = 15;
+
+extern "C" {
+    fn kill(pid: c_int, sig: c_int) -> c_int;
+}
 
 fn main() {
     if let Err(err) = real_main() {
@@ -30,7 +39,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    auto_ensure_aaos_aoa_gadget_for_command(&cmd);
 
     match cmd.as_str() {
         "capture-test" => capture_test(args.collect()),
@@ -42,8 +50,27 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-display-active-probe" => native_display_active_probe(),
         "native-display-capture-test" => native_display_capture_test(args.collect()),
         "native-capture" => native_capture(args.collect()),
+        "native-capture-repeat-test" | "native-repeat-test" => native_capture_repeat_test(args.collect()),
         "input-test" => input_test(args.collect()),
         "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
+        "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
+        "config-check" => config_check(args.collect()),
+        "aap-run" | "run" => {
+            let mut argv = vec![
+                "--config".to_string(),
+                "/data/local/tmp/arda-config.toml".to_string(),
+            ];
+            argv.extend(args);
+            aap_service_discovery_probe(argv)
+        },
+        "net-status" | "internet-status" => net_status(args.collect()),
+        "net-join" | "internet-join" => net_join(args.collect()),
+        "net-disconnect" | "internet-disconnect" => net_disconnect(args.collect()),
+        "net-proxy" | "internet-proxy" => net_proxy(args.collect()),
+        "net-proxy-clear" | "internet-proxy-clear" => net_proxy_clear(),
+        "net-ap-start" | "internet-ap-start" => net_ap_start(args.collect()),
+        "net-ap-stop" | "internet-ap-stop" => net_ap_stop(args.collect()),
+        "net-wifi-rescue" | "internet-wifi-rescue" | "wifi-rescue" => net_wifi_rescue(args.collect()),
         "aap-tcp-probe" => aap_tcp_probe(args.collect()),
         "aap-frame-probe" => aap_frame_probe(args.collect()),
         "aap-version-session" => aap_version_session(args.collect()),
@@ -71,8 +98,9 @@ fn print_help() {
         r#"arda-senderd
 
 Commands:
-  capture-test [--size 1280x720] [--bit-rate 6000000] [--seconds 10] [--out PATH|-] [--loop]
+  capture-test [--size 1280x720] [--bit-rate 6000000] [--seconds 10] [--codec-name NAME] [--out PATH|-] [--loop]
       Starts Android screenrecord in raw H264 mode and writes Annex-B H264 to PATH or stdout.
+      Default codec: c2.android.avc.encoder. Override with --codec-name or ARDA_SCREENRECORD_CODEC.
 
   nal-info FILE [--limit 80]
       Prints NAL types and summary for a raw Annex-B H264 stream.
@@ -103,7 +131,37 @@ Commands:
       Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
 
   aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--no-bind] [--check] [--unbind]
-      Creates/binds the AAOS USB-C Android Open Accessory configfs gadget using accessory.usb0 and /dev/usb_accessory. Run as root on AAOS.
+      Legacy/manual gadget bootstrap. Normal AAP commands no longer auto-create or rebind USB gadget state.
+
+  usb-accessory-status [--path /dev/usb_accessory]
+      Read-only AAOS accessory check: misc device, character node, UDC state, and configfs accessory functions.
+
+  config-check [PATH]
+      Parses an ARDA config.toml profile and prints the CLI arguments it resolves to.
+
+  aap-run [CLI overrides...]
+      Loads /data/local/tmp/arda-config.toml and starts the AAP session. Later CLI flags override config values.
+
+  net-status
+      Prints AAOS Wi-Fi, IP route, DNS and Android global proxy state.
+
+  net-join --ssid SSID [--psk PASS] [--security open|owe|wpa2|wpa3] [--metered] [--disable-autojoin] [--wait-ms 15000]
+      Connects AAOS to a phone hotspot / companion hotspot using Android cmd wifi connect-network.
+
+  net-disconnect [--ssid SSID] [--disable-wifi]
+      Forgets a saved network by SSID, or disables Wi-Fi if no SSID is supplied.
+
+  net-proxy --host HOST --port PORT
+  net-proxy-clear
+      Sets or clears Android global HTTP proxy for the current phone-internet bridge experiment.
+      SOCKS/full-device mode should use a tun2socks helper; see docs/AAOS_PHONE_INTERNET_BRIDGE.md.
+
+  net-ap-start [--force-unsafe-softap] [--use-saved-config] [--ssid SSID --psk PASS] [--security open|wpa2] [--framework-tether-first] [--wait-ms 5000]
+      Experimental AAOS SoftAP helper for reverse mode. Disabled by default on this image because hostapd/HAL failure can poison boot Wi-Fi state.
+  net-ap-stop [--rescue-configs]
+      Stop AAOS SoftAP/LOHS/tether helpers. With --rescue-configs, backs up Wi-Fi config stores and disables Wi-Fi.
+  net-wifi-rescue [--backup-dir DIR]
+      Stop SoftAP/Wi-Fi, disable Wi-Fi autostart, back up Wi-Fi config stores, and sync for bootloop recovery.
 
   aap-tcp-probe [--addr 0.0.0.0:5277] [--dump PATH] [--timeout-ms 60000]
       Raw TCP probe: accepts one client and hex-dumps incoming bytes.
@@ -126,8 +184,11 @@ Commands:
   aap-service-discovery-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
       Runs VERSION + TLS, waits for AUTH_COMPLETE, sends encrypted protobuf ServiceDiscoveryRequest, and replies to PING_REQUEST.
 
-  aap-session-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
-      Full AAP session probe: service discovery, video channel open/setup/start, ping responses, optional H264 file send.
+  aap-session-probe [--config PATH] [--transport tcp|usb-accessory] [--usb-path /dev/usb_accessory] [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
+      Full AAP session probe. TCP remains available for debugging; usb-accessory is the HU-side AAOS gadget stream at /dev/usb_accessory.
+
+  native-capture-repeat-test [--runs 3] [--run-ms 1500] [--pause-ms 500] [--size 1280x720] [--bit-rate 6000000] [--fps 30]
+      Runs native capture repeatedly, stops each run with SIGTERM, and verifies destroyDisplay / MediaCodec EOS / cleanup markers plus non-empty H264 output. Use this before AAP/DHU tests to catch stale virtual-display teardown.
 
   aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start] [--display-auto|--display-profile waveshare-79] [--wm-rotation none|auto|0|90|180|270] [--dhu-priority|--wm-size-orientation logical|natural]
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
@@ -214,6 +275,171 @@ fn aaos_aoa_gadget(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn config_check(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut effective = Vec::new();
+    if argv.is_empty() {
+        effective.push("--config".to_string());
+        effective.push("/data/local/tmp/arda-config.toml".to_string());
+    } else if argv.first().map(|v| v.starts_with('-')).unwrap_or(false) {
+        effective = argv;
+    } else {
+        effective.push("--config".to_string());
+        effective.push(argv[0].clone());
+        effective.extend(argv.into_iter().skip(1));
+    }
+    print!("{}", config::render_resolved_args(effective)?);
+    Ok(())
+}
+
+fn usb_accessory_status(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut path = PathBuf::from("/dev/usb_accessory");
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--path" | "--usb-path" => {
+                i += 1;
+                path = PathBuf::from(argv.get(i).ok_or("--path requires value")?);
+            }
+            "--help" | "-h" => {
+                println!("usb-accessory-status [--path /dev/usb_accessory]");
+                return Ok(());
+            }
+            other => return Err(format!("unknown usb-accessory-status arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    println!("===== ARDA USB accessory status =====");
+    println!("path={}", path.display());
+
+    let mut node_ok = false;
+    match fs::metadata(&path) {
+        Ok(meta) => {
+            node_ok = meta.file_type().is_char_device();
+            println!(
+                "node exists=true char_device={} mode={:o} uid={} gid={}",
+                node_ok,
+                meta.permissions().mode() & 0o7777,
+                meta.uid(),
+                meta.gid()
+            );
+        }
+        Err(err) => println!("node exists=false error={err}"),
+    }
+
+    println!("\n===== /proc/misc =====");
+    let proc_misc = fs::read_to_string("/proc/misc").unwrap_or_default();
+    let accessory_misc: Vec<&str> = proc_misc
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("accessory") || lower.contains("aoa")
+        })
+        .collect();
+    if accessory_misc.is_empty() {
+        println!("accessory misc entry: NOT FOUND");
+    } else {
+        for line in &accessory_misc {
+            println!("{line}");
+        }
+    }
+
+    println!("\n===== UDC =====");
+    let mut link_configured = false;
+    match fs::read_dir("/sys/class/udc") {
+        Ok(entries) => {
+            let mut names = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            if names.is_empty() {
+                println!("UDC: NONE");
+            }
+            for name in names {
+                let base = PathBuf::from("/sys/class/udc").join(&name);
+                let state = fs::read_to_string(base.join("state"))
+                    .unwrap_or_else(|_| "<unknown>".to_string())
+                    .trim()
+                    .to_string();
+                let speed = fs::read_to_string(base.join("current_speed"))
+                    .unwrap_or_else(|_| "<unknown>".to_string())
+                    .trim()
+                    .to_string();
+                if state == "configured" {
+                    link_configured = true;
+                }
+                println!("udc={name} state={state} speed={speed}");
+            }
+        }
+        Err(err) => println!("cannot read /sys/class/udc: {err}"),
+    }
+
+    println!("\n===== configfs accessory functions =====");
+    let mut accessory_function_found = false;
+    let gadget_root = Path::new("/config/usb_gadget");
+    match fs::read_dir(gadget_root) {
+        Ok(gadgets) => {
+            let mut gadget_paths = gadgets
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            gadget_paths.sort();
+            for gadget in gadget_paths {
+                let name = gadget
+                    .file_name()
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let udc = fs::read_to_string(gadget.join("UDC"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let mut functions = Vec::new();
+                if let Ok(entries) = fs::read_dir(gadget.join("functions")) {
+                    for entry in entries.flatten() {
+                        let function = entry.file_name().to_string_lossy().into_owned();
+                        if function.to_ascii_lowercase().contains("accessory") {
+                            accessory_function_found = true;
+                            functions.push(function);
+                        }
+                    }
+                }
+                functions.sort();
+                println!(
+                    "gadget={} udc={} accessory_functions={}",
+                    name,
+                    if udc.is_empty() { "<unbound>" } else { udc.as_str() },
+                    if functions.is_empty() { "<none>".to_string() } else { functions.join(",") }
+                );
+            }
+        }
+        Err(err) => println!("cannot read {}: {err}", gadget_root.display()),
+    }
+
+    println!();
+    println!("USB_ACCESSORY_NODE_OK={}", if node_ok { "YES" } else { "NO" });
+    println!(
+        "USB_ACCESSORY_MISC_OK={}",
+        if accessory_misc.is_empty() { "NO" } else { "YES" }
+    );
+    println!(
+        "USB_ACCESSORY_FUNCTION_FOUND={}",
+        if accessory_function_found { "YES" } else { "NO" }
+    );
+    println!(
+        "USB_LINK_CONFIGURED={}",
+        if link_configured { "YES" } else { "NO" }
+    );
+
+    if node_ok && !accessory_misc.is_empty() {
+        println!("USB_ACCESSORY_READY=YES");
+        Ok(())
+    } else {
+        println!("USB_ACCESSORY_READY=NO");
+        Err("USB accessory path is not ready; status command is read-only and did not modify gadget state".into())
+    }
+}
+
 fn default_aaos_aoa_gadget_args() -> AaosAoaGadgetArgs {
     AaosAoaGadgetArgs {
         name: "arda".to_string(),
@@ -298,144 +524,40 @@ struct AoaGadgetStatus {
     bound_udc: Option<String>,
 }
 
-fn auto_ensure_aaos_aoa_gadget_for_command(cmd: &str) {
-    if !should_auto_ensure_aaos_aoa_gadget(cmd) || env_flag_disabled("ARDA_AAOS_AOA_AUTO") {
-        return;
-    }
-
-    // Fast no-op on non-AAOS hosts or kernels without a USB device controller.
-    if !Path::new("/sys/class/udc").exists() {
-        return;
-    }
-
-    let mut args = default_aaos_aoa_gadget_args();
-    args.wait_ms = 2_000;
-
-    match ensure_aaos_aoa_gadget_maybe_root(&args) {
-        Ok(status) if status.changed => {
-            eprintln!(
-                "arda aaos-aoa: auto-configured USB accessory gadget on {}",
-                status.bound_udc.as_deref().unwrap_or("<none>")
-            );
-        }
-        Ok(_) => {}
-        Err(err) => {
-            // Do not fail the main daemon/probe because of the preflight. Some dev paths
-            // intentionally run over TCP or on images without gadget support.
-            eprintln!("arda aaos-aoa: auto-setup skipped: {err}");
-        }
-    }
-}
-
-fn should_auto_ensure_aaos_aoa_gadget(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "aap-tcp-probe"
-            | "aap-frame-probe"
-            | "aap-version-session"
-            | "aap-ssl-frame-probe"
-            | "aap-tls-handshake-probe"
-            | "aap-tls-plain-probe"
-            | "aap-service-discovery-probe"
-            | "aap-session-probe"
-    )
-}
-
-fn env_flag_disabled(name: &str) -> bool {
-    match env::var(name) {
-        Ok(value) => {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "0" | "false" | "off" | "no" | "disabled")
-        }
-        Err(_) => false,
-    }
-}
-
-fn ensure_aaos_aoa_gadget_maybe_root(args: &AaosAoaGadgetArgs) -> Result<AoaGadgetStatus, Box<dyn std::error::Error>> {
-    let mut effective_args = args.clone();
-    if effective_args.udc.is_none() {
-        effective_args.udc = Some(wait_for_udc(Duration::from_millis(effective_args.wait_ms))?);
-    }
-
-    let udc = effective_args.udc.as_deref().unwrap_or_default();
-    let gadget_path = format!("/config/usb_gadget/{}", effective_args.name);
-    let needs_root_fix = !aaos_aoa_gadget_ready(&gadget_path, udc) || !usb_accessory_node_permissions_ok();
-
-    if needs_root_fix && !is_effective_root() {
-        let root_argv = aoa_gadget_args_to_argv(&effective_args, true);
-        run_aaos_aoa_gadget_as_root(&root_argv)?;
-        return Ok(AoaGadgetStatus {
-            changed: true,
-            bound_udc: read_trim(format!("{gadget_path}/UDC")),
-        });
-    }
-
-    ensure_aaos_aoa_gadget(&effective_args)
-}
-
-fn aoa_gadget_args_to_argv(args: &AaosAoaGadgetArgs, quiet: bool) -> Vec<String> {
-    let mut argv = vec![
-        "--name".to_string(),
-        args.name.clone(),
-        "--wait-ms".to_string(),
-        args.wait_ms.to_string(),
-        "--vendor-id".to_string(),
-        args.vendor_id.clone(),
-        "--product-id".to_string(),
-        args.product_id.clone(),
-        "--serial".to_string(),
-        args.serial.clone(),
-        "--manufacturer".to_string(),
-        args.manufacturer.clone(),
-        "--product".to_string(),
-        args.product.clone(),
-        "--max-power".to_string(),
-        args.max_power.to_string(),
-    ];
-    if let Some(udc) = &args.udc {
-        argv.push("--udc".to_string());
-        argv.push(udc.clone());
-    }
-    if args.no_bind {
-        argv.push("--no-bind".to_string());
-    }
-    if args.unbind {
-        argv.push("--unbind".to_string());
-    }
-    if quiet || args.quiet {
-        argv.push("--quiet".to_string());
-    }
-    argv
-}
-
 fn run_aaos_aoa_gadget_as_root(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    run_self_command_as_root("aaos-aoa-gadget", argv, "root aaos-aoa-gadget failed")
+}
+
+fn run_self_command_as_root(command: &str, argv: &[String], err_prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
     let exe = env::current_exe()
         .ok()
         .or_else(|| env::args().next().map(PathBuf::from))
         .ok_or("cannot resolve arda-senderd path for root re-exec")?;
     let exe_s = exe.to_string_lossy();
-    let mut parts = vec![shell_quote(exe_s.as_ref()), "aaos-aoa-gadget".to_string()];
+    let mut parts = vec![shell_quote(exe_s.as_ref()), shell_quote(command)];
     parts.extend(argv.iter().map(|arg| shell_quote(arg)));
     let command_line = parts.join(" ");
 
-    let output = Command::new("su")
-        .args(["-c", command_line.as_str()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let attempts: [Vec<&str>; 3] = [
+        vec!["-c", command_line.as_str()],
+        vec!["0", "sh", "-c", command_line.as_str()],
+        vec!["root", "sh", "-c", command_line.as_str()],
+    ];
 
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "root aaos-aoa-gadget failed: status={} stdout='{}' stderr='{}'",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        )
-        .into());
+    let mut last_status: Option<std::process::ExitStatus> = None;
+    for args in attempts {
+        let output = Command::new("su")
+            .args(args.as_slice())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+        if output.success() {
+            return Ok(());
+        }
+        last_status = Some(output);
     }
-    Ok(())
+
+    Err(format!("{err_prefix}: all su forms failed; last_status={:?}", last_status).into())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -716,11 +838,612 @@ fn print_dir_names<P: AsRef<Path>>(path: P) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+
+#[derive(Debug, Clone)]
+struct NetJoinArgs {
+    ssid: String,
+    psk: Option<String>,
+    security: Option<String>,
+    metered: bool,
+    disable_autojoin: bool,
+    wait_ms: u64,
+}
+
+fn net_status(_argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("===== wifi status =====");
+    print_command("cmd", &["wifi", "status"]);
+
+    println!("\n===== configured networks =====");
+    print_command("cmd", &["wifi", "list-networks"]);
+
+    println!("\n===== softap / tether diagnostics =====");
+    print_shell("dumpsys wifi 2>/dev/null | grep -Ei 'SoftAp|Soft AP|softap|hostapd|tether|AP iface|ap interface|clients|num clients|started|stopped|failed|SSID|BSSID' | tail -120 || true");
+    print_shell("dumpsys connectivity 2>/dev/null | grep -Ei 'Tether|tether|upstream|wlan|wifi|softap|errored|available|interface' | tail -160 || true");
+
+    println!("\n===== wifi/ap interfaces =====");
+    print_shell("ip link | grep -Ei '^[0-9]+: (wlan|ap|swlan|softap|eth|rndis|usb)' || ip link");
+
+    println!("\n===== wlan0 address =====");
+    print_shell("ip addr show wlan0 || ip addr");
+
+    println!("\n===== routes =====");
+    print_shell("ip route || route -n");
+
+    println!("\n===== dns props =====");
+    print_shell("getprop | grep -i dns || true");
+
+    println!("\n===== android global proxy =====");
+    print_shell("settings get global http_proxy 2>/dev/null || true");
+    Ok(())
+}
+
+fn net_join(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_net_join_args(argv)?;
+    let security = args.security.clone().unwrap_or_else(|| {
+        if args.psk.as_deref().unwrap_or_default().is_empty() {
+            "open".to_string()
+        } else {
+            "wpa2".to_string()
+        }
+    });
+    validate_wifi_security(&security, args.psk.as_deref())?;
+
+    println!("arda net: enabling Wi-Fi");
+    run_command_report("cmd", &["wifi", "set-wifi-enabled", "enabled"]);
+    run_command_report("svc", &["wifi", "enable"]);
+
+    println!("arda net: starting scan");
+    run_command_report("cmd", &["wifi", "start-scan"]);
+
+    let mut connect_args: Vec<String> = vec![
+        "wifi".to_string(),
+        "connect-network".to_string(),
+        args.ssid.clone(),
+        security.clone(),
+    ];
+    if matches!(security.as_str(), "wpa2" | "wpa3") {
+        connect_args.push(args.psk.clone().ok_or("--psk is required for wpa2/wpa3")?);
+    }
+    if args.metered {
+        connect_args.push("-m".to_string());
+    }
+    if args.disable_autojoin {
+        connect_args.push("-d".to_string());
+    }
+
+    println!("arda net: connecting to ssid='{}' security={}", args.ssid, security);
+    let out = run_command_output_owned("cmd", &connect_args)?;
+    print_command_output("cmd", &connect_args, &out);
+    if !out.success() {
+        return Err(format!(
+            "cmd wifi connect-network failed: status={} stdout='{}' stderr='{}'",
+            out.status,
+            out.stdout.trim(),
+            out.stderr.trim()
+        )
+        .into());
+    }
+
+    wait_for_wifi_status(&args.ssid, Duration::from_millis(args.wait_ms));
+    net_status(Vec::new())
+}
+
+fn parse_net_join_args(argv: Vec<String>) -> Result<NetJoinArgs, Box<dyn std::error::Error>> {
+    let mut ssid: Option<String> = None;
+    let mut psk: Option<String> = None;
+    let mut security: Option<String> = None;
+    let mut metered = false;
+    let mut disable_autojoin = false;
+    let mut wait_ms = 15_000;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--ssid" => {
+                i += 1;
+                ssid = Some(argv.get(i).ok_or("--ssid requires value")?.clone());
+            }
+            "--psk" | "--pass" | "--password" => {
+                i += 1;
+                psk = Some(argv.get(i).ok_or("--psk requires value")?.clone());
+            }
+            "--security" => {
+                i += 1;
+                security = Some(argv.get(i).ok_or("--security requires value")?.to_ascii_lowercase());
+            }
+            "--metered" => metered = true,
+            "--disable-autojoin" | "--no-autojoin" => disable_autojoin = true,
+            "--wait-ms" => {
+                i += 1;
+                wait_ms = argv.get(i).ok_or("--wait-ms requires value")?.parse()?;
+            }
+            "--help" | "-h" => {
+                println!("net-join --ssid SSID [--psk PASS] [--security open|owe|wpa2|wpa3] [--metered] [--disable-autojoin] [--wait-ms 15000]");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown net-join arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    Ok(NetJoinArgs {
+        ssid: ssid.ok_or("--ssid is required")?,
+        psk,
+        security,
+        metered,
+        disable_autojoin,
+        wait_ms,
+    })
+}
+
+fn validate_wifi_security(security: &str, psk: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    match security {
+        "open" | "owe" => Ok(()),
+        "wpa2" | "wpa3" => {
+            let psk = psk.ok_or("--psk is required for wpa2/wpa3")?;
+            if psk.len() < 8 {
+                return Err("WPA passphrase must be at least 8 characters".into());
+            }
+            Ok(())
+        }
+        other => Err(format!("unsupported security '{other}', use open|owe|wpa2|wpa3").into()),
+    }
+}
+
+fn wait_for_wifi_status(ssid: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() <= timeout {
+        if let Ok(out) = run_command_output("cmd", &["wifi", "status"]) {
+            let combined = format!("{}\n{}", out.stdout, out.stderr);
+            if wifi_status_is_connected_to(&combined, ssid) {
+                println!("arda net: Wi-Fi connected after {}ms", start.elapsed().as_millis());
+                return;
+            }
+        }
+        if interface_has_ipv4("wlan0") {
+            println!("arda net: wlan0 has IPv4 after {}ms", start.elapsed().as_millis());
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("arda net: connection wait timed out after {}ms; printing current status", timeout.as_millis());
+}
+
+fn wifi_status_is_connected_to(status: &str, ssid: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("not connected") || lower.contains("is disconnected") || lower.contains("state: disconnected") {
+        return false;
+    }
+    if status.contains(ssid) && (lower.contains("connected") || lower.contains("networkid") || lower.contains("bssid")) {
+        return true;
+    }
+    lower.contains("wifi is connected") || lower.contains("state: connected")
+}
+
+fn interface_has_ipv4(iface: &str) -> bool {
+    let query = format!("ip -4 addr show {iface} 2>/dev/null | grep -q ' inet '");
+    Command::new("sh")
+        .arg("-c")
+        .arg(query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn net_disconnect(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssid: Option<String> = None;
+    let mut disable_wifi = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--ssid" => {
+                i += 1;
+                ssid = Some(argv.get(i).ok_or("--ssid requires value")?.clone());
+            }
+            "--disable-wifi" => disable_wifi = true,
+            "--help" | "-h" => {
+                println!("net-disconnect [--ssid SSID] [--disable-wifi]");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown net-disconnect arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let had_ssid = ssid.is_some();
+    if let Some(ssid) = ssid {
+        let list = run_command_output("cmd", &["wifi", "list-networks"])?;
+        print_command_output("cmd", &["wifi".to_string(), "list-networks".to_string()], &list);
+        if let Some(network_id) = find_wifi_network_id(&list.stdout, &ssid) {
+            println!("arda net: forgetting ssid='{}' network_id={}", ssid, network_id);
+            run_command_report("cmd", &["wifi", "forget-network", network_id.as_str()]);
+        } else {
+            println!("arda net: ssid='{}' not found in configured networks", ssid);
+        }
+    }
+
+    if disable_wifi || !had_ssid {
+        println!("arda net: disabling Wi-Fi");
+        run_command_report("svc", &["wifi", "disable"]);
+    }
+
+    net_status(Vec::new())
+}
+
+fn find_wifi_network_id(list_stdout: &str, ssid: &str) -> Option<String> {
+    for line in list_stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Network Id") || trimmed.starts_with("No networks") {
+            continue;
+        }
+        if trimmed.contains(ssid) {
+            let id = trimmed.split_whitespace().next()?;
+            if id.chars().all(|ch| ch.is_ascii_digit()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn net_proxy(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = Some(argv.get(i).ok_or("--host requires value")?.clone());
+            }
+            "--port" => {
+                i += 1;
+                port = Some(argv.get(i).ok_or("--port requires value")?.parse()?);
+            }
+            "--help" | "-h" => {
+                println!("net-proxy --host HOST --port PORT");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown net-proxy arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let host = host.ok_or("--host is required")?;
+    let port = port.ok_or("--port is required")?;
+    let value = format!("{host}:{port}");
+    println!("arda net: setting Android global HTTP proxy to {value}");
+    run_command_report("settings", &["put", "global", "http_proxy", value.as_str()]);
+    net_status(Vec::new())
+}
+
+fn net_proxy_clear() -> Result<(), Box<dyn std::error::Error>> {
+    println!("arda net: clearing Android global HTTP proxy");
+    run_command_report("settings", &["put", "global", "http_proxy", ":0"]);
+    run_command_report("settings", &["delete", "global", "http_proxy"]);
+    net_status(Vec::new())
+}
+
+#[derive(Debug, Clone)]
+struct NetApArgs {
+    ssid: Option<String>,
+    psk: Option<String>,
+    security: String,
+    wait_ms: u64,
+    use_saved_config: bool,
+    prefer_connectivity_tether: bool,
+    force_unsafe_softap: bool,
+}
+
+fn net_ap_start(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_net_ap_args(argv)?;
+    if !args.force_unsafe_softap {
+        println!("arda net: net-ap-start is disabled by default on this AAOS image.");
+        println!("arda net: last test showed hostapd/HAL SoftAP setup failure and moving WifiConfigStore*.xml was needed to recover boot.");
+        println!("arda net: use phone-hotspot client mode first: phone opens hotspot, AAOS runs net-join.");
+        println!("arda net: to intentionally retry AP mode, pass --force-unsafe-softap and keep ADB rescue ready.");
+        return Ok(());
+    }
+    if !is_effective_root() {
+        println!("arda net: net-ap-start unsafe mode needs root; re-running through su");
+        return run_self_command_as_root("net-ap-start", &net_ap_args_to_argv(&args), "root net-ap-start failed");
+    }
+    let ssid_label = args.ssid.as_deref().unwrap_or("<saved Settings hotspot config>");
+    println!("arda net: UNSAFE experimental AAOS SoftAP start ssid='{}' security={}", ssid_label, args.security);
+    println!("arda net: reverse mode: phone joins AAOS AP, companion binds outbound proxy to cellular.");
+
+    // Be conservative: a client Wi-Fi connection and tethered SoftAP cannot both own the same
+    // single-radio wlan0 path on many Pi/AAOS images. Stop any previous AP and disable client
+    // Wi-Fi before trying tethered SoftAP.
+    run_command_report("cmd", &["wifi", "stop-softap"]);
+    run_command_report("cmd", &["wifi", "stop-lohs"]);
+    run_command_report("cmd", &["connectivity", "tether", "stop", "wifi"]);
+    run_command_report("svc", &["wifi", "disable"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+
+    if args.use_saved_config || args.prefer_connectivity_tether || args.ssid.is_none() {
+        candidates.push(("framework tether saved-config".into(), vec!["connectivity".into(), "tether".into(), "start".into(), "wifi".into()]));
+        candidates.push(("framework tether wlan0".into(), vec!["connectivity".into(), "tether".into(), "start".into(), "wlan0".into()]));
+    }
+
+    if let Some(ssid) = args.ssid.clone() {
+        if args.security == "open" {
+            candidates.push(("wifi start-softap custom open".into(), vec!["wifi".into(), "start-softap".into(), ssid.clone(), "open".into()]));
+            candidates.push(("wifi start-lohs custom open".into(), vec!["wifi".into(), "start-lohs".into(), ssid, "open".into()]));
+        } else {
+            let psk = args.psk.clone().ok_or("--psk is required for wpa2 SoftAP")?;
+            candidates.push(("wifi start-softap custom wpa2".into(), vec!["wifi".into(), "start-softap".into(), ssid.clone(), "wpa2".into(), psk.clone()]));
+            candidates.push(("wifi start-lohs custom wpa2".into(), vec!["wifi".into(), "start-lohs".into(), ssid, "wpa2".into(), psk]));
+        }
+    }
+
+    if !args.use_saved_config && !args.prefer_connectivity_tether {
+        // Some images only expose the Settings-backed tether command. Keep it as a fallback even
+        // when a custom SSID was requested; the resulting SSID can be the one configured in UI.
+        candidates.push(("framework tether fallback saved-config".into(), vec!["connectivity".into(), "tether".into(), "start".into(), "wifi".into()]));
+    }
+
+    for (label, candidate) in candidates {
+        println!("arda net: trying {label}");
+        match run_command_output_owned("cmd", &candidate) {
+            Ok(out) => {
+                print_command_output("cmd", &candidate, &out);
+                if out.success() {
+                    std::thread::sleep(Duration::from_millis(args.wait_ms));
+                    net_status(Vec::new())?;
+                    return Ok(());
+                }
+            }
+            Err(err) => println!("$ cmd {}\nERROR: {err}", candidate.join(" ")),
+        }
+    }
+
+    println!("arda net: shell SoftAP/tether commands failed or are not present; trying Android 11 service-call fallback with saved hotspot config");
+    run_command_report("service", &["call", "wifi", "47"]);
+    std::thread::sleep(Duration::from_millis(args.wait_ms));
+    net_status(Vec::new())
+}
+
+fn parse_net_ap_args(argv: Vec<String>) -> Result<NetApArgs, Box<dyn std::error::Error>> {
+    let mut ssid: Option<String> = None;
+    let mut psk: Option<String> = None;
+    let mut security = "wpa2".to_string();
+    let mut wait_ms = 5_000;
+    let mut use_saved_config = false;
+    let mut prefer_connectivity_tether = false;
+    let mut force_unsafe_softap = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--ssid" => {
+                i += 1;
+                ssid = Some(argv.get(i).ok_or("--ssid requires value")?.clone());
+            }
+            "--psk" | "--pass" | "--password" => {
+                i += 1;
+                psk = Some(argv.get(i).ok_or("--psk requires value")?.clone());
+            }
+            "--security" => {
+                i += 1;
+                security = argv.get(i).ok_or("--security requires value")?.to_ascii_lowercase();
+            }
+            "--wait-ms" => {
+                i += 1;
+                wait_ms = argv.get(i).ok_or("--wait-ms requires value")?.parse()?;
+            }
+            "--use-saved-config" | "--settings-config" => use_saved_config = true,
+            "--framework-tether-first" | "--connectivity-tether-first" => prefer_connectivity_tether = true,
+            "--force-unsafe-softap" | "--unsafe" => force_unsafe_softap = true,
+            "--help" | "-h" => {
+                println!("net-ap-start [--force-unsafe-softap] [--use-saved-config] [--ssid SSID --psk PASS --security open|wpa2] [--framework-tether-first] [--wait-ms 5000]");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown net-ap-start arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if !matches!(security.as_str(), "open" | "wpa2") {
+        return Err("--security for net-ap-start must be open or wpa2".into());
+    }
+    if use_saved_config {
+        if ssid.is_some() || psk.is_some() {
+            println!("arda net: --use-saved-config ignores --ssid/--psk and uses the Hotspot settings UI config");
+        }
+    } else if security == "wpa2" && ssid.is_some() {
+        let psk_ref = psk.as_deref().ok_or("--psk is required for wpa2 SoftAP")?;
+        if psk_ref.len() < 8 {
+            return Err("SoftAP WPA2 passphrase must be at least 8 characters".into());
+        }
+    }
+
+    Ok(NetApArgs {
+        ssid,
+        psk,
+        security,
+        wait_ms,
+        use_saved_config,
+        prefer_connectivity_tether,
+        force_unsafe_softap,
+    })
+}
+
+fn net_ap_args_to_argv(args: &NetApArgs) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(ssid) = &args.ssid {
+        argv.push("--ssid".to_string());
+        argv.push(ssid.clone());
+    }
+    if let Some(psk) = &args.psk {
+        argv.push("--psk".to_string());
+        argv.push(psk.clone());
+    }
+    argv.push("--security".to_string());
+    argv.push(args.security.clone());
+    argv.push("--wait-ms".to_string());
+    argv.push(args.wait_ms.to_string());
+    if args.use_saved_config {
+        argv.push("--use-saved-config".to_string());
+    }
+    if args.prefer_connectivity_tether {
+        argv.push("--framework-tether-first".to_string());
+    }
+    if args.force_unsafe_softap {
+        argv.push("--force-unsafe-softap".to_string());
+    }
+    argv
+}
+
+
+fn net_ap_stop(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let rescue_configs = argv.iter().any(|a| a == "--rescue-configs" || a == "--rescue" || a == "--wifi-rescue");
+    println!("arda net: stopping experimental AAOS SoftAP/LOHS/tether");
+    run_softap_stop_commands();
+    if rescue_configs {
+        net_wifi_rescue(Vec::new())?;
+    }
+    net_status(Vec::new())
+}
+
+fn net_wifi_rescue(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut backup_dir: Option<String> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--backup-dir" => {
+                i += 1;
+                backup_dir = Some(argv.get(i).ok_or("--backup-dir requires value")?.clone());
+            }
+            "--help" | "-h" => {
+                println!("net-wifi-rescue [--backup-dir DIR]");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown net-wifi-rescue arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    println!("arda net: Wi-Fi/SoftAP rescue: stop AP, disable Wi-Fi, back up config stores");
+    run_softap_stop_commands();
+    run_command_report("cmd", &["wifi", "set-wifi-enabled", "disabled"]);
+    run_command_report("svc", &["wifi", "disable"]);
+    run_command_report("settings", &["put", "global", "wifi_on", "0"]);
+
+    let backup_dir = backup_dir.unwrap_or_else(|| "/data/local/tmp/arda-wifi-rescue".to_string());
+    let rescue = format!(
+        "B={}; mkdir -p \"$B\"; for d in /data/misc/apexdata/com.android.wifi /data/misc/wifi; do if [ -d \"$d\" ]; then find \"$d\" -maxdepth 1 -type f \\( -iname '*SoftAp*' -o -iname '*WifiConfig*' -o -iname '*WifiConfigStore*' \\) -print -exec mv {{}} \"$B\"/ \\;; fi; done",
+        shell_quote(&backup_dir)
+    );
+    run_command_report("sh", &["-c", rescue.as_str()]);
+    run_command_report("sync", &[]);
+    println!("arda net: rescue done; reboot is recommended if Android userspace is unstable");
+    Ok(())
+}
+
+fn run_softap_stop_commands() {
+    run_command_report("cmd", &["connectivity", "tether", "stop", "wifi"]);
+    run_command_report("cmd", &["wifi", "stop-softap"]);
+    run_command_report("cmd", &["wifi", "stop-lohs"]);
+    run_command_report("service", &["call", "wifi", "49"]);
+}
+
+#[derive(Debug)]
+struct SimpleCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+impl SimpleCommandOutput {
+    fn success(&self) -> bool {
+        self.status.success()
+    }
+}
+
+fn run_command_output(program: &str, args: &[&str]) -> io::Result<SimpleCommandOutput> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(SimpleCommandOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn run_command_output_owned(program: &str, args: &[String]) -> io::Result<SimpleCommandOutput> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(SimpleCommandOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn print_command(program: &str, args: &[&str]) {
+    match run_command_output(program, args) {
+        Ok(out) => {
+            let owned_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            print_command_output(program, &owned_args, &out);
+        }
+        Err(err) => println!("$ {program} {}\nERROR: {err}", args.join(" ")),
+    }
+}
+
+fn print_shell(script: &str) {
+    match run_command_output("sh", &["-c", script]) {
+        Ok(out) => print_command_output("sh", &["-c".to_string(), script.to_string()], &out),
+        Err(err) => println!("$ sh -c {}\nERROR: {err}", shell_quote(script)),
+    }
+}
+
+fn run_command_report(program: &str, args: &[&str]) -> bool {
+    match run_command_output(program, args) {
+        Ok(out) => {
+            let owned_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            print_command_output(program, &owned_args, &out);
+            out.success()
+        }
+        Err(err) => {
+            println!("$ {program} {}\nERROR: {err}", args.join(" "));
+            false
+        }
+    }
+}
+
+fn print_command_output(program: &str, args: &[String], out: &SimpleCommandOutput) {
+    println!("$ {program} {}", args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
+    println!("status={}", out.status);
+    if !out.stdout.trim().is_empty() {
+        println!("stdout:\n{}", out.stdout.trim_end());
+    }
+    if !out.stderr.trim().is_empty() {
+        println!("stderr:\n{}", out.stderr.trim_end());
+    }
+}
+
 #[derive(Debug)]
 struct CaptureArgs {
     size: String,
     bit_rate: u32,
     seconds: u32,
+    codec_name: String,
     out: OutputTarget,
     loop_forever: bool,
     verbose: bool,
@@ -748,8 +1471,8 @@ fn capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         run_index += 1;
         if !output_is_stdout {
             eprintln!(
-                "arda capture: starting screenrecord run #{run_index}: size={} bit_rate={} seconds={}",
-                args.size, args.bit_rate, args.seconds
+                "arda capture: starting screenrecord run #{run_index}: size={} bit_rate={} seconds={} codec={}",
+                args.size, args.bit_rate, args.seconds, args.codec_name
             );
         }
 
@@ -758,6 +1481,7 @@ fn capture_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             bit_rate: args.bit_rate,
             seconds: args.seconds,
             display_id: None,
+            codec_name: Some(args.codec_name.clone()),
         };
 
         if output_is_stdout {
@@ -823,6 +1547,7 @@ fn parse_capture_args(argv: Vec<String>) -> Result<CaptureArgs, Box<dyn std::err
     let mut size = String::from("1280x720");
     let mut bit_rate = 6_000_000u32;
     let mut seconds = 10u32;
+    let mut codec_name = preferred_codec_name();
     let mut out = OutputTarget::Stdout;
     let mut loop_forever = false;
     let mut verbose = false;
@@ -841,6 +1566,13 @@ fn parse_capture_args(argv: Vec<String>) -> Result<CaptureArgs, Box<dyn std::err
             "--seconds" | "--time-limit" => {
                 i += 1;
                 seconds = parse_u32(argv.get(i).ok_or("--seconds requires value")?)?;
+            }
+            "--codec-name" => {
+                i += 1;
+                codec_name = argv.get(i).ok_or("--codec-name requires value")?.trim().to_string();
+                if codec_name.is_empty() {
+                    return Err("--codec-name may not be empty".into());
+                }
             }
             "--out" | "-o" => {
                 i += 1;
@@ -869,6 +1601,7 @@ fn parse_capture_args(argv: Vec<String>) -> Result<CaptureArgs, Box<dyn std::err
         size,
         bit_rate,
         seconds,
+        codec_name,
         out,
         loop_forever,
         verbose,
@@ -978,6 +1711,164 @@ fn native_capture(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if !output_is_stdout {
         print!("{report}");
     }
+    Ok(())
+}
+
+fn native_capture_repeat_test(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut runs = 3u32;
+    let mut run_ms = 1_500u64;
+    let mut pause_ms = 500u64;
+    let mut out_prefix = String::from("/data/local/tmp/arda-native-repeat");
+    let mut capture_argv = Vec::new();
+
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--runs" => {
+                i += 1;
+                runs = argv.get(i).ok_or("--runs requires count")?.parse::<u32>()?;
+            }
+            "--run-ms" => {
+                i += 1;
+                run_ms = argv.get(i).ok_or("--run-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--pause-ms" => {
+                i += 1;
+                pause_ms = argv.get(i).ok_or("--pause-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--out-prefix" => {
+                i += 1;
+                out_prefix = argv.get(i).ok_or("--out-prefix requires path")?.clone();
+            }
+            "--help" | "-h" => {
+                println!(
+                    "native-capture-repeat-test [--runs 3] [--run-ms 1500] [--pause-ms 500] [--out-prefix /data/local/tmp/arda-native-repeat] [--size 1280x720] [--bit-rate 6000000] [--fps 30]"
+                );
+                return Ok(());
+            }
+            value => capture_argv.push(value.to_string()),
+        }
+        i += 1;
+    }
+
+    if runs == 0 || runs > 20 {
+        return Err("--runs must be 1..20".into());
+    }
+    if run_ms < 250 || run_ms > 60_000 {
+        return Err("--run-ms must be 250..60000".into());
+    }
+    if pause_ms > 30_000 {
+        return Err("--pause-ms must be 0..30000".into());
+    }
+
+    let args = parse_native_capture_args(capture_argv)?;
+    let exe = env::current_exe()?;
+    let capture_log = Path::new("/data/local/tmp/arda-display-capture-test.log");
+
+    println!("arda native capture repeat test v50");
+    println!("runs={runs}");
+    println!("run_ms={run_ms}");
+    println!("pause_ms={pause_ms}");
+    println!("size={}x{}", args.width, args.height);
+    println!("bit_rate={}", args.bit_rate);
+    println!("fps={}", args.fps);
+    println!("out_prefix={out_prefix}");
+    println!();
+
+    for run in 1..=runs {
+        let out = format!("{out_prefix}-{run:02}.h264");
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(capture_log);
+
+        println!("NATIVE_REPEAT_RUN_BEGIN run={run}/{runs} out={out}");
+        let started = Instant::now();
+        let mut child = Command::new(&exe)
+            .arg("native-capture")
+            .arg("--size")
+            .arg(format!("{}x{}", args.width, args.height))
+            .arg("--bit-rate")
+            .arg(args.bit_rate.to_string())
+            .arg("--fps")
+            .arg(args.fps.to_string())
+            .arg("--seconds")
+            .arg("0")
+            .arg("--out")
+            .arg(&out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|err| format!("repeat run {run}: failed to spawn native-capture: {err}"))?;
+
+        thread::sleep(Duration::from_millis(run_ms));
+
+        unsafe {
+            let rc = kill(child.id() as c_int, SIGTERM);
+            println!("NATIVE_REPEAT_SIGTERM run={run} pid={} rc={rc}", child.id());
+        }
+
+        let wait_started = Instant::now();
+        let status = loop {
+            match child.try_wait()? {
+                Some(status) => break status,
+                None if wait_started.elapsed() < Duration::from_secs(5) => {
+                    thread::sleep(Duration::from_millis(40));
+                }
+                None => {
+                    println!("NATIVE_REPEAT_FORCE_KILL run={run} pid={}", child.id());
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+            }
+        };
+
+        let log = fs::read_to_string(capture_log)
+            .map_err(|err| format!("repeat run {run}: failed to read {}: {err}", capture_log.display()))?;
+        let output_bytes = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+
+        let required_markers = [
+            "stop requested: leaving drain loop for graceful cleanup",
+            "after destroyDisplay",
+            "after signalEndOfInputStream",
+            "after cleanup",
+            "child returned rc=0",
+        ];
+        let missing = required_markers
+            .iter()
+            .copied()
+            .filter(|marker| !log.contains(marker))
+            .collect::<Vec<_>>();
+
+        println!(
+            "NATIVE_REPEAT_RUN_RESULT run={} status={} elapsed_ms={} output_bytes={} missing_markers={}",
+            run,
+            status,
+            started.elapsed().as_millis(),
+            output_bytes,
+            if missing.is_empty() { "none".to_string() } else { missing.join(" | ") }
+        );
+
+        if !status.success() {
+            return Err(format!("repeat run {run}: native-capture exited with {status}").into());
+        }
+        if output_bytes == 0 {
+            return Err(format!("repeat run {run}: encoded output is empty: {out}").into());
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "repeat run {run}: graceful cleanup markers missing: {}",
+                missing.join(" | ")
+            )
+            .into());
+        }
+
+        println!("NATIVE_REPEAT_RUN_OK=YES run={run}");
+        if run < runs && pause_ms > 0 {
+            thread::sleep(Duration::from_millis(pause_ms));
+        }
+    }
+
+    println!("NATIVE_CAPTURE_REPEAT_TEST_OK=YES");
     Ok(())
 }
 
@@ -1596,6 +2487,8 @@ fn parse_aap_ssl_frame_probe_args(argv: Vec<String>) -> Result<AapSslFrameProbeA
 
 #[derive(Debug)]
 struct AapTlsHandshakeProbeArgs {
+    transport: String,
+    usb_path: PathBuf,
     addr: String,
     dump: Option<PathBuf>,
     timeout_ms: u64,
@@ -1676,6 +2569,8 @@ struct AapTlsHandshakeProbeArgs {
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_aap_tls_handshake_probe_args(argv)?;
     aap::tls_handshake_probe(aap::TlsHandshakeProbeConfig {
+        transport: args.transport,
+        usb_path: args.usb_path,
         addr: args.addr,
         dump_path: args.dump,
         timeout_ms: args.timeout_ms,
@@ -1774,6 +2669,8 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         args.max_frames = 128;
     }
     aap::tls_plain_probe(aap::TlsHandshakeProbeConfig {
+        transport: args.transport,
+        usb_path: args.usb_path,
         addr: args.addr,
         dump_path: args.dump,
         timeout_ms: args.timeout_ms,
@@ -1855,7 +2752,11 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
 
 
 fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = parse_aap_tls_handshake_probe_args(argv)?;
+    let expanded = config::expand_aap_session_args(argv)?;
+    if let Some(path) = expanded.config_path.as_ref() {
+        println!("arda config: loaded {} (CLI flags override config)", path.display());
+    }
+    let mut args = parse_aap_tls_handshake_probe_args(expanded.argv)?;
     if args.dump == Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log")) {
         args.dump = Some(PathBuf::from("/data/local/tmp/arda-aap-service-discovery.log"));
     }
@@ -1863,6 +2764,8 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         args.max_frames = 256;
     }
     aap::tls_service_discovery_probe(aap::TlsHandshakeProbeConfig {
+        transport: args.transport,
+        usb_path: args.usb_path,
         addr: args.addr,
         dump_path: args.dump,
         timeout_ms: args.timeout_ms,
@@ -1982,6 +2885,8 @@ fn parse_android_keycode(value: &str) -> Result<u32, Box<dyn std::error::Error>>
 }
 
 fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandshakeProbeArgs, Box<dyn std::error::Error>> {
+    let mut transport = String::from("tcp");
+    let mut usb_path = PathBuf::from("/dev/usb_accessory");
     let mut addr = String::from("0.0.0.0:5277");
     let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log"));
     let mut timeout_ms = 60_000u64;
@@ -2061,6 +2966,20 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--transport" => {
+                i += 1;
+                transport = argv.get(i).ok_or("--transport requires tcp|usb-accessory")?.to_ascii_lowercase();
+            }
+            "--usb" | "--usb-transport" => {
+                transport = String::from("usb");
+            }
+            "--tcp" | "--tcp-transport" => {
+                transport = String::from("tcp");
+            }
+            "--usb-path" | "--accessory-path" => {
+                i += 1;
+                usb_path = PathBuf::from(argv.get(i).ok_or("--usb-path requires device path")?);
+            }
             "--addr" | "--listen" => {
                 i += 1;
                 addr = argv.get(i).ok_or("--addr requires value")?.clone();
@@ -2657,8 +3576,21 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         i += 1;
     }
 
-    if !addr.contains(':') {
-        return Err("--addr must look like HOST:PORT".into());
+    transport = match transport.as_str() {
+        "tcp" => String::from("tcp"),
+        "usb" | "usb-accessory" | "accessory" | "hu-usb" => String::from("usb-accessory"),
+        other => {
+            return Err(format!(
+                "--transport unsupported value: {other}; use tcp or usb-accessory"
+            )
+            .into())
+        }
+    };
+    if transport == "tcp" && !addr.contains(':') {
+        return Err("--addr must look like HOST:PORT for TCP transport".into());
+    }
+    if transport == "usb-accessory" && usb_path.as_os_str().is_empty() {
+        return Err("--usb-path cannot be empty for USB accessory transport".into());
     }
     if timeout_ms == 0 {
         return Err("--timeout-ms must be positive".into());
@@ -2744,6 +3676,8 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     }
 
     Ok(AapTlsHandshakeProbeArgs {
+        transport,
+        usb_path,
         addr,
         dump,
         timeout_ms,

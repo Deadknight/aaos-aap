@@ -241,3 +241,108 @@ Implemented:
 Next after test:
 - Run `aap-session-probe` from the normal `adb shell` path and verify the old mount/chown/chmod permission lines are gone.
 - Confirm `aaos-aoa-gadget --check` still prints status without requiring root.
+
+## v47 AAOS phone internet bridge bootstrap
+
+Goal: make the ARDA AAOS device usable without built-in internet by using the driver's phone.
+
+Decision:
+- Use Bluetooth only as a control/bootstrap channel later; do not carry bulk internet over BT.
+- First MVP: phone normal hotspot/tethering, AAOS joins as Wi-Fi client.
+- Second mode: phone LocalOnlyHotspot or AAOS SoftAP plus companion app proxy. For full-device internet, add tun2socks later; Android global HTTP proxy is only a partial bridge.
+- Gearhead/AA Wireless bootstrap is useful as a model for exchanging SSID/key/IP/port, but it is projection transport bootstrap, not generic internet sharing.
+
+Implemented now:
+- `net-status` / `internet-status`: prints `cmd wifi status`, configured networks, SoftAP/tether diagnostics, Wi-Fi/AP interfaces, wlan0 address, routes, DNS props and Android global proxy.
+- `net-join` / `internet-join`: enables Wi-Fi, starts scan, calls `cmd wifi connect-network <ssid> open|owe|wpa2|wpa3 [passphrase]`, waits briefly, then prints status.
+- `net-disconnect` / `internet-disconnect`: forgets a network by SSID, or disables Wi-Fi if no SSID is supplied.
+- `net-proxy` / `internet-proxy`: sets Android global HTTP proxy for companion HTTP-proxy experiments.
+- `net-proxy-clear` / `internet-proxy-clear`: clears Android global HTTP proxy.
+- `net-ap-start` / `internet-ap-start`: experimental AAOS SoftAP/reverse-mode helper; supports `--use-saved-config` to start the Settings Hotspot config through Connectivity tethering, or custom `cmd wifi start-softap`/LOHS when supported.
+- `net-ap-stop` / `internet-ap-stop`: experimental SoftAP stop helper.
+- Add `docs/AAOS_PHONE_INTERNET_BRIDGE.md` with mode comparison and test commands.
+
+Next:
+- Test `net-status` on the current AAOS image and capture exact `cmd wifi` support.
+- Test MVP with phone hotspot and verify Maps/GMS internet.
+- If phone hotspot cannot be automated, implement companion LocalOnlyHotspot + HTTP/SOCKS proxy offer over BT.
+- If HTTP proxy is insufficient for Maps/GMS, add AAOS tun2socks helper and route default through the phone proxy.
+
+## v48 AAOS SoftAP/tether diagnostics and saved-config start
+
+Observed test result:
+- Phone-hotspot/client mode did not connect to the requested SSID yet, but the device still had internet through `eth0`; the old wait logic incorrectly matched `Wifi is not connected` because it contained the word `connected`. Fixed by requiring a real connected status or an IPv4 address on `wlan0`.
+- Reverse mode `cmd wifi start-softap ARDA-AAOS ...` returned success, but Settings still showed Hotspot off / saved config name. This is now treated as inconclusive rather than trusted.
+
+Implemented:
+- `net-status` now includes `dumpsys wifi` and `dumpsys connectivity` SoftAP/tether snippets plus Wi-Fi/AP-like interfaces.
+- `net-ap-start --use-saved-config` starts the Settings Hotspot configuration through `cmd connectivity tether start wifi` first. This is the recommended reverse-mode test on the RPi AAOS image.
+- Custom `net-ap-start --ssid ...` remains available, with Connectivity saved-config fallback.
+- `net-ap-stop` now also calls `cmd connectivity tether stop wifi`.
+
+## v49 SoftAP bootloop guard and Wi-Fi rescue
+
+Observed test result:
+- `net-ap-start --use-saved-config` reached `WifiService: startSoftAp uid=0`, but SoftAP failed at hostapd/HAL setup: `Cannot find entry android.hardware.wifi.hostapd@1.0::IHostapd/default`, `Failed to connect to hostapd`, `setup failure when creating ap interface`.
+- After that, the device entered an Android userspace restart loop. Recovery was possible over ADB by stopping SoftAP/Wi-Fi and moving `/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml` and `WifiConfigStoreSoftAp.xml` to `/data/local/tmp/arda-wifi-rescue`.
+
+Implemented:
+- `net-ap-start` is disabled by default on this image. It prints a warning and exits unless `--force-unsafe-softap` is explicitly supplied.
+- `net-ap-stop` now works without attempting automatic `su -c`; add `--rescue-configs` to run the Wi-Fi rescue cleanup after stopping AP.
+- New `net-wifi-rescue [--backup-dir DIR]` command performs the ADB recovery sequence: stop SoftAP, disable Wi-Fi, set `wifi_on=0`, back up Wi-Fi config stores, and sync.
+- `run_self_command_as_root` now tries multiple Android `su` forms (`su -c`, `su 0 sh -c`, `su root sh -c`) because this image rejects `su -c`.
+
+Decision:
+- Do not auto-start AAOS SoftAP from init until the image has working hostapd/HAL/firmware support or a separate known-good AP path.
+- The preferred internet route remains phone hotspot -> AAOS `net-join` first.
+- Reverse mode is still architecturally valid: AAOS AP -> phone joins -> companion proxy bound to cellular. It needs a working AP backend before it can be made persistent.
+
+## v50 local native capture repeat self-test
+
+Goal: validate the unfinished v45 graceful-teardown work locally before returning to AAP/DHU rendering or AAOS image changes.
+
+Implemented:
+- Add `native-capture-repeat-test` / `native-repeat-test`.
+- Default test runs native display capture 3 times back-to-back.
+- Each run uses the real long-running `native-capture --seconds 0` path, waits briefly, sends SIGTERM, and waits up to 5 seconds before a SIGKILL fallback.
+- Verify the native capture log contains all graceful teardown markers:
+  - `stop requested: leaving drain loop for graceful cleanup`
+  - `after destroyDisplay`
+  - `after signalEndOfInputStream`
+  - `after cleanup`
+  - `child returned rc=0`
+- Verify every run produces a non-empty H.264 file.
+- Fail immediately on a missing marker, empty output, or non-zero child exit.
+
+Next after test:
+- Push the local Android binary and run the 3-pass repeat self-test on AAOS.
+- Only after `NATIVE_CAPTURE_REPEAT_TEST_OK=YES`, return to the AAP session and measure first-frame/render latency.
+- Do not touch AAOS framework/image code for rendering unless the local native capture path itself is clean and repeatable.
+
+## v52 current baseline profile + direct USB AAP transport
+
+Status: implemented in source; device compile/runtime verification pending.
+
+- Added repository-root `config.toml` as the current bring-up source of truth.
+- Added dependency-free ARDA config loader; unknown keys fail loudly.
+- Added `config-check [PATH]` to print resolved config-derived CLI args.
+- Added `aap-run`, which loads `/data/local/tmp/arda-config.toml`; later CLI flags override config.
+- Removed automatic AOA gadget creation/rebind from normal command startup.
+- Kept `aaos-aoa-gadget` only as a manual/legacy recovery command.
+- Added read-only `usb-accessory-status` for `/proc/misc`, `/dev/usb_accessory`, UDC state, and configfs accessory function visibility.
+- Added real HU-side `--transport usb-accessory --usb-path /dev/usb_accessory` support to the full AAP session path; `usb` remains a compatibility alias.
+- aa-proxy source comparison confirmed the role: its HU/car branch opens `/dev/usb_accessory` directly, while its `nusb` AOA switch/bulk endpoint code is only for a wired phone/MD. ARDA is the phone-like AAP endpoint, so the HU-side accessory char device is the correct transport.
+- USB accessory transport uses one blocking reader thread on a cloned accessory fd. The kernel accessory read path is interruptible; the session consumes reader events with timed channel waits, so the existing 20 ms video/audio pump cadence still runs between HU frames; cleanup interrupts and joins the reader thread.
+- TCP remains available as an explicit debugging fallback.
+- Current baseline keeps video + app/framework input only; audio and sensor/VHAL forwarding remain disabled until USB live-video refresh is stable.
+
+Immediate v52 test order:
+
+1. Build/push `arda-senderd` and push `config.toml` as `/data/local/tmp/arda-config.toml`.
+2. Run `usb-accessory-status`; require `USB_ACCESSORY_READY=YES`.
+3. Run `config-check /data/local/tmp/arda-config.toml` and verify `--transport usb-accessory`, `--video-frames 0`, Waveshare profile, and app input mode.
+4. Start DHU/USB host side.
+5. Run `aap-run` and verify VERSION/TLS/SDR over `/dev/usb_accessory` without TCP listener/client logs.
+6. Exercise Maps/launcher continuously and verify SliceNonIdr + MEDIA DATA continue without a frame-limit stop.
+7. Only after video refresh is stable, re-enable sensor/VHAL with CLI overrides or a dedicated future profile.
+8. Use `scripts/arda-usb-run.sh` as the normal Mac workflow; stop reconstructing the baseline from shell history.

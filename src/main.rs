@@ -4,6 +4,7 @@ mod config;
 mod h264;
 mod input;
 mod native;
+mod sensor;
 
 use std::env;
 use std::fs::{self, File};
@@ -52,6 +53,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-capture" => native_capture(args.collect()),
         "native-capture-repeat-test" | "native-repeat-test" => native_capture_repeat_test(args.collect()),
         "input-test" => input_test(args.collect()),
+        "sensor-gate-smoke" => sensor_gate_smoke(),
+        "sensor-wasm-smoke" => sensor_wasm_smoke(args.collect()),
         "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
         "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
         "config-check" => config_check(args.collect()),
@@ -130,6 +133,12 @@ Commands:
   input-test [--size 1280x720] swipe X1 Y1 X2 Y2 [--duration-ms 300] [--steps 20]
       Creates a temporary /dev/uinput virtual touchscreen and injects a tap or swipe. Run with root on AAOS.
 
+  sensor-gate-smoke
+      Regression-checks that sensor parameter/config flags do not implicitly enable SensorSource or VHAL forwarding; only explicit master/destination flags may do so.
+
+  sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
+      Loads the Wasmtime sensor/VHAL policy engine, feeds deterministic sample events, and verifies the ABI plus typed host-command path without writing VHAL.
+
   aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--no-bind] [--check] [--unbind]
       Legacy/manual gadget bootstrap. Normal AAP commands no longer auto-create or rebind USB gadget state.
 
@@ -200,8 +209,8 @@ Commands:
   aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
 
-  aap-session-probe ... --sensor-open [--sensor-max-type 21] [--sensor-jsonl PATH] [--sensor-forward-os] [--sensor-forward-vhal] [--sensor-vhal-min-ms 500]
-      Opens the HU SensorSourceService channel, subscribes to advertised sensor types up to 21, decodes SensorBatch messages, optionally writes JSONL, and best-effort forwards LOCATION through cmd location plus supported vehicle values through cmd car_service inject-vhal-event.
+  aap-session-probe ... --sensor-open [--sensor-max-type 23] [--sensor-jsonl PATH] [--sensor-forward-os] [--sensor-forward-vhal] [--sensor-wasm builtin|PATH] [--sensor-wasm-fuel N] [--sensor-wasm-max-commands N] [--sensor-vhal-min-ms 500]
+      Opens the HU SensorSourceService channel only when --sensor-open is explicit, decodes generated-proto SensorBatch messages into ArdaSensorEvent values, optionally forwards LOCATION to Android, then runs the isolated Wasmtime policy module. Wasm can only request typed VHAL commands through the host ABI; Rust validates property/type/area/range/rate limits before the host adapter writes VHAL.
 
   aap-fragment-smoke
       Verifies AAP FIRST/MIDDLE/LAST plaintext fragmentation sizing used before TLS encryption.
@@ -2562,6 +2571,9 @@ struct AapTlsHandshakeProbeArgs {
     sensor_location_provider: String,
     sensor_location_min_ms: u64,
     sensor_vhal_min_ms: u64,
+    sensor_wasm_path: String,
+    sensor_wasm_fuel: u64,
+    sensor_wasm_max_commands: usize,
     quiet_ping_logs: bool,
     log_level: String,
 }
@@ -2644,6 +2656,9 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
         sensor_vhal_min_ms: args.sensor_vhal_min_ms,
+        sensor_wasm_path: args.sensor_wasm_path.clone(),
+        sensor_wasm_fuel: args.sensor_wasm_fuel,
+        sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -2657,6 +2672,126 @@ fn aap_proto_smoke() -> Result<(), Box<dyn std::error::Error>> {
 
 fn aap_fragment_smoke() -> Result<(), Box<dyn std::error::Error>> {
     aap::fragment_smoke()?;
+    Ok(())
+}
+
+fn sensor_gate_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let baseline = parse_aap_tls_handshake_probe_args(vec![
+        "--no-sensor-open".to_string(),
+        "--sensor-request-all".to_string(),
+        "--sensor-max-type".to_string(),
+        "23".to_string(),
+        "--sensor-jsonl".to_string(),
+        "/data/local/tmp/arda-sensors.jsonl".to_string(),
+        "--no-sensor-forward-vhal".to_string(),
+        "--sensor-vhal-min-ms".to_string(),
+        "500".to_string(),
+        "--sensor-wasm".to_string(),
+        "builtin".to_string(),
+        "--sensor-wasm-fuel".to_string(),
+        "50000".to_string(),
+        "--sensor-wasm-max-commands".to_string(),
+        "16".to_string(),
+    ])?;
+    if baseline.sensor_open {
+        return Err("sensor gate regression: parameter flags implicitly enabled sensor_open".into());
+    }
+    if baseline.sensor_forward_vhal {
+        return Err("sensor gate regression: parameter flags implicitly enabled sensor_forward_vhal".into());
+    }
+
+    let explicit = parse_aap_tls_handshake_probe_args(vec![
+        "--sensor-open".to_string(),
+        "--sensor-forward-vhal".to_string(),
+        "--sensor-max-type".to_string(),
+        "23".to_string(),
+        "--sensor-wasm".to_string(),
+        "builtin".to_string(),
+    ])?;
+    if !explicit.sensor_open || !explicit.sensor_forward_vhal {
+        return Err("sensor gate regression: explicit enable flags were not preserved".into());
+    }
+
+    println!(
+        "SENSOR_GATE_SMOKE baseline_open={} baseline_vhal={} explicit_open={} explicit_vhal={} max_type={}",
+        baseline.sensor_open,
+        baseline.sensor_forward_vhal,
+        explicit.sensor_open,
+        explicit.sensor_forward_vhal,
+        baseline.sensor_max_type,
+    );
+    println!("SENSOR_GATE_SMOKE_OK=YES");
+    Ok(())
+}
+
+fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wasm_spec = String::from("builtin");
+    let mut fuel_per_event = 50_000u64;
+    let mut max_commands_per_event = 16usize;
+
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--wasm" | "--sensor-wasm" | "--wasm-path" => {
+                i += 1;
+                wasm_spec = argv.get(i).ok_or("--wasm requires builtin or PATH")?.to_string();
+            }
+            "--fuel" | "--sensor-wasm-fuel" => {
+                i += 1;
+                fuel_per_event = argv.get(i).ok_or("--fuel requires positive integer")?.parse::<u64>()?;
+            }
+            "--max-commands" | "--sensor-wasm-max-commands" => {
+                i += 1;
+                max_commands_per_event = argv.get(i).ok_or("--max-commands requires 1..256")?.parse::<usize>()?;
+            }
+            other => return Err(format!("unknown sensor-wasm-smoke arg: {other}").into()),
+        }
+        i += 1;
+    }
+    if fuel_per_event == 0 {
+        return Err("--fuel must be positive".into());
+    }
+    if !(1..=256).contains(&max_commands_per_event) {
+        return Err("--max-commands must be 1..256".into());
+    }
+
+    let (mut pipeline, ready) = sensor::SensorPipeline::new(sensor::SensorPipelineConfig {
+        wasm_spec,
+        fuel_per_event,
+        max_commands_per_event,
+        vhal_enabled: false,
+        vhal_min_interval_ms: 0,
+    })?;
+    println!("{ready}");
+
+    let events = sensor::smoke_events();
+    for event in &events {
+        println!("SENSOR_NORMALIZED {}", event.summary());
+    }
+    let lines = pipeline.process_events(&events);
+    for line in &lines {
+        println!("{line}");
+    }
+
+    let joined = lines.join("\n");
+    let required = [
+        "prop=PERF_VEHICLE_SPEED(291504647)",
+        "prop=PERF_VEHICLE_SPEED_DISPLAY(291504648)",
+        "prop=NIGHT_MODE(287310855)",
+        "prop=CURRENT_GEAR(289408001)",
+        "prop=GEAR_SELECTION(289408000)",
+        "prop=ENV_OUTSIDE_TEMPERATURE(291505923)",
+    ];
+    for marker in required {
+        if !joined.contains(marker) {
+            return Err(format!("sensor wasm smoke missing expected output: {marker}").into());
+        }
+    }
+    if joined.contains("SENSOR_WASM_TRAP") || joined.contains("SENSOR_WASM_VHAL rejected") {
+        return Err("sensor wasm smoke observed a trap or rejected command".into());
+    }
+
+    println!("SENSOR_WASM_SMOKE_OK=YES");
     Ok(())
 }
 
@@ -2744,6 +2879,9 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
         sensor_vhal_min_ms: args.sensor_vhal_min_ms,
+        sensor_wasm_path: args.sensor_wasm_path.clone(),
+        sensor_wasm_fuel: args.sensor_wasm_fuel,
+        sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -2839,6 +2977,9 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         sensor_location_provider: args.sensor_location_provider.clone(),
         sensor_location_min_ms: args.sensor_location_min_ms,
         sensor_vhal_min_ms: args.sensor_vhal_min_ms,
+        sensor_wasm_path: args.sensor_wasm_path.clone(),
+        sensor_wasm_fuel: args.sensor_wasm_fuel,
+        sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
     })?;
@@ -2952,7 +3093,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut mic_max_unacked: u32 = 8;
     let mut sensor_open = false;
     let mut sensor_request_all = true;
-    let mut sensor_max_type: i32 = 21;
+    let mut sensor_max_type: i32 = 23;
     let mut sensor_period_ms: i64 = -2;
     let mut sensor_jsonl_path: Option<PathBuf> = None;
     let mut sensor_forward_os = false;
@@ -2960,6 +3101,9 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut sensor_location_provider = String::from("arda_gps");
     let mut sensor_location_min_ms: u64 = 1000;
     let mut sensor_vhal_min_ms: u64 = 500;
+    let mut sensor_wasm_path = String::from("builtin");
+    let mut sensor_wasm_fuel: u64 = 50_000;
+    let mut sensor_wasm_max_commands: usize = 16;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
 
@@ -3449,7 +3593,6 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 sensor_open = false;
             }
             "--sensor-request-all" | "--sensors-request-all" | "--sensor-all" => {
-                sensor_open = true;
                 sensor_request_all = true;
             }
             "--no-sensor-request-all" | "--no-sensor-all" => {
@@ -3457,29 +3600,24 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--sensor-max-type" | "--sensors-max-type" => {
                 i += 1;
-                sensor_open = true;
-                sensor_max_type = argv.get(i).ok_or("--sensor-max-type requires 1..21")?.parse::<i32>()?;
+                sensor_max_type = argv.get(i).ok_or("--sensor-max-type requires 1..23")?.parse::<i32>()?;
             }
             "--sensor-period-ms" | "--sensors-period-ms" => {
                 i += 1;
-                sensor_open = true;
                 sensor_period_ms = argv.get(i).ok_or("--sensor-period-ms requires milliseconds, 0 event-driven, -1 stop, -2 auto")?.parse::<i64>()?;
             }
             "--sensor-jsonl" | "--sensor-jsonl-path" | "--sensors-jsonl" => {
                 i += 1;
-                sensor_open = true;
                 sensor_jsonl_path = Some(PathBuf::from(argv.get(i).ok_or("--sensor-jsonl requires PATH")?));
             }
             "--no-sensor-jsonl" => {
                 sensor_jsonl_path = None;
             }
             "--sensor-forward-os" | "--sensors-forward-os" | "--sensor-os" => {
-                sensor_open = true;
                 sensor_forward_os = true;
                 sensor_forward_vhal = true;
             }
             "--sensor-forward-location" | "--sensor-location-os" => {
-                sensor_open = true;
                 sensor_forward_os = true;
             }
             "--no-sensor-forward-os" | "--no-sensor-os" => {
@@ -3490,7 +3628,6 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 sensor_forward_os = false;
             }
             "--sensor-forward-vhal" | "--sensor-vhal-os" | "--sensor-car-service" => {
-                sensor_open = true;
                 sensor_forward_vhal = true;
             }
             "--no-sensor-forward-vhal" | "--no-sensor-vhal-os" | "--no-sensor-car-service" => {
@@ -3498,19 +3635,27 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--sensor-location-provider" | "--sensor-provider" => {
                 i += 1;
-                sensor_open = true;
                 sensor_location_provider = argv.get(i).ok_or("--sensor-location-provider requires provider name")?.to_string();
             }
             "--sensor-location-min-ms" | "--sensor-os-min-ms" => {
                 i += 1;
-                sensor_open = true;
                 sensor_location_min_ms = argv.get(i).ok_or("--sensor-location-min-ms requires milliseconds")?.parse::<u64>()?;
             }
             "--sensor-vhal-min-ms" | "--sensor-car-service-min-ms" => {
                 i += 1;
-                sensor_open = true;
-                sensor_forward_vhal = true;
                 sensor_vhal_min_ms = argv.get(i).ok_or("--sensor-vhal-min-ms requires milliseconds")?.parse::<u64>()?;
+            }
+            "--sensor-wasm" | "--sensor-wasm-path" | "--vhal-wasm" => {
+                i += 1;
+                sensor_wasm_path = argv.get(i).ok_or("--sensor-wasm requires builtin or PATH")?.to_string();
+            }
+            "--sensor-wasm-fuel" | "--vhal-wasm-fuel" => {
+                i += 1;
+                sensor_wasm_fuel = argv.get(i).ok_or("--sensor-wasm-fuel requires positive integer")?.parse::<u64>()?;
+            }
+            "--sensor-wasm-max-commands" | "--vhal-wasm-max-commands" => {
+                i += 1;
+                sensor_wasm_max_commands = argv.get(i).ok_or("--sensor-wasm-max-commands requires 1..256")?.parse::<usize>()?;
             }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
@@ -3674,6 +3819,24 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if mic_ack_mode == "off" {
         mic_ack = false;
     }
+    if !(1..=23).contains(&sensor_max_type) {
+        return Err("--sensor-max-type must be 1..23".into());
+    }
+    if sensor_period_ms < -2 {
+        return Err("--sensor-period-ms must be -2, -1, 0, or a positive millisecond value".into());
+    }
+    if sensor_location_provider.trim().is_empty() {
+        return Err("--sensor-location-provider cannot be empty".into());
+    }
+    if sensor_wasm_path.trim().is_empty() {
+        return Err("--sensor-wasm cannot be empty".into());
+    }
+    if sensor_wasm_fuel == 0 {
+        return Err("--sensor-wasm-fuel must be positive".into());
+    }
+    if !(1..=256).contains(&sensor_wasm_max_commands) {
+        return Err("--sensor-wasm-max-commands must be 1..256".into());
+    }
 
     Ok(AapTlsHandshakeProbeArgs {
         transport,
@@ -3751,6 +3914,9 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         sensor_location_provider,
         sensor_location_min_ms,
         sensor_vhal_min_ms,
+        sensor_wasm_path,
+        sensor_wasm_fuel,
+        sensor_wasm_max_commands,
         quiet_ping_logs,
         log_level,
     })

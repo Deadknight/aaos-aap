@@ -406,3 +406,79 @@ Immediate test:
 4. Require bridge log `client accepted uid=0` and successful tap/swipe injection.
 5. Attempt a connection from a normal app UID only if a controlled test helper is available; the bridge must log `rejected peer uid=...`.
 6. After secure input is stable, return to sensor/VHAL work. The next architecture target is a Wasmtime/WebAssembly VHAL translation layer while preserving the proven AAP/TLS/SDR path.
+
+## v55 explicit sensor gate and normalized event boundary
+
+Observed bug in the v54 source-of-truth tree:
+- Repository config correctly emitted `--no-sensor-open` and `--no-sensor-forward-vhal`.
+- Later sensor parameter flags such as `--sensor-request-all`, `--sensor-max-type`, `--sensor-jsonl`, and `--sensor-vhal-min-ms` mutated the parser state and implicitly re-enabled SensorSource and/or VHAL forwarding.
+- This explained runtime `SENSOR_SOURCE_OPEN`, sensor requests, and direct VHAL writes while the baseline config claimed sensors were disabled.
+
+Implemented:
+- Make `--sensor-open` / `--no-sensor-open` the only master SensorSource gate.
+- Sensor parameter flags configure a future session but never enable the master gate.
+- `--sensor-forward-vhal` selects VHAL output but does not implicitly open the sensor channel.
+- Add `sensor-gate-smoke` as a no-HU regression test for the exact config-order bug.
+- Replace protobuf-layer `DecodedVehicleProperty` generation with a normalized `ArdaSensorEvent` boundary.
+- Preserve generated protobuf parsing, batch summary, JSONL, and location forwarding.
+- Normalize the latest sample per sensor type in each AAP SensorBatch into stable Rust units/values.
+- Extend the current normalized schema through SensorType 23, including toll card and opaque energy-model presence.
+- Keep the request ceiling at 23 because the current generated SensorBatch schema has no trailer payload field for SensorType 24.
+
+Resulting boundary:
+
+```text
+AAP SensorBatch protobuf
+        -> parse generated proto
+        -> ArdaSensorEvent
+        -> policy / mapping layer
+```
+
+The AAP/TLS/SDR path is unchanged.
+
+## v56 Wasmtime VHAL translation and policy layer
+
+Goal:
+- Move sensor-to-VHAL translation/policy out of the AAP session and protobuf parser.
+- Allow OEM/vehicle mappings to change as a `.wasm` policy module without rewriting AAP/TLS/SDR or rebuilding the protocol path.
+- Keep Android/VHAL authority in the Rust host rather than granting it to the guest.
+
+Implemented:
+- Pin Wasmtime `36.0.11` with a reduced `cranelift + runtime + std` feature set.
+- Compile `wasm/arda_vhal_default.wat` at build time and embed the resulting Wasm module in senderd.
+- Add external policy selection with `--sensor-wasm builtin|PATH`.
+- Add Wasm ABI v1: `arda_abi_version()` and fixed `arda_on_sensor(kind, a..f)` normalized-event entrypoint.
+- Expose only three typed guest imports: `arda_vhal.emit_bool`, `emit_i32`, and `emit_f32`.
+- Do not install WASI; the guest receives no filesystem, network, shell, Binder, AAP session, or direct VHAL object.
+- Add fixed fuel per sensor event and fail-closed command discard on guest trap.
+- Add Wasmtime store resource limits: 2 MiB linear memory, one memory, one table, 1024 table elements, two instances; cap external module files at 4 MiB.
+- Add host command-count limit per event.
+- Validate every guest VHAL request in Rust by property allow-list, exact type, global area, finite/range checks, and per-property/area rate limiting.
+- Isolate the old `cmd car_service inject-vhal-event` plus userdebug dumpsys fallback inside the VHAL host adapter; remove direct VHAL mapping/writes from `src/aap/mod.rs` and `src/aap/proto.rs`.
+- Fail closed if the Wasm engine cannot initialize: normalized sensor decode and JSONL continue, but VHAL mapping remains disabled and does not fall back to the old direct path.
+- Add `sensor-wasm-smoke`, which exercises deterministic normalized events through the embedded Wasm ABI and host validator in VHAL dry-run mode.
+- Built-in policy maps speed, RPM, odometer, parking brake, mapped gear, night mode, and outside temperature.
+- Fuel/range stay normalized but are deliberately not mapped by the built-in policy until the AAP source units are established.
+- Add `docs/ARDA_SENSOR_WASMTIME.md` as the ABI, safety-boundary, normalized-value, and test reference.
+
+Repository baseline remains intentionally off:
+
+```toml
+[sensor]
+open = false
+forward_vhal = false
+wasm = "builtin"
+wasm_fuel = 50000
+wasm_max_commands = 16
+```
+
+Immediate combined test order:
+1. Build senderd; the first build resolves Wasmtime and updates `Cargo.lock`.
+2. Push senderd/config over network ADB because DHU AOAP mode can remove USB ADB.
+3. Run `sensor-gate-smoke`; require `SENSOR_GATE_SMOKE_OK=YES`.
+4. Run `sensor-wasm-smoke`; require `SENSOR_WASM_ENGINE ready` and `SENSOR_WASM_SMOKE_OK=YES` with only `dry_run` VHAL output.
+5. Run normal baseline AAP with repository config and require no `SENSOR_SOURCE_OPEN`, no `SENSOR_WASM_ENGINE`, and no VHAL output.
+6. Run AAP with explicit `--sensor-open --no-sensor-forward-vhal`; collect real-HU `SENSOR_BATCH`, `SENSOR_NORMALIZED`, `SENSOR_WASM_EVENT`, and `SENSOR_WASM_VHAL dry_run` lines.
+7. Only after inspecting real values, run explicit `--sensor-open --sensor-forward-vhal` and verify validated `SENSOR_WASM_VHAL applied` lines plus AAOS property behavior.
+8. Do not accept any `SENSOR_OS_VHAL` line; that direct session/proto mapping path has been removed.
+

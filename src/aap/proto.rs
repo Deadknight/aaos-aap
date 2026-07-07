@@ -11,6 +11,7 @@ pub mod protos {
 
 use protobuf::{Enum, Message};
 use self::protos::protos::*;
+use crate::sensor::ArdaSensorEvent;
 
 pub fn control_message_name(id: u16) -> &'static str {
     match ControlMessageType::from_i32(id as i32) {
@@ -1489,36 +1490,11 @@ pub struct DecodedLocationFix {
 }
 
 #[derive(Debug, Clone)]
-pub struct DecodedVehicleProperty {
-    pub signal: &'static str,
-    pub property_name: &'static str,
-    pub property_id: i32,
-    pub area_id: i32,
-    pub value: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct SensorBatchSummary {
     pub summary: String,
     pub json_line: String,
     pub location: Option<DecodedLocationFix>,
-    pub vhal_props: Vec<DecodedVehicleProperty>,
-}
-
-fn decoded_vhal_prop(
-    signal: &'static str,
-    property_name: &'static str,
-    property_id: i32,
-    area_id: i32,
-    value: impl ToString,
-) -> DecodedVehicleProperty {
-    DecodedVehicleProperty {
-        signal,
-        property_name,
-        property_id,
-        area_id,
-        value: value.to_string(),
-    }
+    pub events: Vec<ArdaSensorEvent>,
 }
 
 fn android_vehicle_gear_from_aap(gear: Gear) -> Option<i32> {
@@ -1574,6 +1550,8 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         (19, "accelerometer", msg.accelerometer_data.len()),
         (20, "gyroscope", msg.gyroscope_data.len()),
         (21, "gps_satellite", msg.gps_satellite_data.len()),
+        (22, "toll_card", msg.toll_card_data.len()),
+        (23, "energy_model", msg.energy_model_control.len()),
     ];
     let populated = counts
         .iter()
@@ -1585,13 +1563,13 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
             summary: "SENSOR_MESSAGE_BATCH empty".to_string(),
             json_line: "{\"type\":\"sensor_batch\",\"empty\":true}".to_string(),
             location: None,
-            vhal_props: Vec::new(),
+            events: Vec::new(),
         });
     }
 
     let mut details = Vec::new();
     let mut json_fields = Vec::new();
-    let mut vhal_props = Vec::new();
+    let mut events = Vec::new();
     json_fields.push("\"type\":\"sensor_batch\"".to_string());
 
     let location = msg.location_data.last().map(|loc| {
@@ -1611,81 +1589,166 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
             "\"location\":{{\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{:.3},\"altitude_m\":{:.2},\"speed_mps\":{:.3},\"bearing_deg\":{:.3}}}",
             fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
         ));
+        events.push(ArdaSensorEvent::Location {
+            latitude_deg: fix.latitude_deg,
+            longitude_deg: fix.longitude_deg,
+            accuracy_m: fix.accuracy_m,
+            altitude_m: fix.altitude_m,
+            speed_mps: fix.speed_mps,
+            bearing_deg: fix.bearing_deg,
+        });
         fix
     });
+    if let Some(compass) = msg.compass_data.last() {
+        let bearing_deg = compass.bearing_e6() as f64 / 1_000_000.0;
+        let pitch_deg = compass.pitch_e6() as f64 / 1_000_000.0;
+        let roll_deg = compass.roll_e6() as f64 / 1_000_000.0;
+        details.push(format!("compass_bearing={:.1} pitch={:.1} roll={:.1}", bearing_deg, pitch_deg, roll_deg));
+        json_fields.push(format!("\"compass\":{{\"bearing_deg\":{:.3},\"pitch_deg\":{:.3},\"roll_deg\":{:.3}}}", bearing_deg, pitch_deg, roll_deg));
+        events.push(ArdaSensorEvent::Compass { bearing_deg, pitch_deg, roll_deg });
+    }
     if let Some(speed) = msg.speed_data.last() {
         let speed_mps = speed.speed_e3() as f64 / 1000.0;
         details.push(format!("speed_mps={:.2}", speed_mps));
         json_fields.push(format!("\"speed_mps\":{:.3}", speed_mps));
-        vhal_props.push(decoded_vhal_prop("PERF_VEHICLE_SPEED", "PERF_VEHICLE_SPEED", 291504647, 0, format!("{:.3}", speed_mps)));
-        vhal_props.push(decoded_vhal_prop("PERF_VEHICLE_SPEED_DISPLAY", "PERF_VEHICLE_SPEED_DISPLAY", 291504648, 0, format!("{:.3}", speed_mps)));
-    }
-    if let Some(compass) = msg.compass_data.last() {
-        details.push(format!("compass_bearing={:.1}", compass.bearing_e6() as f64 / 1_000_000.0));
-        json_fields.push(format!("\"compass_bearing_deg\":{:.3}", compass.bearing_e6() as f64 / 1_000_000.0));
+        events.push(ArdaSensorEvent::Speed {
+            speed_mps,
+            cruise_engaged: speed.cruise_engaged(),
+            cruise_set_speed_raw: speed.cruise_set_speed(),
+        });
     }
     if let Some(rpm) = msg.rpm_data.last() {
         let rpm_value = rpm.rpm_e3() as f64 / 1000.0;
         details.push(format!("rpm={:.0}", rpm_value));
         json_fields.push(format!("\"rpm\":{:.3}", rpm_value));
-        vhal_props.push(decoded_vhal_prop("ENGINE_RPM", "ENGINE_RPM", 291504901, 0, format!("{:.3}", rpm_value)));
+        events.push(ArdaSensorEvent::Rpm { rpm: rpm_value });
     }
     if let Some(odo) = msg.odometer_data.last() {
         let odometer_km = odo.kms_e1() as f64 / 10.0;
-        details.push(format!("odometer_km={:.1}", odometer_km));
-        json_fields.push(format!("\"odometer_km\":{:.1}", odometer_km));
-        vhal_props.push(decoded_vhal_prop("PERF_ODOMETER", "PERF_ODOMETER", 291504644, 0, format!("{:.1}", odometer_km)));
+        let trip_km = odo.trip_kms_e1() as f64 / 10.0;
+        details.push(format!("odometer_km={:.1} trip_km={:.1}", odometer_km, trip_km));
+        json_fields.push(format!("\"odometer\":{{\"km\":{:.1},\"trip_km\":{:.1}}}", odometer_km, trip_km));
+        events.push(ArdaSensorEvent::Odometer { kilometers: odometer_km, trip_kilometers: trip_km });
     }
     if let Some(fuel) = msg.fuel_data.last() {
         details.push(format!("fuel={} range={} low={}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
         json_fields.push(format!("\"fuel\":{{\"level\":{},\"range\":{},\"low\":{}}}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
-        // AAP does not state units in this proto. Keep the raw values aligned with
-        // the RemotiveLabs Android mapping, but do not synthesize anything if the HU omits them.
-        vhal_props.push(decoded_vhal_prop("FUEL_LEVEL", "FUEL_LEVEL", 291504903, 0, fuel.fuel_level()));
-        vhal_props.push(decoded_vhal_prop("RANGE_REMAINING", "RANGE_REMAINING", 291504904, 0, fuel.range()));
+        events.push(ArdaSensorEvent::Fuel {
+            level_raw: fuel.fuel_level(),
+            range_raw: fuel.range(),
+            low_fuel_warning: fuel.low_fuel_warning(),
+        });
     }
     if let Some(pb) = msg.parking_brake_data.last() {
         let value = pb.parking_brake();
         details.push(format!("parking_brake={}", value));
         json_fields.push(format!("\"parking_brake\":{}", value));
-        vhal_props.push(decoded_vhal_prop("PARKING_BRAKE_ON", "PARKING_BRAKE_ON", 287310850, 0, value));
+        events.push(ArdaSensorEvent::ParkingBrake { engaged: value });
     }
     if let Some(gear) = msg.gear_data.last() {
         let aap_gear = gear.gear();
-        details.push(format!("gear={:?}", aap_gear));
+        let android_gear = android_vehicle_gear_from_aap(aap_gear);
+        details.push(format!("gear={:?} android_gear={:?}", aap_gear, android_gear));
         json_fields.push(format!("\"gear\":\"{:?}\"", aap_gear));
-        if let Some(android_gear) = android_vehicle_gear_from_aap(aap_gear) {
-            vhal_props.push(decoded_vhal_prop("CURRENT_GEAR", "CURRENT_GEAR", 289408001, 0, android_gear));
-            vhal_props.push(decoded_vhal_prop("GEAR_SELECTION", "GEAR_SELECTION", 289408000, 0, android_gear));
-        }
+        events.push(ArdaSensorEvent::Gear {
+            aap_gear: aap_gear.value(),
+            android_gear,
+        });
+    }
+    if let Some(diagnostics) = msg.diagnostics_data.last() {
+        let dtc = diagnostics.dtc().to_vec();
+        details.push(format!("diagnostics_dtc_bytes={}", dtc.len()));
+        json_fields.push(format!("\"diagnostics\":{{\"dtc_bytes\":{}}}", dtc.len()));
+        events.push(ArdaSensorEvent::Diagnostics { dtc });
     }
     if let Some(night) = msg.night_mode_data.last() {
         let value = night.night_mode();
         details.push(format!("night_mode={}", value));
         json_fields.push(format!("\"night_mode\":{}", value));
-        vhal_props.push(decoded_vhal_prop("NIGHT_MODE", "NIGHT_MODE", 287310855, 0, value));
+        events.push(ArdaSensorEvent::NightMode { enabled: value });
     }
     if let Some(env) = msg.environment_data.last() {
         let temperature_c = env.temperature_e3() as f64 / 1000.0;
-        details.push(format!("env_temp_c={:.1}", temperature_c));
-        json_fields.push(format!("\"environment\":{{\"temperature_c\":{:.3},\"pressure\":{},\"rain\":{}}}", temperature_c, env.pressure_e3(), env.rain()));
-        vhal_props.push(decoded_vhal_prop("ENV_OUTSIDE_TEMPERATURE", "ENV_OUTSIDE_TEMPERATURE", 291505923, 0, format!("{:.3}", temperature_c)));
+        let pressure = env.pressure_e3() as f64 / 1000.0;
+        details.push(format!("env_temp_c={:.1} pressure={:.3} rain={}", temperature_c, pressure, env.rain()));
+        json_fields.push(format!("\"environment\":{{\"temperature_c\":{:.3},\"pressure\":{:.3},\"rain\":{}}}", temperature_c, pressure, env.rain()));
+        events.push(ArdaSensorEvent::Environment { temperature_c, pressure, rain_raw: env.rain() });
+    }
+    if let Some(hvac) = msg.hvac_data.last() {
+        let target_temperature_c = hvac.target_temperature_e3() as f64 / 1000.0;
+        let current_temperature_c = hvac.current_temperature_e3() as f64 / 1000.0;
+        details.push(format!("hvac_target_c={:.1} hvac_current_c={:.1}", target_temperature_c, current_temperature_c));
+        json_fields.push(format!("\"hvac\":{{\"target_temperature_c\":{:.3},\"current_temperature_c\":{:.3}}}", target_temperature_c, current_temperature_c));
+        events.push(ArdaSensorEvent::Hvac { target_temperature_c, current_temperature_c });
     }
     if let Some(status) = msg.driving_status_data.last() {
         details.push(format!("driving_status=0x{:x}", status.status()));
         json_fields.push(format!("\"driving_status\":{}", status.status()));
+        events.push(ArdaSensorEvent::DrivingStatus { status: status.status() });
+    }
+    if let Some(dead) = msg.dead_reckoning_data.last() {
+        let steering_angle_deg = dead.steering_angle_e1() as f64 / 10.0;
+        let wheel_speed_mps = dead.wheel_speed_e3.iter().map(|v| *v as f64 / 1000.0).collect::<Vec<_>>();
+        details.push(format!("dead_reckoning_steering={:.1} wheel_speed_mps={:?}", steering_angle_deg, wheel_speed_mps));
+        json_fields.push(format!("\"dead_reckoning\":{{\"steering_angle_deg\":{:.1},\"wheel_count\":{}}}", steering_angle_deg, wheel_speed_mps.len()));
+        events.push(ArdaSensorEvent::DeadReckoning { steering_angle_deg, wheel_speed_mps });
+    }
+    if let Some(passenger) = msg.passenger_data.last() {
+        let present = passenger.passenger_present();
+        details.push(format!("passenger_present={}", present));
+        json_fields.push(format!("\"passenger_present\":{}", present));
+        events.push(ArdaSensorEvent::Passenger { present });
+    }
+    if let Some(door) = msg.door_data.last() {
+        let door_open = door.door_open.iter().copied().collect::<Vec<_>>();
+        details.push(format!("hood_open={} trunk_open={} door_open={:?}", door.hood_open(), door.trunk_open(), door_open));
+        json_fields.push(format!("\"door\":{{\"hood_open\":{},\"trunk_open\":{},\"door_count\":{}}}", door.hood_open(), door.trunk_open(), door_open.len()));
+        events.push(ArdaSensorEvent::Door { hood_open: door.hood_open(), trunk_open: door.trunk_open(), door_open });
+    }
+    if let Some(light) = msg.light_data.last() {
+        let head_light_state = light.head_light_state().value();
+        let turn_indicator_state = light.turn_indicator_state().value();
+        details.push(format!("head_light={:?} turn_indicator={:?} hazard={}", light.head_light_state(), light.turn_indicator_state(), light.hazard_lights_on()));
+        json_fields.push(format!("\"light\":{{\"head_light_state\":{},\"turn_indicator_state\":{},\"hazard\":{}}}", head_light_state, turn_indicator_state, light.hazard_lights_on()));
+        events.push(ArdaSensorEvent::Light { head_light_state, turn_indicator_state, hazard_lights_on: light.hazard_lights_on() });
+    }
+    if let Some(tire) = msg.tire_pressure_data.last() {
+        let pressures = tire.tire_pressures_e2.iter().map(|v| *v as f64 / 100.0).collect::<Vec<_>>();
+        details.push(format!("tire_pressure={:?}", pressures));
+        json_fields.push(format!("\"tire_pressure\":{{\"count\":{}}}", pressures.len()));
+        events.push(ArdaSensorEvent::TirePressure { pressures });
     }
     if let Some(acc) = msg.accelerometer_data.last() {
-        details.push(format!("accel=({:.3},{:.3},{:.3})", acc.acceleration_x_e3() as f64 / 1000.0, acc.acceleration_y_e3() as f64 / 1000.0, acc.acceleration_z_e3() as f64 / 1000.0));
-        json_fields.push(format!("\"accelerometer\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", acc.acceleration_x_e3() as f64 / 1000.0, acc.acceleration_y_e3() as f64 / 1000.0, acc.acceleration_z_e3() as f64 / 1000.0));
+        let x = acc.acceleration_x_e3() as f64 / 1000.0;
+        let y = acc.acceleration_y_e3() as f64 / 1000.0;
+        let z = acc.acceleration_z_e3() as f64 / 1000.0;
+        details.push(format!("accel=({:.3},{:.3},{:.3})", x, y, z));
+        json_fields.push(format!("\"accelerometer\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", x, y, z));
+        events.push(ArdaSensorEvent::Accelerometer { x, y, z });
     }
     if let Some(gyro) = msg.gyroscope_data.last() {
-        details.push(format!("gyro=({:.3},{:.3},{:.3})", gyro.rotation_speed_x_e3() as f64 / 1000.0, gyro.rotation_speed_y_e3() as f64 / 1000.0, gyro.rotation_speed_z_e3() as f64 / 1000.0));
-        json_fields.push(format!("\"gyroscope\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", gyro.rotation_speed_x_e3() as f64 / 1000.0, gyro.rotation_speed_y_e3() as f64 / 1000.0, gyro.rotation_speed_z_e3() as f64 / 1000.0));
+        let x = gyro.rotation_speed_x_e3() as f64 / 1000.0;
+        let y = gyro.rotation_speed_y_e3() as f64 / 1000.0;
+        let z = gyro.rotation_speed_z_e3() as f64 / 1000.0;
+        details.push(format!("gyro=({:.3},{:.3},{:.3})", x, y, z));
+        json_fields.push(format!("\"gyroscope\":{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3}}}", x, y, z));
+        events.push(ArdaSensorEvent::Gyroscope { x, y, z });
     }
     if let Some(sat) = msg.gps_satellite_data.last() {
         details.push(format!("gps_satellites use={} view={} listed={}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
         json_fields.push(format!("\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{}}}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
+        events.push(ArdaSensorEvent::GpsSatellite { in_use: sat.number_in_use(), in_view: sat.number_in_view(), listed: sat.satellites.len() });
+    }
+    if let Some(toll) = msg.toll_card_data.last() {
+        let present = toll.is_card_present();
+        details.push(format!("toll_card_present={}", present));
+        json_fields.push(format!("\"toll_card_present\":{}", present));
+        events.push(ArdaSensorEvent::TollCard { present });
+    }
+    if !msg.energy_model_control.is_empty() {
+        details.push("energy_model=present(opaque)".to_string());
+        json_fields.push("\"energy_model\":{\"present\":true,\"opaque\":true}".to_string());
+        events.push(ArdaSensorEvent::EnergyModel { present: true });
     }
 
     Some(SensorBatchSummary {
@@ -1697,7 +1760,7 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         ),
         json_line: format!("{{{}}}", json_fields.join(",")),
         location,
-        vhal_props,
+        events,
     })
 }
 

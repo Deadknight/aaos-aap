@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI="${PI:-1000000028c0b59c}"
+DHU_SERIAL="${DHU_SERIAL:-1000000028c0b59c}"
 REMOTE_BIN="/data/local/tmp/arda-senderd"
 REMOTE_CONFIG="/data/local/tmp/arda-config.toml"
 CONFIG="${ARDA_CONFIG:-$ROOT/config.toml}"
@@ -16,12 +17,15 @@ Usage:
 
 Environment:
   PI=1000000028c0b59c
+  DHU_SERIAL=1000000028c0b59c
   ARDA_CONFIG=/path/to/config.toml
   ARDA_CERT_DIR=$HOME/Downloads/certs
 
 Examples:
   ./scripts/arda-usb-run.sh
   ./scripts/arda-usb-run.sh --build
+  PI=192.168.1.15:5555 ./scripts/arda-usb-run.sh
+  PI=192.168.1.15:5555 ./scripts/arda-usb-run.sh -- --sensor-open --no-sensor-forward-vhal
   ./scripts/arda-usb-run.sh -- --log-level summary
 EOF
 }
@@ -83,6 +87,9 @@ wait_for_adb_device() {
 }
 
 step 1 "checking ADB device (no adb root restart)"
+if [[ "$PI" == *:* ]]; then
+  adb connect "$PI" >/dev/null 2>&1 || true
+fi
 wait_for_adb_device
 
 echo "ADB_READY=YES serial=$PI"
@@ -130,9 +137,10 @@ adb -s "$PI" shell "$REMOTE_BIN" usb-accessory-status
 echo
 step 6 "USB baseline ready; start DHU from another terminal"
 echo "ARDA_USB_BASELINE_READY=YES"
-echo "Pi serial: $PI"
+echo "ADB target: $PI"
+echo "DHU USB serial: $DHU_SERIAL"
 echo "Start DHU from another Mac terminal with:"
-echo "  desktop-head-unit --usb=$PI"
+echo "  desktop-head-unit --usb=$DHU_SERIAL"
 echo
 echo
 step 7 "starting ARDA AAP USB accessory session"

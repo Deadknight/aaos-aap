@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use crate::capture::screenrecord::preferred_codec_name;
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
 use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, PlatformInputBridgeInjector, TouchInjectAction, TouchInjector};
+use crate::sensor::{SensorPipeline, SensorPipelineConfig};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -1323,6 +1324,9 @@ pub struct TlsHandshakeProbeConfig {
     pub sensor_location_provider: String,
     pub sensor_location_min_ms: u64,
     pub sensor_vhal_min_ms: u64,
+    pub sensor_wasm_path: String,
+    pub sensor_wasm_fuel: u64,
+    pub sensor_wasm_max_commands: usize,
     pub quiet_ping_logs: bool,
     pub log_level: String,
 }
@@ -1397,7 +1401,7 @@ impl Default for TlsHandshakeProbeConfig {
             mic_max_unacked: 8,
             sensor_open: false,
             sensor_request_all: true,
-            sensor_max_type: 21,
+            sensor_max_type: 23,
             sensor_period_ms: -2,
             sensor_jsonl_path: None,
             sensor_forward_os: false,
@@ -1405,6 +1409,9 @@ impl Default for TlsHandshakeProbeConfig {
             sensor_location_provider: "arda_gps".to_string(),
             sensor_location_min_ms: 1000,
             sensor_vhal_min_ms: 500,
+            sensor_wasm_path: "builtin".to_string(),
+            sensor_wasm_fuel: 50_000,
+            sensor_wasm_max_commands: 16,
             quiet_ping_logs: true,
             log_level: "normal".to_string(),
         }
@@ -1480,34 +1487,22 @@ struct SensorChannelState {
 }
 
 #[derive(Debug)]
-struct SensorVhalLastPush {
-    signal: &'static str,
-    at: Instant,
-}
-
-#[derive(Debug)]
 struct SensorOsForwarder {
     location_enabled: bool,
-    vhal_enabled: bool,
     provider: String,
     location_initialized: bool,
     last_location_push: Option<Instant>,
     location_min_interval: Duration,
-    vhal_min_interval: Duration,
-    vhal_last_pushes: Vec<SensorVhalLastPush>,
 }
 
 impl SensorOsForwarder {
     fn new(config: &TlsHandshakeProbeConfig) -> Self {
         Self {
             location_enabled: config.sensor_forward_os,
-            vhal_enabled: config.sensor_forward_vhal,
             provider: config.sensor_location_provider.clone(),
             location_initialized: false,
             last_location_push: None,
             location_min_interval: Duration::from_millis(config.sensor_location_min_ms),
-            vhal_min_interval: Duration::from_millis(config.sensor_vhal_min_ms),
-            vhal_last_pushes: Vec::new(),
         }
     }
 
@@ -1555,53 +1550,6 @@ impl SensorOsForwarder {
         }
         Ok(())
     }
-
-    fn push_vhal_props(
-        &mut self,
-        props: &[proto::DecodedVehicleProperty],
-        dump: &mut Option<Box<dyn Write>>,
-    ) -> io::Result<()> {
-        if !self.vhal_enabled {
-            return Ok(());
-        }
-        for prop in props {
-            if !self.should_push_vhal(prop.signal) {
-                continue;
-            }
-            let ok = run_car_service_vhal_inject_cmd(prop, dump).unwrap_or(false);
-            self.mark_vhal_attempt(prop.signal);
-            if !ok && session_log_enabled(LOG_NORMAL) {
-                let line = format!(
-                    "SENSOR_OS_VHAL failed prop={}({}) area={} value={} note=cmd_car_service_and_dumpsys_fallback_failed_or_unsupported",
-                    prop.property_name, prop.property_id, prop.area_id, prop.value
-                );
-                println!("{line}");
-                log_line(dump, &line)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn should_push_vhal(&self, signal: &'static str) -> bool {
-        if self.vhal_min_interval.as_millis() == 0 {
-            return true;
-        }
-        let now = Instant::now();
-        self.vhal_last_pushes
-            .iter()
-            .find(|last| last.signal == signal)
-            .map(|last| now.duration_since(last.at) >= self.vhal_min_interval)
-            .unwrap_or(true)
-    }
-
-    fn mark_vhal_attempt(&mut self, signal: &'static str) {
-        let now = Instant::now();
-        if let Some(last) = self.vhal_last_pushes.iter_mut().find(|last| last.signal == signal) {
-            last.at = now;
-        } else {
-            self.vhal_last_pushes.push(SensorVhalLastPush { signal, at: now });
-        }
-    }
 }
 
 fn run_command_logged(
@@ -1639,40 +1587,6 @@ fn run_command_logged(
         }
     }
 }
-
-fn run_car_service_vhal_inject_cmd(
-    prop: &proto::DecodedVehicleProperty,
-    dump: &mut Option<Box<dyn Write>>,
-) -> io::Result<bool> {
-    let prop_id = prop.property_id.to_string();
-    let area_id = prop.area_id.to_string();
-    let value = prop.value.as_str();
-    let cmd_args = [
-        "car_service",
-        "inject-vhal-event",
-        prop_id.as_str(),
-        area_id.as_str(),
-        value,
-    ];
-    let label = format!("SENSOR_OS_VHAL {}", prop.property_name);
-    match run_command_logged("/system/bin/cmd", &cmd_args, dump, &label) {
-        Ok(true) => Ok(true),
-        Ok(false) | Err(_) => {
-            // Older AAOS docs used dumpsys activity service com.android.car with no explicit
-            // area for global properties. Keep it as a compatibility fallback for userdebug builds.
-            let dumpsys_args = [
-                "activity",
-                "service",
-                "com.android.car",
-                "inject-vhal-event",
-                prop_id.as_str(),
-                value,
-            ];
-            run_command_logged("/system/bin/dumpsys", &dumpsys_args, dump, &format!("SENSOR_OS_VHAL_FALLBACK {}", prop.property_name))
-        }
-    }
-}
-
 
 fn audio_stream_matches(filter: &str, stream_type: &str) -> bool {
     let filter = filter.to_ascii_lowercase();
@@ -1754,7 +1668,7 @@ fn requested_sensor_types(sensor: &SensorChannelState, config: &TlsHandshakeProb
     values.dedup();
     values
         .into_iter()
-        .filter(|value| *value >= 1 && *value <= config.sensor_max_type && *value <= 21)
+        .filter(|value| *value >= 1 && *value <= config.sensor_max_type && *value <= 23)
         .collect()
 }
 
@@ -2750,6 +2664,30 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut mic_source_channel: Option<MicSourceChannelState> = None;
     let mut sensor_channel: Option<SensorChannelState> = None;
     let mut sensor_os_forwarder = SensorOsForwarder::new(&config);
+    let mut sensor_pipeline: Option<SensorPipeline> = None;
+    if config.sensor_open {
+        match SensorPipeline::new(SensorPipelineConfig {
+            wasm_spec: config.sensor_wasm_path.clone(),
+            fuel_per_event: config.sensor_wasm_fuel,
+            max_commands_per_event: config.sensor_wasm_max_commands,
+            vhal_enabled: config.sensor_forward_vhal,
+            vhal_min_interval_ms: config.sensor_vhal_min_ms,
+        }) {
+            Ok((pipeline, ready)) => {
+                println!("{ready}");
+                log_line(&mut dump, &ready)?;
+                sensor_pipeline = Some(pipeline);
+            }
+            Err(err) => {
+                let line = format!(
+                    "SENSOR_WASM_ENGINE disabled error={} vhal_fail_closed=true sensor_decode_continues=true",
+                    err
+                );
+                println!("{line}");
+                log_line(&mut dump, &line)?;
+            }
+        }
+    }
     let mut audio_capture: Option<AppProcessAudioCapture> = None;
     let mut audio_capture_buffer: Vec<u8> = Vec::new();
     let mut audio_channel_open_requests_sent = 0usize;
@@ -4237,10 +4175,20 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if let Some(file) = sensor.jsonl_file.as_mut() {
                         writeln!(file, "{}", batch.json_line)?;
                     }
+                    for event in &batch.events {
+                        let line = format!("SENSOR_NORMALIZED {}", event.summary());
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
                     if let Some(location) = batch.location.as_ref() {
                         sensor_os_forwarder.push_location(location, &mut dump)?;
                     }
-                    sensor_os_forwarder.push_vhal_props(&batch.vhal_props, &mut dump)?;
+                    if let Some(pipeline) = sensor_pipeline.as_mut() {
+                        for line in pipeline.process_events(&batch.events) {
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+                        }
+                    }
                 }
             }
 

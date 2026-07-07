@@ -12,9 +12,9 @@ The current profile intentionally enables only:
 - platform `screenrecord` raw H.264 backend
 - SDR-driven 1280x720 / 30 fps selection
 - Waveshare 7.9 display geometry profile
-- app/framework input injection
+- secured platform InputBridge injection over the v54 filesystem UNIX socket
 
-Audio and sensor/VHAL forwarding are disabled in the baseline while live video refresh is being stabilized.
+Audio and sensor/VHAL forwarding remain disabled in the baseline. The sensor parser now has an explicit master gate and the v56 Wasmtime VHAL policy engine is configured but is not instantiated until `--sensor-open` is explicitly enabled.
 
 The selected H.264 encoder is currently `c2.android.avc.encoder`. The Pi V4L2 encoder `c2.v4l2.avc.encoder` returned `Encoder failed (err=-38)` and produced zero NAL units in the controlled A/B test.
 
@@ -132,8 +132,9 @@ adb shell /data/local/tmp/arda-senderd \
   aap-run \
   --sensor-open \
   --sensor-request-all \
-  --sensor-max-type 21 \
+  --sensor-max-type 23 \
   --sensor-jsonl /data/local/tmp/arda-sensors.jsonl \
+  --sensor-wasm builtin \
   --sensor-forward-vhal \
   --sensor-vhal-min-ms 500
 ```
@@ -144,11 +145,13 @@ adb shell /data/local/tmp/arda-senderd \
 
 Zero means unlimited live frames. A previous test command omitted this and the default frame limit stopped video after 30 frames, which looked like a frozen DHU image.
 
-### `input.inject_mode = "app"`
+### `input.inject_mode = "bridge"`
 
-The Waveshare setup uses 1280x720 logical AAP coordinates while the physical/natural WM geometry is 720x1280 with a 270-degree rotation profile. Framework/app injection targets the logical display coordinate space directly.
+The Waveshare setup uses 1280x720 logical AAP coordinates while the physical/natural WM geometry is 720x1280 with a 270-degree rotation profile. The v54 platform bridge injects the already mapped logical display coordinates through `InputManagerGlobal.injectInputEvent()`.
 
-The uinput backend creates a 1280x720 virtual touchscreen which Android can route through its input viewport/orientation path again. In this setup that produced incorrect X/Y behavior.
+Senderd reaches the persistent privileged bridge through the secured filesystem UNIX socket at `/data/user_de/0/com.arda.inputbridge/files/arda-input.sock`. The socket is mode `0600` and the bridge verifies kernel peer credentials for the current root senderd runtime.
+
+The old `app_process` and uinput paths remain explicit A/B fallbacks but are not the baseline.
 
 ### `video.first_frame_kick = false`
 
@@ -156,7 +159,9 @@ The old `center-cancel` experiment was an Android-12-era dirty-frame workaround.
 
 ### Audio and sensors disabled
 
-During video refresh tests, synchronous sensor/VHAL forwarding and audio work add unrelated activity to the AAP session loop. They are re-enabled as explicit A/B overrides after video transport is stable.
+Audio remains disabled in the baseline. SensorSource and VHAL are also disabled by explicit master/destination gates, but the v55/v56 normalized sensor + Wasmtime policy configuration is present and ready for explicit A/B overrides.
+
+Use `sensor-gate-smoke` and `sensor-wasm-smoke` before a real HU sensor session. See `ARDA_SENSOR_WASMTIME.md`.
 
 ## Candidates for later CLI cleanup
 

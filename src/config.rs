@@ -133,6 +133,9 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
         "sensor.jsonl",
         "sensor.forward_vhal",
         "sensor.vhal_min_ms",
+        "sensor.wasm",
+        "sensor.wasm_fuel",
+        "sensor.wasm_max_commands",
     ]
     .into_iter()
     .collect();
@@ -202,6 +205,9 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
     }
     push_bool(&values, "sensor.forward_vhal", "--sensor-forward-vhal", "--no-sensor-forward-vhal", &mut out)?;
     push_value(&values, "sensor.vhal_min_ms", "--sensor-vhal-min-ms", &mut out)?;
+    push_value(&values, "sensor.wasm", "--sensor-wasm", &mut out)?;
+    push_value(&values, "sensor.wasm_fuel", "--sensor-wasm-fuel", &mut out)?;
+    push_value(&values, "sensor.wasm_max_commands", "--sensor-wasm-max-commands", &mut out)?;
 
     Ok(out)
 }

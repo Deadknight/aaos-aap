@@ -5,8 +5,20 @@ use std::process::Command;
 
 fn main() {
     generate_protos();
+    build_sensor_wasm();
     build_inputd_java();
     build_native_cpp();
+}
+
+
+fn build_sensor_wasm() {
+    println!("cargo:rerun-if-changed=wasm/arda_vhal_default.wat");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
+    let wasm_out = out_dir.join("arda_vhal_default.wasm");
+    let bytes = wat::parse_file("wasm/arda_vhal_default.wat")
+        .expect("compile wasm/arda_vhal_default.wat");
+    fs::write(&wasm_out, bytes).expect("write embedded arda_vhal_default.wasm");
 }
 
 fn generate_protos() {

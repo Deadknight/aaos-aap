@@ -51,7 +51,12 @@ stream = "media"
 [sensor]
 open = false
 request_all = true
-max_type = 21
+max_type = 23
 jsonl = "/data/local/tmp/arda-sensors.jsonl"
 forward_vhal = false
 vhal_min_ms = 500
+# Embedded Wasmtime policy by default. External OEM/vehicle policy modules can
+# be selected with a filesystem path while keeping AAP/TLS/SDR in Rust.
+wasm = "builtin"
+wasm_fuel = 50000
+wasm_max_commands = 16

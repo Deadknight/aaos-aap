@@ -1,6 +1,6 @@
 use crate::vehicle::client::SensorRouterPublisher;
 use crate::vehicle::model::{
-    property_name, sensor_event_to_vehicle_signals, VehicleSignal,
+    property_name, sensor_event_to_vehicle_signals, VehicleSignal, AAP_SENSOR_SOURCE_ID,
 };
 use crate::vehicle::policy::{ready_line, VehiclePolicyEngine};
 use crate::vehicle::wire::DEFAULT_ROUTER_SOCKET;
@@ -510,10 +510,12 @@ impl SensorPipeline {
         config: SensorPipelineConfig,
     ) -> Result<(Self, String), Box<dyn std::error::Error>> {
         if config.vhal_enabled {
-            let publisher = SensorRouterPublisher::connect(DEFAULT_ROUTER_SOCKET, 1)?;
+            let publisher =
+                SensorRouterPublisher::connect(DEFAULT_ROUTER_SOCKET, AAP_SENSOR_SOURCE_ID)?;
             let ready = format!(
-                "SENSOR_VEHICLE_ROUTER ready socket={} source_id=1 source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
+                "SENSOR_VEHICLE_ROUTER ready socket={} source_id={} source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
                 DEFAULT_ROUTER_SOCKET,
+                AAP_SENSOR_SOURCE_ID,
                 config.vhal_min_interval_ms,
             );
             return Ok((
@@ -609,9 +611,10 @@ fn process_dry_run_signal(
     signal: &VehicleSignal,
 ) -> Vec<String> {
     let mut lines = vec![format!(
-        "SENSOR_WASM_EVENT event={} kind={} property={}({}) area={} value={}",
+        "SENSOR_WASM_EVENT event={} kind={} source={} property={}({}) area={} value={}",
         event.name(),
         event.kind_id(),
+        signal.source_id,
         property_name(signal.property_id),
         signal.property_id,
         signal.area_id,

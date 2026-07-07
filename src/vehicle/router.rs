@@ -122,11 +122,24 @@ pub struct VehicleRouterConfig {
 
 pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = Path::new(&config.socket_path);
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    println!(
+        "VEHICLE_ROUTER_START socket={} euid={} egid={} socket_uid={} socket_gid={}",
+        config.socket_path,
+        euid,
+        egid,
+        UID_ROOT,
+        ROUTER_SOCKET_GID_SYSTEM,
+    );
+
     if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .map_err(|err| startup_io_error("create_parent", parent, err))?;
     }
     if socket_path.exists() {
-        fs::remove_file(socket_path)?;
+        fs::remove_file(socket_path)
+            .map_err(|err| startup_io_error("remove_stale_socket", socket_path, err))?;
     }
 
     let (policy, abi_version) = VehiclePolicyEngine::new(
@@ -144,9 +157,17 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
         )
     );
 
-    let listener = UnixListener::bind(socket_path)?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
-    set_socket_owner(socket_path, UID_ROOT, ROUTER_SOCKET_GID_SYSTEM)?;
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|err| startup_io_error("bind_socket", socket_path, err))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))
+        .map_err(|err| startup_io_error("chmod_socket_0660", socket_path, err))?;
+    set_socket_owner(socket_path, UID_ROOT, ROUTER_SOCKET_GID_SYSTEM).map_err(|err| {
+        startup_io_error(
+            "chown_socket_root_system_requires_privilege",
+            socket_path,
+            err,
+        )
+    })?;
 
     println!(
         "VEHICLE_ROUTER_READY socket={} mode=0660 uid={} gid={} protocol={} allowed_roles=root:SIGNAL_SOURCE|VHAL|MANAGER,system_appid:MANAGER,vehicle_network:VHAL",
@@ -191,6 +212,22 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
     Ok(())
 }
 
+
+fn startup_io_error(stage: &str, path: &Path, err: io::Error) -> io::Error {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    io::Error::new(
+        err.kind(),
+        format!(
+            "vehicle router startup stage={} path={} euid={} egid={} error={}",
+            stage,
+            path.display(),
+            euid,
+            egid,
+            err,
+        ),
+    )
+}
 
 fn set_socket_owner(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())

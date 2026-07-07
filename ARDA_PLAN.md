@@ -554,3 +554,66 @@ Immediate Phase 1.1 validation order:
   codegen and emits `ARDA_PROTO_ACCESSORS_OK=...` on success.
 - This is a build/codegen determinism fix only; VehicleProperty IDs, Rust AAP/HU mappings, generic
   Wasmtime typed pass-through, router arbitration and command routing remain unchanged.
+
+## v57 Phase 1.1 runtime validation correction — 2026-07-07
+
+Authoritative user-side results after the protobuf codegen refresh fix:
+- Android Docker cross-build passed.
+- `sensor-gate-smoke` passed with `SENSOR_GATE_SMOKE_OK=YES`.
+- `vehicle-policy-smoke` passed with generic property pass-through and `VEHICLE_POLICY_SMOKE_OK=YES`.
+- `sensor-wasm-smoke` exposed one source-identity bug: `sensor_event_to_vehicle_signals()` created
+  otherwise valid built-in AAP VehicleProperty signals with reserved `source_id=0`. The live router
+  publisher rewrote those signals to source 1 before publish, so the bug was hidden on that path; the
+  direct dry-run policy path correctly rejected them before Wasm.
+- The first combined router shell command produced no router output because
+  `pkill -f "arda-senderd vehicle-routerd"` can match the remote shell's own `sh -c` command line,
+  which contains that exact text, and terminate the test shell before daemon startup.
+
+Runtime correction in the current tree:
+- Define one `AAP_SENSOR_SOURCE_ID=1` constant in `src/vehicle/model.rs`.
+- Built-in AAP/HU sensor mapping now creates valid source-1 `VehicleSignal` values immediately.
+- `SensorPipeline` uses the same constant when registering `AAP SensorSource` with the router.
+- Dry-run `SENSOR_WASM_EVENT` logging includes the source ID, so the policy boundary is visible.
+- Add `scripts/run-vehicle-router-smoke-android.sh`, which captures the PID of the router it starts and
+  kills only that process. It intentionally does not use `pkill -f` and defaults to the dedicated
+  `/data/local/tmp/arda_vehicle_router_smoke.sock` path so an active normal router socket is untouched.
+
+Immediate validation order after this correction:
+1. Rebuild with `./scripts/docker-build.sh`.
+2. Push the rebuilt `arda-senderd`.
+3. Run `sensor-wasm-smoke`; require `source=1`, no `SENSOR_WASM_TRAP`, and
+   `SENSOR_WASM_SMOKE_OK=YES`.
+4. Run `DEVICE=<network-adb-device> ./scripts/run-vehicle-router-smoke-android.sh` and require all three
+   `VEHICLE_ROUTER_SMOKE_*_OK=YES` markers.
+5. If both pass, close v57 Phase 1.1 and start Phase 2 Vehicle Manager / adapter AIDL work.
+
+
+
+## v57 Phase 1.1 router privilege smoke correction — 2026-07-07
+
+Authoritative user-side runtime result after the source-ID correction:
+- `sensor-wasm-smoke` passed with all built-in AAP events carrying `source=1`.
+- No `SENSOR_WASM_TRAP` remained.
+- `SENSOR_WASM_SMOKE_OK=YES` passed.
+- The PID-scoped router runner reached daemon startup, but the daemon exited after Wasmtime init with
+  `Operation not permitted (os error 1)` before `VEHICLE_ROUTER_READY`.
+
+The router startup order makes this deterministic: after the Wasmtime ready line it binds the Unix
+socket, applies mode `0660`, then explicitly changes the socket owner to `root:system` (`0:1000`). The
+runner was launching through a normal ADB shell (`AID_SHELL`/UID 2000), so the explicit `chown(0,1000)`
+required by the router security boundary failed with `EPERM`.
+
+Current correction:
+- Do not weaken or ignore the router socket ownership requirement for `/data/local/tmp` smoke paths.
+- `scripts/run-vehicle-router-smoke-android.sh` now requests `adb root`, reconnects until the device
+  shell reports UID 0, and fails with `ROUTER_ADB_ROOT_REQUIRED` if root is unavailable.
+- The runner emits `ROUTER_ADB_ROOT_OK ... uid=0` before daemon startup.
+- Router startup I/O now reports the exact failing stage, path, EUID and EGID. A future ownership
+  failure is reported as `stage=chown_socket_root_system_requires_privilege` instead of a bare OS error.
+
+Remaining Phase 1.1 gate:
+1. Rebuild and push the corrected binary.
+2. Run the root-aware PID-scoped router smoke runner over network ADB.
+3. Require `VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES`,
+   `VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES`, and `VEHICLE_ROUTER_SMOKE_OK=YES`.
+4. Only then close Phase 1.1 and begin Vehicle Manager / adapter AIDL Phase 2.

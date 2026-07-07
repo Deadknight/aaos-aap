@@ -1,5 +1,7 @@
 use crate::sensor::ArdaSensorEvent;
 
+pub const AAP_SENSOR_SOURCE_ID: u32 = 1;
+
 pub const AREA_GLOBAL: i32 = 0;
 // ARDA vehicle values now use Android VHAL area IDs directly. For front seats,
 // VehicleAreaSeat::ROW_1_LEFT is 0x1 and ROW_1_RIGHT is 0x4.
@@ -594,7 +596,7 @@ fn validate_property_rule(
 pub fn sensor_event_to_vehicle_signals(event: &ArdaSensorEvent) -> Vec<VehicleSignal> {
     let timestamp_nanos = monotonic_nanos();
     let make = |property_id, area_id, value| VehicleSignal {
-        source_id: 0,
+        source_id: AAP_SENSOR_SOURCE_ID,
         property_id: property_id,
         area_id,
         value,
@@ -691,14 +693,14 @@ pub fn smoke_vehicle_signals() -> Vec<VehicleSignal> {
     let ts = monotonic_nanos();
     vec![
         VehicleSignal {
-            source_id: 1,
+            source_id: AAP_SENSOR_SOURCE_ID,
             property_id: PROP_PERF_VEHICLE_SPEED,
             area_id: AREA_GLOBAL,
             value: VehicleValue::F32(13.8),
             timestamp_nanos: ts,
         },
         VehicleSignal {
-            source_id: 1,
+            source_id: AAP_SENSOR_SOURCE_ID,
             property_id: PROP_FUEL_LEVEL,
             area_id: AREA_GLOBAL,
             // VehiclePropertyIds.FUEL_LEVEL is milliliters.
@@ -706,21 +708,21 @@ pub fn smoke_vehicle_signals() -> Vec<VehicleSignal> {
             timestamp_nanos: ts,
         },
         VehicleSignal {
-            source_id: 1,
+            source_id: AAP_SENSOR_SOURCE_ID,
             property_id: PROP_EV_CURRENT_BATTERY_CAPACITY,
             area_id: AREA_GLOBAL,
             value: VehicleValue::F32(74_000.0),
             timestamp_nanos: ts,
         },
         VehicleSignal {
-            source_id: 1,
+            source_id: AAP_SENSOR_SOURCE_ID,
             property_id: PROP_EV_BATTERY_LEVEL,
             area_id: AREA_GLOBAL,
             value: VehicleValue::F32(59_940.0),
             timestamp_nanos: ts,
         },
         VehicleSignal {
-            source_id: 1,
+            source_id: AAP_SENSOR_SOURCE_ID,
             property_id: PROP_HVAC_TEMPERATURE_SET,
             area_id: AREA_DRIVER,
             value: VehicleValue::F32(21.5),

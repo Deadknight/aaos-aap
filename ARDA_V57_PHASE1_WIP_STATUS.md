@@ -85,30 +85,39 @@ The adapter is responsible for OEM/CAN encoding when it receives a standard prop
 
 Do not describe these later phases as completed code.
 
-## Compile status
+## Compile and runtime validation status
 
-The user has already run the first Phase 1 Docker build. That build reached Rust compilation but failed
-on the rust-protobuf accessor cascade before router code could compile.
+The user's real Android Docker cross-build passed after forcing fresh package-specific protobuf codegen.
+The old rust-protobuf accessor `E0599` cascade is closed.
 
-Phase 1.1 contains the codegen correction and architecture simplification, but has not yet passed the
-user's real Android cross-build. The next compiler result is authoritative.
+User-side smoke results on 2026-07-07:
+- `sensor-gate-smoke`: PASS.
+- `vehicle-policy-smoke`: PASS, including generic VehicleProperty pass-through.
+- `sensor-wasm-smoke`: PASS after the source-ID correction. All built-in AAP events now carry
+  `source=1`, no `SENSOR_WASM_TRAP` remains, and `SENSOR_WASM_SMOKE_OK=YES` passes.
+- the first router smoke wrapper did not actually reach daemon startup because its `pkill -f` pattern
+  could match and terminate the remote `sh -c` test shell itself. The PID-scoped runner fixed that.
+- the PID-scoped runner then exposed a privilege mismatch: the router reached Wasmtime initialization
+  but exited before `VEHICLE_ROUTER_READY` with `EPERM`. The router intentionally chowns its socket to
+  `root:system` (`0:1000`), while the runner had launched it as normal ADB shell UID 2000.
+- the current runner now requests `adb root`, verifies remote UID 0 before daemon startup, and preserves
+  the strict root:system socket ownership boundary. Router startup errors also include stage/path/EUID/EGID.
+
+Phase 1.1 is therefore compile-green and sensor-policy runtime-green, but remains runtime-open until the
+root-aware PID-scoped router smoke passes.
 
 ## Validation order
 
-1. Apply Phase 1.1 changed files to the current Phase 1 tree.
-2. Run `./scripts/docker-build.sh`.
-3. Require the old protobuf `set_*` / `field, not a method` cascade to disappear.
-4. Run `sensor-gate-smoke`.
-5. Run `sensor-wasm-smoke`.
-6. Run `vehicle-policy-smoke` and require:
-   - `VEHICLE_POLICY_SMOKE_GENERIC_PROPERTY_PASS_THROUGH=YES`
-   - `VEHICLE_POLICY_SMOKE_OK=YES`
-7. Start `vehicle-routerd`.
-8. Run `vehicle-router-smoke` and require:
+1. Run `./scripts/docker-build.sh`.
+2. Push the rebuilt Android binary.
+3. `sensor-wasm-smoke` is already PASS with `source=1`, no traps, and `SENSOR_WASM_SMOKE_OK=YES`.
+4. Run `DEVICE=<network-adb-device> ./scripts/run-vehicle-router-smoke-android.sh`; the script must
+   print `ROUTER_ADB_ROOT_OK ... uid=0` before router startup.
+5. Require:
    - `VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES`
    - `VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES`
    - `VEHICLE_ROUTER_SMOKE_OK=YES`
-9. Only after Phase 1.1 passes, continue with Vehicle Manager / adapter AIDL.
+6. Only after those two remaining runtime checks pass, continue with Vehicle Manager / adapter AIDL.
 
 ## Preserved proven paths
 

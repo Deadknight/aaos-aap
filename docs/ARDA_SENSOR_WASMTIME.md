@@ -132,6 +132,10 @@ discarded. A Wasm trap also discards all outputs from that call.
 
 `source_id` must be in `1..=i32::MAX`. Source ID zero is reserved.
 
+The built-in AAP/HU sensor adapter uses `AAP_SENSOR_SOURCE_ID=1`. The Rust sensor mapping creates
+source-1 signals before either dry-run policy processing or router publication; source zero is not used
+as an internal placeholder. This keeps the dry-run and live-router policy boundary identical.
+
 ## Typed value lanes
 
 ```text

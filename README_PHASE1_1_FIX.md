@@ -74,3 +74,63 @@ survive across codegen contract changes.
 build must print an `ARDA_PROTO_ACCESSORS_OK=.../arda_vehicle_router.rs` warning before Rust reaches
 the router sources. Missing accessors now fail as one build-script error instead of hundreds of
 `E0599` messages.
+
+## Runtime follow-up after the first successful Android build
+
+The Android cross-build passed. The first runtime smokes then found two independent test-path issues:
+
+1. `sensor_event_to_vehicle_signals()` emitted built-in AAP signals with reserved `source_id=0`.
+   Router forwarding hid the bug because `SensorRouterPublisher` overwrote the source with 1, while
+   dry-run policy validation correctly rejected source zero before Wasm. The mapping now emits
+   `AAP_SENSOR_SOURCE_ID=1` directly and the router registration uses the same constant.
+
+2. A combined ADB shell wrapper used `pkill -f "arda-senderd vehicle-routerd"`. That pattern can match
+   the remote `sh -c` command line that contains the pattern itself and kill the test shell. Use
+   `scripts/run-vehicle-router-smoke-android.sh`; it records the daemon PID, kills only that PID, and
+   uses `/data/local/tmp/arda_vehicle_router_smoke.sock` so the normal router socket is untouched.
+
+Remaining Phase 1.1 gate:
+
+```text
+SENSOR_WASM_SMOKE_OK=YES
+VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES
+VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES
+VEHICLE_ROUTER_SMOKE_OK=YES
+```
+
+
+
+## Router smoke privilege follow-up
+
+The corrected sensor smoke is now green:
+
+```text
+SENSOR_WASM_EVENT ... source=1 ...
+SENSOR_WASM_TRAP=NONE
+SENSOR_WASM_SMOKE_OK=YES
+```
+
+The next router run reached the daemon and exposed a separate startup privilege mismatch. The router
+prints the Wasmtime ready line before binding/configuring its Unix socket, then requires the socket to
+be owned by `root:system` (`0:1000`). Launching `vehicle-routerd` as the normal ADB shell user cannot
+perform that ownership change and exits with `EPERM` before `VEHICLE_ROUTER_READY`.
+
+Do not make socket ownership best-effort and do not special-case `/data/local/tmp` by ignoring `chown`
+failures. The ownership check is part of the router's intended security boundary.
+
+Use the root-aware runner:
+
+```bash
+DEVICE=192.168.1.15:5555 ./scripts/run-vehicle-router-smoke-android.sh
+```
+
+It requests `adb root`, reconnects, verifies `id -u == 0`, and only then launches the PID-scoped smoke
+router. Expected startup marker:
+
+```text
+ROUTER_ADB_ROOT_OK device=... uid=0 ...
+```
+
+The Rust router startup path now annotates I/O failures with stage/path/EUID/EGID. An ownership failure
+will identify `stage=chown_socket_root_system_requires_privilege` rather than returning only
+`Operation not permitted (os error 1)`.

@@ -265,13 +265,34 @@ VEHICLE_POLICY_SMOKE_GENERIC_PROPERTY_PASS_THROUGH=YES
 VEHICLE_POLICY_SMOKE_OK=YES
 ```
 
-Router terminal:
+For a one-command Android/network-ADB smoke, use the PID-scoped root-aware runner:
 
 ```bash
+DEVICE=192.168.1.15:5555 ./scripts/run-vehicle-router-smoke-android.sh
+```
+
+The router intentionally owns its socket as `root:system` (`0:1000`) with mode `0660`. The script
+therefore requests `adb root`, reconnects until the remote shell reports UID 0, and fails closed with
+`ROUTER_ADB_ROOT_REQUIRED` if root is unavailable. Do not ignore the router's `chown` failure for a
+smoke socket; that would test a weaker security boundary than the daemon is designed to use.
+
+The script uses `/data/local/tmp/arda_vehicle_router_smoke.sock`, captures the PID of the router it
+starts and kills only that PID. The normal router socket is not unlinked. Do not wrap router startup
+in `pkill -f "arda-senderd vehicle-routerd"`; the pattern can match the remote `sh -c` command line
+that contains the pattern itself and terminate the test shell.
+
+Router startup logs include stage/path/EUID/EGID for filesystem/socket setup failures. For example, a
+non-root socket ownership failure is identified as
+`stage=chown_socket_root_system_requires_privilege`.
+
+For manual two-terminal testing, first ensure ADB shell is root and run:
+
+```bash
+adb root
 /data/local/tmp/arda-senderd vehicle-routerd
 ```
 
-Second terminal:
+Then in a second terminal run:
 
 ```bash
 /data/local/tmp/arda-senderd vehicle-router-smoke

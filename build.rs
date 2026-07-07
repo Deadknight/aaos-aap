@@ -24,16 +24,63 @@ fn build_sensor_wasm() {
 fn generate_protos() {
     println!("cargo:rerun-if-changed=proto/protos.proto");
     println!("cargo:rerun-if-changed=proto/ev.proto");
+    println!("cargo:rerun-if-changed=proto/arda_vehicle_router.proto");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing")).join("protos");
     std::fs::create_dir_all(&out_dir).expect("create OUT_DIR/protos");
 
     protobuf_codegen::Codegen::new()
         .pure()
+        // rust-protobuf v3 intentionally does not generate field accessors by
+        // default. The router client uses the accessor API consistently, so
+        // request it explicitly for all generated messages.
+        .customize(protobuf_codegen::Customize::default().generate_accessors(true))
         .out_dir(&out_dir)
         .include("proto")
-        .inputs(["proto/protos.proto", "proto/ev.proto"])
-        .run_from_script();
+        .inputs([
+            "proto/protos.proto",
+            "proto/ev.proto",
+            "proto/arda_vehicle_router.proto",
+        ])
+        .run()
+        .expect("generate protobuf Rust sources");
+
+    verify_vehicle_router_accessors(&out_dir);
+}
+
+fn verify_vehicle_router_accessors(out_dir: &Path) {
+    let generated = out_dir.join("arda_vehicle_router.rs");
+    let source = fs::read_to_string(&generated)
+        .unwrap_or_else(|err| panic!("cannot read generated router protobuf {}: {err}", generated.display()));
+
+    // The router source deliberately uses rust-protobuf's generated accessor API.
+    // Fail in build.rs with one actionable error instead of allowing a stale
+    // no-accessor OUT_DIR snapshot to expand into hundreds of E0599 errors.
+    let required = [
+        "pub fn set_protocol_version",
+        "pub fn has_hello",
+        "pub fn set_hello",
+        "pub fn source_id(&self)",
+        "pub fn set_source_id",
+        "pub fn property_id(&self)",
+        "pub fn set_property_id",
+        "pub fn has_vhal_events",
+        "pub fn set_vhal_events",
+    ];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|needle| !source.contains(needle))
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() {
+        panic!(
+            "generated arda_vehicle_router.rs is missing required rust-protobuf accessors {:?}; remove stale arda-senderd build artifacts and rerun codegen",
+            missing
+        );
+    }
+
+    println!("cargo:warning=ARDA_PROTO_ACCESSORS_OK={}", generated.display());
 }
 
 fn build_inputd_java() {

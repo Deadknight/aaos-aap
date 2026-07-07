@@ -5,6 +5,7 @@ mod h264;
 mod input;
 mod native;
 mod sensor;
+mod vehicle;
 
 use std::env;
 use std::fs::{self, File};
@@ -55,6 +56,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "input-test" => input_test(args.collect()),
         "sensor-gate-smoke" => sensor_gate_smoke(),
         "sensor-wasm-smoke" => sensor_wasm_smoke(args.collect()),
+        "vehicle-routerd" => vehicle_routerd(args.collect()),
+        "vehicle-policy-smoke" => vehicle_policy_smoke(args.collect()),
+        "vehicle-router-smoke" => vehicle_router_smoke(args.collect()),
         "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
         "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
         "config-check" => config_check(args.collect()),
@@ -137,7 +141,16 @@ Commands:
       Regression-checks that sensor parameter/config flags do not implicitly enable SensorSource or VHAL forwarding; only explicit master/destination flags may do so.
 
   sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
-      Loads the Wasmtime sensor/VHAL policy engine, feeds deterministic sample events, and verifies the ABI plus typed host-command path without writing VHAL.
+      Loads the local Wasmtime vehicle policy through the sensor compatibility smoke path and verifies deterministic dry-run VHAL events.
+
+  vehicle-routerd [--socket PATH] [--wasm builtin|PATH] [--fuel N] [--max-outputs N]
+      Runs the central ARDA vehicle router. The router owns Wasmtime ABI v2, vehicle-signal arbitration, VHAL event routing, and vehicle-command dispatch.
+
+  vehicle-policy-smoke [--wasm builtin|PATH] [--fuel N] [--max-outputs N]
+      Verifies Wasmtime ABI v2 in-process: standard VehicleProperty IDs pass through unchanged and HVAC VHAL set maps back to the same property command.
+
+  vehicle-router-smoke [--socket PATH]
+      Connects to a running vehicle-routerd as root and verifies the full bidirectional router flow, including request-versus-confirmed-state behavior.
 
   aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--no-bind] [--check] [--unbind]
       Legacy/manual gadget bootstrap. Normal AAP commands no longer auto-create or rebind USB gadget state.
@@ -2793,6 +2806,118 @@ fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>
 
     println!("SENSOR_WASM_SMOKE_OK=YES");
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct VehiclePolicyCliArgs {
+    socket_path: String,
+    wasm_spec: String,
+    fuel_per_call: u64,
+    max_outputs_per_call: usize,
+}
+
+fn parse_vehicle_policy_cli_args(
+    argv: Vec<String>,
+    allow_socket: bool,
+) -> Result<VehiclePolicyCliArgs, Box<dyn std::error::Error>> {
+    let mut args = VehiclePolicyCliArgs {
+        socket_path: vehicle::wire::DEFAULT_ROUTER_SOCKET.to_string(),
+        wasm_spec: "builtin".to_string(),
+        fuel_per_call: 50_000,
+        max_outputs_per_call: 16,
+    };
+
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--socket" if allow_socket => {
+                i += 1;
+                args.socket_path = argv
+                    .get(i)
+                    .ok_or("--socket requires PATH")?
+                    .to_string();
+            }
+            "--wasm" | "--wasm-path" => {
+                i += 1;
+                args.wasm_spec = argv
+                    .get(i)
+                    .ok_or("--wasm requires builtin or PATH")?
+                    .to_string();
+            }
+            "--fuel" => {
+                i += 1;
+                args.fuel_per_call = argv
+                    .get(i)
+                    .ok_or("--fuel requires positive integer")?
+                    .parse::<u64>()?;
+            }
+            "--max-outputs" => {
+                i += 1;
+                args.max_outputs_per_call = argv
+                    .get(i)
+                    .ok_or("--max-outputs requires 1..256")?
+                    .parse::<usize>()?;
+            }
+            "--socket" => {
+                return Err("--socket is not valid for vehicle-policy-smoke".into());
+            }
+            other => return Err(format!("unknown vehicle policy/router arg: {other}").into()),
+        }
+        i += 1;
+    }
+
+    if args.socket_path.trim().is_empty() {
+        return Err("--socket must not be empty".into());
+    }
+    if args.fuel_per_call == 0 {
+        return Err("--fuel must be positive".into());
+    }
+    if !(1..=256).contains(&args.max_outputs_per_call) {
+        return Err("--max-outputs must be 1..256".into());
+    }
+
+    Ok(args)
+}
+
+fn vehicle_routerd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_vehicle_policy_cli_args(argv, true)?;
+    vehicle::router::run_vehicle_router(vehicle::router::VehicleRouterConfig {
+        socket_path: args.socket_path,
+        wasm_spec: args.wasm_spec,
+        fuel_per_call: args.fuel_per_call,
+        max_outputs_per_call: args.max_outputs_per_call,
+    })
+}
+
+fn vehicle_policy_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_vehicle_policy_cli_args(argv, false)?;
+    vehicle::smoke::policy_smoke(
+        &args.wasm_spec,
+        args.fuel_per_call,
+        args.max_outputs_per_call,
+    )
+}
+
+fn vehicle_router_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut socket_path = vehicle::wire::DEFAULT_ROUTER_SOCKET.to_string();
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--socket" => {
+                i += 1;
+                socket_path = argv
+                    .get(i)
+                    .ok_or("--socket requires PATH")?
+                    .to_string();
+            }
+            other => return Err(format!("unknown vehicle-router-smoke arg: {other}").into()),
+        }
+        i += 1;
+    }
+    if socket_path.trim().is_empty() {
+        return Err("--socket must not be empty".into());
+    }
+    vehicle::smoke::router_smoke(&socket_path)
 }
 
 fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

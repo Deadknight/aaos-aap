@@ -1,201 +1,293 @@
-# ARDA sensor normalization and Wasmtime VHAL policy
+# ARDA vehicle-property policy / Wasmtime ABI v2
 
-## Scope
+This document describes the v57 Phase 1.1 policy boundary.
 
-The AAP/TLS/SDR session remains in Rust. WebAssembly is not part of transport,
-TLS, service discovery, protobuf framing, channel state, media, or input.
+## Position in the stack
 
-The sensor path is:
+Wasmtime is not the VHAL implementation and does not parse AAP transport frames.
 
 ```text
-AAP SensorSource protobuf
-        |
-        v
-parse_sensor_batch_payload
-        |
-        v
-ArdaSensorEvent (normalized Rust values)
-        |
-        v
-Wasmtime policy module
-        |
-        v
-typed VHAL command requests
-        |
-        v
-Rust allow-list / type / area / range / rate validation
-        |
-        v
-VHAL host adapter
+AAP SensorSource
+    -> Rust HU sensor mapping
+    -> standard Android VehicleProperty ID/value
+                                      \
+CAN / third-party adapter --------------> vehicle router
+                                           -> source arbitration
+                                           -> Wasmtime ABI v2
+                                           -> VHAL property events
+
+AAOS UI -> Car Service -> AIDL VHAL set
+                              -> vehicle router
+                              -> Wasmtime ABI v2
+                              -> VehicleProperty command
+                              -> approved adapter -> CAN
 ```
 
-The built-in policy is compiled from `wasm/arda_vhal_default.wat` at Rust build
-time and embedded in `arda-senderd`. An external `.wasm` file can be selected
-with `--sensor-wasm PATH` without rebuilding senderd.
+The proven AAP/TLS/SDR path stays in `arda-senderd`.
 
-## Master gate
+Location is deliberately excluded:
 
-Only `--sensor-open` opens the AAP SensorSource channel.
+```text
+AAP SENSOR_LOCATION -> ARDA GPS provider -> Android GPS_PROVIDER -> fused
+```
 
-The following flags configure a future sensor session but must not implicitly
-open one:
+Location must not be represented as a VHAL property or Wasm policy input.
 
-- `--sensor-request-all`
-- `--sensor-max-type`
-- `--sensor-period-ms`
-- `--sensor-jsonl`
-- `--sensor-location-provider`
-- `--sensor-location-min-ms`
-- `--sensor-vhal-min-ms`
-- `--sensor-wasm`
-- `--sensor-wasm-fuel`
-- `--sensor-wasm-max-commands`
+## Property ID model
 
-Likewise, `--sensor-forward-vhal` selects the VHAL destination but does not open
-the SensorSource channel. `sensor-gate-smoke` is the regression test for this
-contract.
+ARDA does not define a second generic signal-ID namespace.
 
-The repository baseline keeps `sensor.open = false` and
-`sensor.forward_vhal = false`.
+`VehicleSignal.property_id`, `VhalEvent.property_id`, `VhalSetRequest.property_id`, and
+`VehicleCommand.property_id` carry the Android `VehicleProperty` ID directly.
 
-## Normalization policy
+This is intentional. An adapter developer that already decoded a vehicle into standard AAOS
+semantics may publish the standard property ID, area ID, type, value, and timestamp directly.
+The default Wasm module does not contain a `NIGHT_MODE`, `RPM`, `GEAR`, ... switch table.
 
-`parse_sensor_batch_payload` continues to use the generated protobuf types. For
-each sensor type present in an AAP `SensorBatch`, ARDA normalizes the latest
-sample of that type into one `ArdaSensorEvent`. This intentionally collapses a
-batch to current vehicle state before VHAL translation; the original batch
-summary and JSONL capture remain available for diagnostics.
+Examples:
 
-Current normalized sensor kinds match the AAP `SensorType` numeric ids:
+```text
+property_id = FUEL_LEVEL
+area_id     = 0
+value       = F32(32500.0)       # milliliters
 
-| kind | event | ABI values `a..f` |
-|---:|---|---|
-| 1 | LOCATION | lat deg, lon deg, accuracy m, altitude m, speed m/s, bearing deg |
-| 2 | COMPASS | bearing deg, pitch deg, roll deg, 0, 0, 0 |
-| 3 | SPEED | speed m/s, cruise bool, cruise set speed raw, 0, 0, 0 |
-| 4 | RPM | rpm, 0, 0, 0, 0, 0 |
-| 5 | ODOMETER | km, trip km, 0, 0, 0, 0 |
-| 6 | FUEL | level raw, range raw, low warning bool, 0, 0, 0 |
-| 7 | PARKING_BRAKE | engaged bool, 0, 0, 0, 0, 0 |
-| 8 | GEAR | AAP gear, Android VehicleGear, mapping-present bool, 0, 0, 0 |
-| 9 | OBDII_DIAGNOSTIC_CODE | byte length, FNV-1a32 digest, 0, 0, 0, 0 |
-| 10 | NIGHT_MODE | enabled bool, 0, 0, 0, 0, 0 |
-| 11 | ENVIRONMENT_DATA | temperature C, pressure scaled by e3, rain raw, 0, 0, 0 |
-| 12 | HVAC_DATA | target C, current C, 0, 0, 0, 0 |
-| 13 | DRIVING_STATUS_DATA | status bitmask, 0, 0, 0, 0, 0 |
-| 14 | DEAD_RECKONING_DATA | steering deg, wheel 0..3 m/s, wheel count |
-| 15 | PASSENGER_DATA | present bool, 0, 0, 0, 0, 0 |
-| 16 | DOOR_DATA | hood, trunk, door 0..3 bool |
-| 17 | LIGHT_DATA | headlight enum, turn enum, hazard bool, 0, 0, 0 |
-| 18 | TIRE_PRESSURE_DATA | tire 0..3 scaled by e2, count, 0 |
-| 19 | ACCELEROMETER_DATA | x, y, z, 0, 0, 0 |
-| 20 | GYROSCOPE_DATA | x, y, z, 0, 0, 0 |
-| 21 | GPS_SATELLITE_DATA | in use, in view, listed, 0, 0, 0 |
-| 22 | TOLL_CARD | present bool, 0, 0, 0, 0, 0 |
-| 23 | VEHICLE_ENERGY_MODEL_DATA | present/opaque bool, 0, 0, 0, 0, 0 |
+property_id = EV_BATTERY_LEVEL
+area_id     = 0
+value       = F32(59940.0)       # watt-hours
 
-The current generated `SensorBatch` schema has no trailer payload field, so the
-master request ceiling is 23 even though the AAP `SensorType` enum also names
-`SENSOR_TRAILER_DATA(24)`. Do not silently request a payload the current proto
-cannot normalize.
+property_id = HVAC_TEMPERATURE_SET
+area_id     = ROW_1_LEFT
+value       = F32(23.0)          # Celsius
+```
 
-## Wasm ABI v1
+The platform-internal protobuf keeps `property_id` as `int32` rather than a closed enum. This is
+important because ARDA must not prevent vendor VehicleProperty IDs. The future adapter SDK may ship
+convenience constants/generated wrappers, but the wire value remains the actual property ID.
 
-Required exports:
+## Built-in HU/AAP mapping
+
+AAP/HU SensorSource is a built-in source, so its known sensor semantics are translated in Rust by
+`src/vehicle/model.rs::sensor_event_to_vehicle_signals()`.
+
+Current mappings:
+
+```text
+AAP SPEED        -> PERF_VEHICLE_SPEED
+                 -> PERF_VEHICLE_SPEED_DISPLAY
+
+AAP RPM          -> ENGINE_RPM
+AAP ODOMETER     -> PERF_ODOMETER
+AAP PARKING      -> PARKING_BRAKE_ON
+AAP GEAR         -> CURRENT_GEAR
+                 -> GEAR_SELECTION
+AAP NIGHT_MODE   -> NIGHT_MODE
+AAP ENV temp     -> ENV_OUTSIDE_TEMPERATURE
+AAP HVAC target  -> HVAC_TEMPERATURE_SET / ROW_1_LEFT
+AAP HVAC current -> HVAC_TEMPERATURE_CURRENT / ROW_1_LEFT
+```
+
+AAP location is not mapped to VHAL.
+
+AAP `FuelData.fuel_level` and `range` remain unmapped because the current AAP protobuf does not
+define source units. ARDA must not pretend those raw integers are VHAL milliliters/meters.
+
+## ABI version
+
+The guest must export:
 
 ```text
 arda_abi_version() -> i32
-arda_on_sensor(kind: i32,
-               a: f64, b: f64, c: f64,
-               d: f64, e: f64, f: f64) -> i32
 ```
 
-`arda_abi_version()` must return `1`.
+The required value is `2`.
 
-`arda_on_sensor()` returns `0` on success. A non-zero result discards all VHAL
-commands emitted for that event.
-
-Available imports are intentionally only:
+The guest also exports:
 
 ```text
-arda_vhal.emit_bool(property_id: i32, area_id: i32, value: i32) -> i32
-arda_vhal.emit_i32(property_id: i32, area_id: i32, value: i32) -> i32
-arda_vhal.emit_f32(property_id: i32, area_id: i32, value: f32) -> i32
+arda_on_vehicle_signal(
+    source_id: i32,
+    property_id: i32,
+    area_id: i32,
+    value_type: i32,
+    i64_lane: i64,
+    f64_lane: f64
+) -> i32
+
+arda_on_vhal_set(
+    property_id: i32,
+    area_id: i32,
+    value_type: i32,
+    i64_lane: i64,
+    f64_lane: f64
+) -> i32
+
+arda_reset_capability(
+    capability_id: i32,
+    area_id: i32
+) -> i32
 ```
 
-No WASI linker is installed. The guest receives no filesystem, network, shell,
-Binder, AAP session, or direct VHAL object.
+A zero return means the call completed. A non-zero status is fail-closed: outputs from that call are
+discarded. A Wasm trap also discards all outputs from that call.
 
-## Runtime limits
+`source_id` must be in `1..=i32::MAX`. Source ID zero is reserved.
 
-Each event receives a fresh fixed fuel budget. A trap discards partially emitted
-commands. The host also limits commands per event.
-
-The current Wasmtime store limiter allows at most:
-
-- 2 MiB linear memory per memory
-- one linear memory
-- one table
-- 1024 table elements
-- two instances
-
-External Wasm module files are capped at 4 MiB before compilation.
-
-These limits protect the host boundary; VHAL output validation is still applied
-independently after guest execution.
-
-## VHAL host validation
-
-The guest does not write VHAL directly. Every command must pass Rust validation:
-
-- property id allow-list
-- exact value type (`bool`, `i32`, or `f32`)
-- area id allow-list; currently global area `0` only
-- finite floating-point value
-- property range
-- per-property/area minimum update interval
-
-The built-in policy currently maps:
-
-- SPEED -> `PERF_VEHICLE_SPEED`, `PERF_VEHICLE_SPEED_DISPLAY`
-- RPM -> `ENGINE_RPM`
-- ODOMETER -> `PERF_ODOMETER`
-- PARKING_BRAKE -> `PARKING_BRAKE_ON`
-- mapped GEAR -> `CURRENT_GEAR`, `GEAR_SELECTION`
-- NIGHT_MODE -> `NIGHT_MODE`
-- ENVIRONMENT_DATA temperature -> `ENV_OUTSIDE_TEMPERATURE`
-
-FUEL is normalized but deliberately not mapped by the built-in policy because
-the current AAP proto does not define the units of `fuel_level` and `range`.
-An OEM/vehicle-specific policy can map those values after their source units are
-established.
-
-## Failure behavior
-
-If Wasmtime cannot load, validate, instantiate, or ABI-check the selected module,
-sensor decoding and JSONL continue but VHAL mapping is disabled. ARDA does not
-fall back to the old direct protobuf-to-`cmd car_service` mapping.
-
-If a guest call traps, all commands emitted by that call are discarded.
-
-If VHAL forwarding is disabled, validated commands are logged as
-`SENSOR_WASM_VHAL dry_run` and are not applied.
-
-## Smoke tests
-
-Run on the target Pi after building and pushing senderd:
-
-```bash
-/data/local/tmp/arda-senderd sensor-gate-smoke
-/data/local/tmp/arda-senderd sensor-wasm-smoke
-```
-
-Required markers:
+## Typed value lanes
 
 ```text
-SENSOR_GATE_SMOKE_OK=YES
-SENSOR_WASM_ENGINE ready ...
-SENSOR_WASM_SMOKE_OK=YES
+1 BOOL   -> i64_lane = 0 or 1
+2 I32    -> i64_lane
+3 I64    -> i64_lane
+4 F32    -> f64_lane
+5 F64    -> f64_lane; no default ABI v2 emitter yet
+6 BYTES  -> future memory/span ABI
 ```
 
-The Wasm smoke test always uses VHAL dry-run mode.
+## Host imports
+
+Vehicle state to Android:
+
+```text
+arda_vhal.emit_bool(property_id, area_id, value)
+arda_vhal.emit_i32(property_id, area_id, value)
+arda_vhal.emit_i64(property_id, area_id, value)
+arda_vhal.emit_f32(property_id, area_id, value)
+```
+
+Android set request to vehicle adapter:
+
+```text
+arda_vehicle.emit_bool(property_id, area_id, value)
+arda_vehicle.emit_i32(property_id, area_id, value)
+arda_vehicle.emit_i64(property_id, area_id, value)
+arda_vehicle.emit_f32(property_id, area_id, value)
+```
+
+No WASI context is linked. The guest receives no filesystem, network, Binder, shell, AAP or direct
+VHAL object.
+
+## Built-in policy
+
+`wasm/arda_vhal_default.wat` is a typed pass-through policy.
+
+Vehicle direction:
+
+```text
+(property_id, area_id, BOOL) -> arda_vhal.emit_bool(same property, same area, same value)
+(property_id, area_id, I32)  -> arda_vhal.emit_i32(...)
+(property_id, area_id, I64)  -> arda_vhal.emit_i64(...)
+(property_id, area_id, F32)  -> arda_vhal.emit_f32(...)
+```
+
+Reverse direction:
+
+```text
+VHAL set(property_id, area_id, value)
+    -> arda_vehicle.emit_*(same property_id, same area_id, same value)
+```
+
+Therefore an adapter receiving `HVAC_TEMPERATURE_SET / ROW_1_LEFT / 23.0` decides how to encode that
+request onto its own CAN/USB/BT protocol.
+
+A custom Wasm module remains useful when policy is actually needed, for example:
+
+```text
+vendor property remap
+unit conversion
+filtering / clamping
+stateful combination of several properties
+OEM-specific HVAC encoding policy
+one Android property -> several vehicle commands
+several vehicle values -> one Android property
+```
+
+The default module should not become a giant property switch.
+
+## Supported-property registry
+
+Phase 1.1 does not yet have the real `IVehicleHardware` backend from which to consume the active
+`VehiclePropConfig` set. `src/vehicle/model.rs` therefore contains one declarative
+`SUPPORTED_PROPERTY_RULES` registry for the current test subset.
+
+The registry holds only validation/authorization metadata:
+
+```text
+property ID
+expected value type
+publish capability
+optional command capability
+allowed area class
+safety range
+```
+
+It is not a signal-to-property mapping table.
+
+When the AIDL VHAL backend lands, the supported property/type/area metadata should be derived from
+the actual VHAL property configs and combined with Arda Vehicle Manager grants. The small static
+registry is the Phase 1 transition boundary, not the final source of VHAL truth.
+
+## Source arbitration
+
+The router selects state sources at `(capability, area)` scope.
+
+Example:
+
+```text
+ENERGY / GLOBAL
+  Mercedes CAN priority 100
+  AAP/HU fallback priority 10
+```
+
+A higher-priority source can take ownership. A selected source can also be replaced after it is
+stale for five seconds.
+
+Before a capability source changes, the router calls:
+
+```text
+arda_reset_capability(capability_id, area_id)
+```
+
+The builtin pass-through policy is stateless, so its reset hook is currently a no-op. Custom
+stateful policies must clear capability-scoped guest state there.
+
+## Request versus confirmed state
+
+A VHAL set request and confirmed vehicle state are separate.
+
+```text
+AAOS UI sets HVAC_TEMPERATURE_SET = 23
+    -> VHAL set request
+    -> Wasm reverse path
+    -> adapter command property_id=HVAC_TEMPERATURE_SET value=23
+    -> adapter writes CAN
+```
+
+That does not immediately create a confirmed 23 C VHAL event.
+
+The adapter later reads actual vehicle state and publishes:
+
+```text
+HVAC_TEMPERATURE_SET = 23
+```
+
+Only that vehicle-originated publish becomes the confirmed VHAL property event.
+
+## Limits / fail-closed behavior
+
+Current policy host limits:
+
+```text
+Wasm file size          <= 4 MiB
+linear memory           <= 2 MiB
+memories                <= 1
+tables                   <= 1
+table elements          <= 1024
+instances               <= 2
+fuel                     configured per call
+outputs                  configured per call
+```
+
+Host validation checks the current supported-property registry, exact type, allowed area, finite
+floating-point values, numeric range, state-vs-command direction, and router capability ownership.
+
+Guest trap, non-zero status, invalid output or output-limit overflow fails closed for that call.

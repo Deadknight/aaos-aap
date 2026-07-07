@@ -1,17 +1,9 @@
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, Instant};
-
-use wasmtime::{
-    Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc,
+use crate::vehicle::client::SensorRouterPublisher;
+use crate::vehicle::model::{
+    property_name, sensor_event_to_vehicle_signals, VehicleSignal,
 };
-
-pub const SENSOR_WASM_ABI_VERSION: i32 = 1;
-const BUILTIN_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arda_vhal_default.wasm"));
-const MAX_WASM_MODULE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_WASM_LINEAR_MEMORY_BYTES: usize = 2 * 1024 * 1024;
-const MAX_WASM_TABLE_ELEMENTS: usize = 1024;
+use crate::vehicle::policy::{ready_line, VehiclePolicyEngine};
+use crate::vehicle::wire::DEFAULT_ROUTER_SOCKET;
 
 #[derive(Debug, Clone)]
 pub enum ArdaSensorEvent {
@@ -492,414 +484,6 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
     hash
 }
 
-#[derive(Debug, Clone)]
-enum RawVhalValue {
-    Bool(bool),
-    I32(i32),
-    F32(f32),
-}
-
-#[derive(Debug, Clone)]
-struct RawVhalCommand {
-    property_id: i32,
-    area_id: i32,
-    value: RawVhalValue,
-}
-
-#[derive(Debug)]
-struct WasmHostState {
-    limits: StoreLimits,
-    commands: Vec<RawVhalCommand>,
-    max_commands: usize,
-    dropped_commands: u64,
-}
-
-impl WasmHostState {
-    fn new(max_commands: usize) -> Self {
-        Self {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(MAX_WASM_LINEAR_MEMORY_BYTES)
-                .table_elements(MAX_WASM_TABLE_ELEMENTS)
-                .instances(2)
-                .tables(1)
-                .memories(1)
-                .trap_on_grow_failure(true)
-                .build(),
-            commands: Vec::new(),
-            max_commands: max_commands.max(1),
-            dropped_commands: 0,
-        }
-    }
-
-    fn push(&mut self, command: RawVhalCommand) -> i32 {
-        if self.commands.len() >= self.max_commands {
-            self.dropped_commands = self.dropped_commands.saturating_add(1);
-            return -2;
-        }
-        self.commands.push(command);
-        0
-    }
-}
-
-struct SensorWasmEngine {
-    store: Store<WasmHostState>,
-    on_sensor: TypedFunc<(i32, f64, f64, f64, f64, f64, f64), i32>,
-    fuel_per_event: u64,
-    module_label: String,
-}
-
-impl SensorWasmEngine {
-    fn new(
-        wasm_spec: &str,
-        fuel_per_event: u64,
-        max_commands: usize,
-    ) -> Result<(Self, i32), Box<dyn std::error::Error>> {
-        let (module_label, module_bytes) = load_module_bytes(wasm_spec)?;
-
-        let mut engine_config = Config::new();
-        engine_config.consume_fuel(true);
-        let engine = Engine::new(&engine_config)?;
-        let module = Module::from_binary(&engine, &module_bytes)?;
-        let mut linker = Linker::new(&engine);
-
-        linker.func_wrap(
-            "arda_vhal",
-            "emit_bool",
-            |mut caller: Caller<'_, WasmHostState>, property_id: i32, area_id: i32, value: i32| -> i32 {
-                caller.data_mut().push(RawVhalCommand {
-                    property_id,
-                    area_id,
-                    value: RawVhalValue::Bool(value != 0),
-                })
-            },
-        )?;
-        linker.func_wrap(
-            "arda_vhal",
-            "emit_i32",
-            |mut caller: Caller<'_, WasmHostState>, property_id: i32, area_id: i32, value: i32| -> i32 {
-                caller.data_mut().push(RawVhalCommand {
-                    property_id,
-                    area_id,
-                    value: RawVhalValue::I32(value),
-                })
-            },
-        )?;
-        linker.func_wrap(
-            "arda_vhal",
-            "emit_f32",
-            |mut caller: Caller<'_, WasmHostState>, property_id: i32, area_id: i32, value: f32| -> i32 {
-                caller.data_mut().push(RawVhalCommand {
-                    property_id,
-                    area_id,
-                    value: RawVhalValue::F32(value),
-                })
-            },
-        )?;
-
-        let mut store = Store::new(&engine, WasmHostState::new(max_commands));
-        store.limiter(|state| &mut state.limits);
-        store.set_fuel(fuel_per_event.max(1))?;
-        let instance = linker.instantiate(&mut store, &module)?;
-        let abi_version = instance
-            .get_typed_func::<(), i32>(&mut store, "arda_abi_version")?
-            .call(&mut store, ())?;
-        if abi_version != SENSOR_WASM_ABI_VERSION {
-            return Err(format!(
-                "sensor wasm ABI mismatch: module={} expected={} actual={}",
-                module_label, SENSOR_WASM_ABI_VERSION, abi_version
-            )
-            .into());
-        }
-        let on_sensor = instance.get_typed_func::<
-            (i32, f64, f64, f64, f64, f64, f64),
-            i32,
-        >(&mut store, "arda_on_sensor")?;
-
-        Ok((
-            Self {
-                store,
-                on_sensor,
-                fuel_per_event: fuel_per_event.max(1),
-                module_label,
-            },
-            abi_version,
-        ))
-    }
-
-    fn process_event(
-        &mut self,
-        event: &ArdaSensorEvent,
-    ) -> Result<(i32, Vec<RawVhalCommand>, u64), Box<dyn std::error::Error>> {
-        {
-            let state = self.store.data_mut();
-            state.commands.clear();
-            state.dropped_commands = 0;
-        }
-        self.store.set_fuel(self.fuel_per_event)?;
-        let [a, b, c, d, e, f] = event.abi_values();
-        let status = match self
-            .on_sensor
-            .call(&mut self.store, (event.kind_id(), a, b, c, d, e, f))
-        {
-            Ok(status) => status,
-            Err(err) => {
-                let state = self.store.data_mut();
-                state.commands.clear();
-                state.dropped_commands = 0;
-                return Err(err.into());
-            }
-        };
-        let state = self.store.data_mut();
-        let commands = std::mem::take(&mut state.commands);
-        let dropped = std::mem::take(&mut state.dropped_commands);
-        Ok((status, commands, dropped))
-    }
-}
-
-fn load_module_bytes(wasm_spec: &str) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-    let normalized = wasm_spec.trim();
-    if normalized.is_empty()
-        || normalized.eq_ignore_ascii_case("builtin")
-        || normalized.eq_ignore_ascii_case("default")
-        || normalized.eq_ignore_ascii_case("embedded")
-    {
-        return Ok(("builtin:arda_vhal_default".to_string(), BUILTIN_WASM.to_vec()));
-    }
-
-    let path = Path::new(normalized);
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("cannot stat sensor wasm {}: {err}", path.display()))?;
-    let module_len = usize::try_from(metadata.len())
-        .map_err(|_| format!("sensor wasm {} is too large for this platform", path.display()))?;
-    if module_len > MAX_WASM_MODULE_BYTES {
-        return Err(format!(
-            "sensor wasm {} exceeds max module bytes: actual={} max={}",
-            path.display(), module_len, MAX_WASM_MODULE_BYTES
-        )
-        .into());
-    }
-    let bytes = fs::read(path)
-        .map_err(|err| format!("cannot read sensor wasm {}: {err}", path.display()))?;
-    Ok((format!("file:{}", path.display()), bytes))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VhalValueType {
-    Bool,
-    I32,
-    F32,
-}
-
-#[derive(Debug, Clone)]
-struct VhalCommand {
-    property_id: i32,
-    property_name: &'static str,
-    area_id: i32,
-    value: RawVhalValue,
-}
-
-impl VhalCommand {
-    fn value_string(&self) -> String {
-        match self.value {
-            RawVhalValue::Bool(value) => value.to_string(),
-            RawVhalValue::I32(value) => value.to_string(),
-            RawVhalValue::F32(value) => format!("{value:.3}"),
-        }
-    }
-}
-
-fn property_rule(property_id: i32) -> Option<(&'static str, VhalValueType, f64, f64)> {
-    match property_id {
-        291_504_647 => Some(("PERF_VEHICLE_SPEED", VhalValueType::F32, -1.0, 1_000.0)),
-        291_504_648 => Some(("PERF_VEHICLE_SPEED_DISPLAY", VhalValueType::F32, -1.0, 1_000.0)),
-        291_504_901 => Some(("ENGINE_RPM", VhalValueType::F32, 0.0, 50_000.0)),
-        291_504_644 => Some(("PERF_ODOMETER", VhalValueType::F32, 0.0, 2_000_000_000.0)),
-        291_504_903 => Some(("FUEL_LEVEL", VhalValueType::F32, 0.0, 2_000_000_000.0)),
-        291_504_904 => Some(("RANGE_REMAINING", VhalValueType::F32, -1.0, 2_000_000_000.0)),
-        287_310_850 => Some(("PARKING_BRAKE_ON", VhalValueType::Bool, 0.0, 1.0)),
-        289_408_001 => Some(("CURRENT_GEAR", VhalValueType::I32, 0.0, 0x1000 as f64)),
-        289_408_000 => Some(("GEAR_SELECTION", VhalValueType::I32, 0.0, 0x1000 as f64)),
-        287_310_855 => Some(("NIGHT_MODE", VhalValueType::Bool, 0.0, 1.0)),
-        291_505_923 => Some(("ENV_OUTSIDE_TEMPERATURE", VhalValueType::F32, -100.0, 200.0)),
-        _ => None,
-    }
-}
-
-fn validate_command(raw: RawVhalCommand) -> Result<VhalCommand, String> {
-    let Some((property_name, expected_type, min_value, max_value)) = property_rule(raw.property_id) else {
-        return Err(format!("property_not_allowed id={}", raw.property_id));
-    };
-    if raw.area_id != 0 {
-        return Err(format!(
-            "area_not_allowed property={}({}) area={}",
-            property_name, raw.property_id, raw.area_id
-        ));
-    }
-
-    let (actual_type, numeric_value) = match raw.value {
-        RawVhalValue::Bool(value) => (VhalValueType::Bool, if value { 1.0 } else { 0.0 }),
-        RawVhalValue::I32(value) => (VhalValueType::I32, value as f64),
-        RawVhalValue::F32(value) => (VhalValueType::F32, value as f64),
-    };
-    if actual_type != expected_type {
-        return Err(format!(
-            "type_mismatch property={}({}) expected={:?} actual={:?}",
-            property_name, raw.property_id, expected_type, actual_type
-        ));
-    }
-    if !numeric_value.is_finite() {
-        return Err(format!(
-            "non_finite property={}({})",
-            property_name, raw.property_id
-        ));
-    }
-    if numeric_value < min_value || numeric_value > max_value {
-        return Err(format!(
-            "range_reject property={}({}) value={} allowed={}..{}",
-            property_name, raw.property_id, numeric_value, min_value, max_value
-        ));
-    }
-
-    Ok(VhalCommand {
-        property_id: raw.property_id,
-        property_name,
-        area_id: raw.area_id,
-        value: raw.value,
-    })
-}
-
-#[derive(Debug)]
-struct VhalLastPush {
-    property_id: i32,
-    area_id: i32,
-    at: Instant,
-}
-
-struct VhalHostAdapter {
-    enabled: bool,
-    min_interval: Duration,
-    last_pushes: Vec<VhalLastPush>,
-}
-
-impl VhalHostAdapter {
-    fn new(enabled: bool, min_interval_ms: u64) -> Self {
-        Self {
-            enabled,
-            min_interval: Duration::from_millis(min_interval_ms),
-            last_pushes: Vec::new(),
-        }
-    }
-
-    fn dispatch(&mut self, event: &ArdaSensorEvent, command: &VhalCommand) -> String {
-        let value = command.value_string();
-        if !self.enabled {
-            return format!(
-                "SENSOR_WASM_VHAL dry_run event={} prop={}({}) area={} value={}",
-                event.name(), command.property_name, command.property_id, command.area_id, value
-            );
-        }
-        if !self.should_push(command.property_id, command.area_id) {
-            return format!(
-                "SENSOR_WASM_VHAL rate_limited event={} prop={}({}) area={} value={} min_ms={}",
-                event.name(), command.property_name, command.property_id, command.area_id, value, self.min_interval.as_millis()
-            );
-        }
-
-        let prop_id = command.property_id.to_string();
-        let area_id = command.area_id.to_string();
-        let cmd_args = [
-            "car_service",
-            "inject-vhal-event",
-            prop_id.as_str(),
-            area_id.as_str(),
-            value.as_str(),
-        ];
-        let primary = run_command_capture("/system/bin/cmd", &cmd_args);
-        self.mark_attempt(command.property_id, command.area_id);
-        if primary.success {
-            return format!(
-                "SENSOR_WASM_VHAL applied event={} prop={}({}) area={} value={} cmd='cmd {}' status={} stdout='{}' stderr='{}'",
-                event.name(), command.property_name, command.property_id, command.area_id, value,
-                cmd_args.join(" "), primary.status, primary.stdout, primary.stderr
-            );
-        }
-
-        let fallback_args = [
-            "activity",
-            "service",
-            "com.android.car",
-            "inject-vhal-event",
-            prop_id.as_str(),
-            value.as_str(),
-        ];
-        let fallback = run_command_capture("/system/bin/dumpsys", &fallback_args);
-        format!(
-            "SENSOR_WASM_VHAL {} event={} prop={}({}) area={} value={} primary_status={} primary_stderr='{}' fallback_status={} fallback_stdout='{}' fallback_stderr='{}'",
-            if fallback.success { "applied_fallback" } else { "failed" },
-            event.name(), command.property_name, command.property_id, command.area_id, value,
-            primary.status, primary.stderr, fallback.status, fallback.stdout, fallback.stderr
-        )
-    }
-
-    fn should_push(&self, property_id: i32, area_id: i32) -> bool {
-        if self.min_interval.is_zero() {
-            return true;
-        }
-        let now = Instant::now();
-        self.last_pushes
-            .iter()
-            .find(|last| last.property_id == property_id && last.area_id == area_id)
-            .map(|last| now.duration_since(last.at) >= self.min_interval)
-            .unwrap_or(true)
-    }
-
-    fn mark_attempt(&mut self, property_id: i32, area_id: i32) {
-        let now = Instant::now();
-        if let Some(last) = self
-            .last_pushes
-            .iter_mut()
-            .find(|last| last.property_id == property_id && last.area_id == area_id)
-        {
-            last.at = now;
-        } else {
-            self.last_pushes.push(VhalLastPush {
-                property_id,
-                area_id,
-                at: now,
-            });
-        }
-    }
-}
-
-struct CommandResult {
-    success: bool,
-    status: String,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_command_capture(program: &str, args: &[&str]) -> CommandResult {
-    match Command::new(program).args(args).output() {
-        Ok(output) => CommandResult {
-            success: output.status.success(),
-            status: output.status.to_string(),
-            stdout: compact_output(&output.stdout),
-            stderr: compact_output(&output.stderr),
-        },
-        Err(err) => CommandResult {
-            success: false,
-            status: "spawn-error".to_string(),
-            stdout: String::new(),
-            stderr: err.to_string(),
-        },
-    }
-}
-
-fn compact_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .trim()
-        .replace('\n', " | ")
-}
 
 #[derive(Debug, Clone)]
 pub struct SensorPipelineConfig {
@@ -910,41 +494,57 @@ pub struct SensorPipelineConfig {
     pub vhal_min_interval_ms: u64,
 }
 
+enum SensorPipelineMode {
+    Router(SensorRouterPublisher),
+    DryRun(VehiclePolicyEngine),
+}
+
 pub struct SensorPipeline {
-    wasm: SensorWasmEngine,
-    vhal: VhalHostAdapter,
+    mode: SensorPipelineMode,
     events_seen: u64,
-    commands_generated: u64,
-    commands_rejected: u64,
+    signals_seen: u64,
 }
 
 impl SensorPipeline {
     pub fn new(
         config: SensorPipelineConfig,
     ) -> Result<(Self, String), Box<dyn std::error::Error>> {
-        let (wasm, abi_version) = SensorWasmEngine::new(
+        if config.vhal_enabled {
+            let publisher = SensorRouterPublisher::connect(DEFAULT_ROUTER_SOCKET, 1)?;
+            let ready = format!(
+                "SENSOR_VEHICLE_ROUTER ready socket={} source_id=1 source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
+                DEFAULT_ROUTER_SOCKET,
+                config.vhal_min_interval_ms,
+            );
+            return Ok((
+                Self {
+                    mode: SensorPipelineMode::Router(publisher),
+                    events_seen: 0,
+                    signals_seen: 0,
+                },
+                ready,
+            ));
+        }
+
+        let (policy, abi_version) = VehiclePolicyEngine::new(
             &config.wasm_spec,
             config.fuel_per_event,
             config.max_commands_per_event,
         )?;
         let ready = format!(
-            "SENSOR_WASM_ENGINE ready abi={} module={} fuel_per_event={} max_commands_per_event={} memory_limit_bytes={} table_limit_elements={} vhal_enabled={} vhal_min_ms={} wasi=false imports=arda_vhal.emit_bool,emit_i32,emit_f32",
-            abi_version,
-            wasm.module_label,
-            config.fuel_per_event.max(1),
-            config.max_commands_per_event.max(1),
-            MAX_WASM_LINEAR_MEMORY_BYTES,
-            MAX_WASM_TABLE_ELEMENTS,
-            config.vhal_enabled,
-            config.vhal_min_interval_ms,
+            "{} sensor_mode=dry_run direct_vhal_shell=false",
+            ready_line(
+                &policy,
+                abi_version,
+                config.fuel_per_event,
+                config.max_commands_per_event,
+            )
         );
         Ok((
             Self {
-                wasm,
-                vhal: VhalHostAdapter::new(config.vhal_enabled, config.vhal_min_interval_ms),
+                mode: SensorPipelineMode::DryRun(policy),
                 events_seen: 0,
-                commands_generated: 0,
-                commands_rejected: 0,
+                signals_seen: 0,
             },
             ready,
         ))
@@ -954,51 +554,120 @@ impl SensorPipeline {
         let mut lines = Vec::new();
         for event in events {
             self.events_seen = self.events_seen.saturating_add(1);
-            match self.wasm.process_event(event) {
-                Ok((status, commands, dropped)) => {
-                    if status != 0 {
+            let signals = sensor_event_to_vehicle_signals(event);
+            if signals.is_empty() {
+                lines.push(format!(
+                    "SENSOR_VEHICLE_PROPERTY_SKIP event={} kind={} reason=no_vhal_property_mapping total_events={}",
+                    event.name(),
+                    event.kind_id(),
+                    self.events_seen,
+                ));
+                continue;
+            }
+            self.signals_seen = self.signals_seen.saturating_add(signals.len() as u64);
+            match &mut self.mode {
+                SensorPipelineMode::Router(publisher) => {
+                    for signal in &signals {
                         lines.push(format!(
-                            "SENSOR_WASM_EVENT rejected event={} kind={} guest_status={} commands_discarded={}",
-                            event.name(), event.kind_id(), status, commands.len()
-                        ));
-                        continue;
-                    }
-                    lines.push(format!(
-                        "SENSOR_WASM_EVENT event={} kind={} commands={} dropped_by_host={} total_events={}",
-                        event.name(), event.kind_id(), commands.len(), dropped, self.events_seen
-                    ));
-                    if dropped > 0 {
-                        lines.push(format!(
-                            "SENSOR_WASM_LIMIT event={} dropped_commands={} reason=max_commands_per_event",
-                            event.name(), dropped
+                            "SENSOR_VEHICLE_PROPERTY event={} property={}({}) area={} value={}",
+                            event.name(),
+                            property_name(signal.property_id),
+                            signal.property_id,
+                            signal.area_id,
+                            signal.value.summary(),
                         ));
                     }
-                    for raw in commands {
-                        self.commands_generated = self.commands_generated.saturating_add(1);
-                        match validate_command(raw) {
-                            Ok(command) => {
-                                lines.push(self.vhal.dispatch(event, &command));
-                            }
-                            Err(reason) => {
-                                self.commands_rejected = self.commands_rejected.saturating_add(1);
-                                lines.push(format!(
-                                    "SENSOR_WASM_VHAL rejected event={} reason={} total_rejected={}",
-                                    event.name(), reason, self.commands_rejected
-                                ));
-                            }
-                        }
+                    match publisher.publish(&signals) {
+                        Ok(()) => lines.push(format!(
+                            "SENSOR_VEHICLE_ROUTER published event={} properties={} total_properties={}",
+                            event.name(),
+                            signals.len(),
+                            self.signals_seen,
+                        )),
+                        Err(err) => lines.push(format!(
+                            "SENSOR_VEHICLE_ROUTER failed event={} properties={} error={} fail_closed=true direct_vhal_fallback=false",
+                            event.name(),
+                            signals.len(),
+                            err,
+                        )),
                     }
                 }
-                Err(err) => {
-                    lines.push(format!(
-                        "SENSOR_WASM_TRAP event={} kind={} error={} commands_discarded=true",
-                        event.name(), event.kind_id(), err
-                    ));
+                SensorPipelineMode::DryRun(policy) => {
+                    for signal in signals {
+                        lines.extend(process_dry_run_signal(policy, event, &signal));
+                    }
                 }
             }
         }
         lines
     }
+}
+
+fn process_dry_run_signal(
+    policy: &mut VehiclePolicyEngine,
+    event: &ArdaSensorEvent,
+    signal: &VehicleSignal,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "SENSOR_WASM_EVENT event={} kind={} property={}({}) area={} value={}",
+        event.name(),
+        event.kind_id(),
+        property_name(signal.property_id),
+        signal.property_id,
+        signal.area_id,
+        signal.value.summary(),
+    )];
+    match policy.process_vehicle_signal(signal) {
+        Ok(output) => {
+            if output.status != 0 {
+                lines.push(format!(
+                    "SENSOR_WASM_EVENT rejected event={} property={} guest_status={} outputs_discarded=true",
+                    event.name(),
+                    property_name(signal.property_id),
+                    output.status,
+                ));
+                return lines;
+            }
+            if output.dropped_outputs > 0 {
+                lines.push(format!(
+                    "SENSOR_WASM_LIMIT event={} property={} dropped_outputs={} reason=max_outputs_per_call",
+                    event.name(),
+                    property_name(signal.property_id),
+                    output.dropped_outputs,
+                ));
+            }
+            for vhal_event in output.vhal_events {
+                lines.push(format!(
+                    "SENSOR_WASM_VHAL dry_run event={} property={} prop={}({}) area={} value={}",
+                    event.name(),
+                    property_name(signal.property_id),
+                    property_name(vhal_event.property_id),
+                    vhal_event.property_id,
+                    vhal_event.area_id,
+                    vhal_event.value.summary(),
+                ));
+            }
+            for command in output.vehicle_commands {
+                lines.push(format!(
+                    "SENSOR_WASM_VEHICLE unexpected_command event={} property={} command_property={}({}) area={} value={}",
+                    event.name(),
+                    property_name(signal.property_id),
+                    property_name(command.property_id),
+                    command.property_id,
+                    command.area_id,
+                    command.value.summary(),
+                ));
+            }
+        }
+        Err(err) => lines.push(format!(
+            "SENSOR_WASM_TRAP event={} kind={} property={} error={} outputs_discarded=true",
+            event.name(),
+            event.kind_id(),
+            property_name(signal.property_id),
+            err,
+        )),
+    }
+    lines
 }
 
 pub fn smoke_events() -> Vec<ArdaSensorEvent> {

@@ -482,3 +482,75 @@ Immediate combined test order:
 7. Only after inspecting real values, run explicit `--sensor-open --sensor-forward-vhal` and verify validated `SENSOR_WASM_VHAL applied` lines plus AAOS property behavior.
 8. Do not accept any `SENSOR_OS_VHAL` line; that direct session/proto mapping path has been removed.
 
+
+## v57 Phase 1.1 direct VehicleProperty model + generic Wasm pass-through
+
+Reason for the Phase 1.1 correction:
+- The first v57 router checkpoint used an ARDA-specific generic signal namespace and implemented the
+  default WAT policy as a property-by-property `if` chain.
+- That shape duplicated standard AAOS/VHAL semantics inside the policy guest and would grow into a
+  giant switch table.
+- The first Docker compile also exposed a rust-protobuf v3 codegen mismatch: router code consistently
+  used generated accessors, while protobuf v3 does not generate public-field accessors by default.
+
+Implemented in the current Phase 1.1 source:
+- Explicitly request rust-protobuf generated field accessors in `build.rs`.
+- Rename the new router protocol fields from `signal_id` to `property_id`; protobuf field numbers stay
+  unchanged.
+- Remove the second ARDA signal-ID namespace. `VehicleSignal.property_id` and
+  `VehicleCommand.property_id` now carry Android `VehicleProperty` IDs directly.
+- Map the known built-in AAP/HU sensor types to standard VHAL properties in Rust before the router.
+- Keep AAP location out of VHAL/Wasmtime for the future GPS_PROVIDER -> fused path.
+- Keep AAP FuelData unmapped because the source protobuf does not define fuel/range units.
+- Replace the builtin WAT property switch with a value-type-only pass-through policy. The default
+  guest preserves property ID, area ID and value in both vehicle->VHAL and VHAL-set->vehicle
+  directions.
+- Keep custom Wasm modules as optional policy/remap/stateful logic only where an OEM integration
+  actually needs them.
+- Rename the platform-internal protobuf property fields to `property_id`. Keep the wire field type as
+  `int32`, rather than a closed property enum, so vendor VehicleProperty IDs remain representable.
+- Replace the Rust `property_rule()` match chain with declarative `SUPPORTED_PROPERTY_RULES` metadata.
+  This registry is only the Phase 1 validation/authorization subset; it is not a signal mapping table.
+- The future real AIDL VHAL backend should derive supported property/type/area metadata from the active
+  VehiclePropConfig set and combine it with Arda Vehicle Manager grants.
+
+Current default flow:
+
+```text
+AAP/HU SensorSource
+    -> Rust built-in sensor mapping
+    -> VehicleProperty ID + area + typed value
+                                      \
+third-party/CAN adapter ---------------> router / source arbitration
+                                         -> generic Wasm policy
+                                         -> same VehicleProperty event
+                                         -> VHAL
+
+VHAL set request
+    -> router
+    -> generic Wasm policy
+    -> same VehicleProperty command
+    -> approved adapter
+```
+
+Immediate Phase 1.1 validation order:
+1. Rebuild senderd with the Phase 1.1 changed files.
+2. Require the old rust-protobuf `no method named set_*` / `field, not a method` cascade to disappear.
+3. Run `sensor-gate-smoke`.
+4. Run `sensor-wasm-smoke` and verify the known HU mappings pass through unchanged.
+5. Run `vehicle-policy-smoke` and require `VEHICLE_POLICY_SMOKE_GENERIC_PROPERTY_PASS_THROUGH=YES`.
+6. Start `vehicle-routerd`, then run `vehicle-router-smoke` and require property-ID-preserving HVAC
+   command routing plus capability-scoped source arbitration.
+7. Only after Phase 1.1 compile/smoke success, continue with Vehicle Manager/AIDL adapter API.
+
+### v57 Phase 1.1 build determinism follow-up
+
+- The first Phase 1.1 Android build still compiled against a no-accessor generated
+  `arda_vehicle_router.rs`, producing the same 204 `E0599` accessor cascade.
+- `generate_accessors(true)` remains the intended rust-protobuf API contract for the router.
+- Android Docker builds now clean only the `arda-senderd` artifacts for the selected target before
+  compiling so timestamp-preserving `rsync -av` patch restores cannot reuse stale `OUT_DIR/protos`.
+- `build.rs` now validates the generated router source for required accessors immediately after
+  codegen and emits `ARDA_PROTO_ACCESSORS_OK=...` on success.
+- This is a build/codegen determinism fix only; VehicleProperty IDs, Rust AAP/HU mappings, generic
+  Wasmtime typed pass-through, router arbitration and command routing remain unchanged.

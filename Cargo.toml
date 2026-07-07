@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 protobuf = "3.7.1"
+libc = "0.2"
 rustls = { version = "0.23" }
 rustls-pemfile = "2"
 wasmtime = { version = "=36.0.11", default-features = false, features = ["cranelift", "runtime", "std"] }

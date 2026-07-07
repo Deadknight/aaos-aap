@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package arda.vehicle.router.v2;
+
+option java_package = "com.arda.vehicle.router.proto";
+option java_outer_classname = "ArdaVehicleRouterProto";
+option java_multiple_files = false;
+
+// Platform-internal protocol between arda-senderd sensor publishers,
+// Arda Vehicle Manager, the ARDA VHAL transition backend and vehicle-routerd.
+// VehicleSignal/VehicleCommand property_id fields carry Android VehicleProperty IDs directly.
+// This is not the third-party adapter SDK. Third-party apps use AIDL/Binder.
+
+enum ClientRole {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SIGNAL_SOURCE = 1;
+  ROLE_VHAL = 2;
+  ROLE_MANAGER = 3;
+}
+
+enum ValueType {
+  VALUE_UNSPECIFIED = 0;
+  VALUE_BOOL = 1;
+  VALUE_I32 = 2;
+  VALUE_I64 = 3;
+  VALUE_F32 = 4;
+  VALUE_F64 = 5;
+  VALUE_BYTES = 6;
+}
+
+enum Capability {
+  CAP_UNSPECIFIED = 0;
+  CAP_POWERTRAIN = 1;
+  CAP_ENERGY = 2;
+  CAP_HVAC_STATE = 3;
+  CAP_BODY_STATE = 4;
+  CAP_CHARGING_STATE = 5;
+  CAP_HVAC_CONTROL = 16;
+  CAP_BODY_CONTROL = 17;
+  CAP_CHARGING_CONTROL = 18;
+}
+
+enum CommandStatus {
+  COMMAND_OK = 0;
+  COMMAND_REJECTED = 1;
+  COMMAND_UNSUPPORTED = 2;
+  COMMAND_IO_ERROR = 3;
+  COMMAND_TIMEOUT = 4;
+}
+
+message Hello {
+  uint32 protocol_version = 1;
+  ClientRole role = 2;
+  string client_name = 3;
+}
+
+message HelloAck {
+  bool accepted = 1;
+  string error = 2;
+  uint32 protocol_version = 3;
+  uint32 peer_uid = 4;
+}
+
+message RegisterSource {
+  uint32 source_id = 1;
+  string source_name = 2;
+  int32 priority = 3;
+  repeated int32 publish_capabilities = 4;
+  repeated int32 command_capabilities = 5;
+}
+
+message RegisterSourceResult {
+  uint32 source_id = 1;
+  bool accepted = 2;
+  string error = 3;
+}
+
+message VehicleSignal {
+  uint32 source_id = 1;
+  int32 property_id = 2;
+  int32 area_id = 3;
+  ValueType value_type = 4;
+  bool bool_value = 5;
+  int32 int32_value = 6;
+  int64 int64_value = 7;
+  float float_value = 8;
+  double double_value = 9;
+  bytes bytes_value = 10;
+  int64 timestamp_nanos = 11;
+}
+
+message VehicleSignals {
+  repeated VehicleSignal signals = 1;
+}
+
+message VhalEvent {
+  int32 property_id = 1;
+  int32 area_id = 2;
+  ValueType value_type = 3;
+  bool bool_value = 4;
+  int32 int32_value = 5;
+  int64 int64_value = 6;
+  float float_value = 7;
+  double double_value = 8;
+  bytes bytes_value = 9;
+  int64 timestamp_nanos = 10;
+}
+
+message VhalEvents {
+  repeated VhalEvent events = 1;
+}
+
+message VhalSetRequest {
+  uint64 request_id = 1;
+  int32 property_id = 2;
+  int32 area_id = 3;
+  ValueType value_type = 4;
+  bool bool_value = 5;
+  int32 int32_value = 6;
+  int64 int64_value = 7;
+  float float_value = 8;
+  double double_value = 9;
+  bytes bytes_value = 10;
+  int64 timestamp_nanos = 11;
+}
+
+message VhalSetResult {
+  uint64 request_id = 1;
+  bool handled = 2;
+  int32 status = 3;
+  string error = 4;
+}
+
+message VehicleCommand {
+  uint64 command_id = 1;
+  uint32 source_id = 2;
+  int32 property_id = 3;
+  int32 area_id = 4;
+  ValueType value_type = 5;
+  bool bool_value = 6;
+  int32 int32_value = 7;
+  int64 int64_value = 8;
+  float float_value = 9;
+  double double_value = 10;
+  bytes bytes_value = 11;
+  int64 timestamp_nanos = 12;
+}
+
+message VehicleCommands {
+  repeated VehicleCommand commands = 1;
+}
+
+message CommandAck {
+  uint64 command_id = 1;
+  CommandStatus status = 2;
+  string error = 3;
+}
+
+message CommandAcks {
+  repeated CommandAck acknowledgements = 1;
+}
+
+message VhalSetError {
+  uint64 request_id = 1;
+  int32 property_id = 2;
+  int32 area_id = 3;
+  int32 status = 4;
+  string error = 5;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message Envelope {
+  uint32 protocol_version = 1;
+  uint64 request_id = 2;
+  Hello hello = 10;
+  HelloAck hello_ack = 11;
+  RegisterSource register_source = 12;
+  RegisterSourceResult register_source_result = 13;
+  VehicleSignals vehicle_signals = 14;
+  VhalEvents vhal_events = 15;
+  VhalSetRequest vhal_set_request = 16;
+  VhalSetResult vhal_set_result = 17;
+  VehicleCommands vehicle_commands = 18;
+  CommandAcks command_acks = 19;
+  VhalSetError vhal_set_error = 20;
+  Ping ping = 21;
+  Pong pong = 22;
+}

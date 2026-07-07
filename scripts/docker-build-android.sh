@@ -37,6 +37,14 @@ echo "Building Rust + embedded native C++ probe + app_process inputd for $TARGET
 echo "ANDROID_JAR=$ANDROID_JAR"
 echo "D8=$D8"
 
+# Patch/checkpoint archives are commonly applied with `rsync -av`, which preserves
+# source mtimes. Cargo's build-script rerun tracking is mtime-based, so an older
+# restored build.rs can otherwise leave a stale OUT_DIR/protos snapshot in target/.
+# Clean only this package for the selected Android target; dependency artifacts stay
+# cached, while build.rs/codegen/native/inputd are guaranteed to reflect this tree.
+echo "Refreshing arda-senderd target artifacts before codegen"
+cargo clean -p arda-senderd --target "$TARGET"
+
 if [[ -n "$FEATURES" ]]; then
   cargo build --release --target "$TARGET" --features "$FEATURES"
 else

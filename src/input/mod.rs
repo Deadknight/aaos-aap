@@ -7,8 +7,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem;
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -140,6 +143,110 @@ impl TouchInjectAction {
 
 const INPUTD_JAR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arda_inputd.jar"));
 const INPUTD_JAR_PATH: &str = "/data/local/tmp/arda-inputd.jar";
+const PLATFORM_INPUT_BRIDGE_SOCKET_PATH: &str =
+    "/data/user_de/0/com.arda.inputbridge/files/arda-input.sock";
+
+/// Client for the platform-integrated privileged ARDA input bridge.
+///
+/// The bridge is a persistent system_ext app signed with the platform key. It
+/// owns INJECT_EVENTS and performs InputManagerGlobal.injectInputEvent() inside
+/// Android's framework process model. arda-senderd only forwards the already
+/// mapped AAP input reports over a root-authenticated local UNIX-domain socket line protocol:
+///
+///   DISPLAY <id>
+///   T DOWN|MOVE|UP <x> <y> <pointer_id>
+///   K <android_keycode>
+///   STOP
+pub struct PlatformInputBridgeInjector {
+    stream: Option<UnixStream>,
+    display_id: i32,
+}
+
+impl PlatformInputBridgeInjector {
+    pub fn create(display_id: i32) -> io::Result<(Self, String)> {
+        let mut injector = Self {
+            stream: None,
+            display_id,
+        };
+        injector.connect()?;
+
+        let mut report = String::new();
+        report.push_str("arda platform input bridge client\n");
+        report.push_str(&format!(
+            "socket_path={}\n",
+            PLATFORM_INPUT_BRIDGE_SOCKET_PATH
+        ));
+        report.push_str("transport=unix-filesystem\n");
+        report.push_str("peer_auth=SO_PEERCRED/root-uid\n");
+        report.push_str(&format!("display_id={}\n", display_id));
+        report.push_str("protocol=line-v1\n");
+
+        Ok((injector, report))
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        let mut stream = UnixStream::connect(PLATFORM_INPUT_BRIDGE_SOCKET_PATH)?;
+        writeln!(stream, "DISPLAY {}", self.display_id)?;
+        stream.flush()?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    fn send_line(&mut self, line: &str) -> io::Result<()> {
+        let result = {
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "platform input bridge socket is not connected",
+                )
+            })?;
+            writeln!(stream, "{line}").and_then(|_| stream.flush())
+        };
+
+        if let Err(err) = result {
+            if let Some(stream) = self.stream.take() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    pub fn inject_touch(
+        &mut self,
+        action: TouchInjectAction,
+        x: i32,
+        y: i32,
+        pointer_id: u32,
+    ) -> io::Result<()> {
+        self.send_line(&format!(
+            "T {} {} {} {}",
+            action.shell_word(),
+            x,
+            y,
+            pointer_id
+        ))
+    }
+
+    pub fn inject_key_press(&mut self, keycode: u32) -> io::Result<()> {
+        self.send_line(&format!("K {}", keycode))
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(mut stream) = self.stream.take() {
+            let _ = writeln!(stream, "STOP");
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for PlatformInputBridgeInjector {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// Long-lived Android framework injector launched through app_process.
 ///
@@ -171,7 +278,16 @@ impl AppProcessInputInjector {
         report.push_str(&format!("jar={} bytes={}\n", jar_path.display(), INPUTD_JAR_BYTES.len()));
         report.push_str(&format!("display_id={}\n", display_id));
 
-        let mut child = Command::new("/system/bin/app_process")
+        // The live USB AAP session currently runs arda-senderd as root so it can
+        // open /dev/usb_accessory. Keep the transport parent privileged for now,
+        // but do not inherit uid 0 into the framework input injector. Android's
+        // shell uid owns the established INJECT_EVENTS path used by adb shell
+        // input. Drop uid/gid in the child immediately before exec instead of
+        // depending on /system/bin/su, which is not present on all userdebug
+        // images.
+        let parent_euid = effective_uid().unwrap_or(u32::MAX);
+        let mut child_cmd = Command::new("/system/bin/app_process");
+        child_cmd
             .env("CLASSPATH", &jar_path)
             .arg("/")
             .arg("com.arda.input.InputServer")
@@ -179,8 +295,16 @@ impl AppProcessInputInjector {
             .arg(display_id.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+
+        if parent_euid == 0 {
+            report.push_str("launch_as=shell-direct parent_euid=0 uid=2000 gid=2000\n");
+            child_cmd.uid(2000).gid(2000);
+        } else {
+            report.push_str(&format!("launch_as=inherited parent_euid={}\n", parent_euid));
+        }
+
+        let mut child = child_cmd.spawn()?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "app_process child stdin missing")
@@ -188,6 +312,14 @@ impl AppProcessInputInjector {
 
         report.push_str(&format!("pid={}\n", child.id()));
         thread::sleep(Duration::from_millis(250));
+
+        if let Some(status) = child.try_wait()? {
+            let _ = fs::remove_file(&jar_path);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("app_process inputd exited during startup: {status}"),
+            ));
+        }
 
         Ok((Self { child, stdin: Some(stdin), jar_path }, report))
     }
@@ -286,6 +418,18 @@ fn normalize_audio_capture_launch_as(value: &str) -> &str {
         "audioserver" | "audio-server" | "1041" => "audioserver",
         _ => "shell",
     }
+}
+
+fn effective_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            let _real = parts.next()?;
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn shell_quote(value: &str) -> String {

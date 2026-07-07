@@ -346,3 +346,63 @@ Immediate v52 test order:
 6. Exercise Maps/launcher continuously and verify SliceNonIdr + MEDIA DATA continue without a frame-limit stop.
 7. Only after video refresh is stable, re-enable sensor/VHAL with CLI overrides or a dedicated future profile.
 8. Use `scripts/arda-usb-run.sh` as the normal Mac workflow; stop reconstructing the baseline from shell history.
+
+## v53 platform-integrated input bridge client
+
+Observed platform hot-deploy result:
+- `/system_ext/priv-app/ArdaInputBridge/ArdaInputBridge.apk` is scanned as privileged/system_ext, persistent, installed for users 0 and 10.
+- `com.arda.inputbridge` starts at boot and logs `READY addr=127.0.0.1:5276`.
+- The platform bridge is signed with the platform certificate, requests `android.permission.INJECT_EVENTS`, and injects via `InputManagerGlobal.injectInputEvent()`.
+- Exact loopback protocol is line based: `DISPLAY <id>`, `T DOWN|MOVE|UP <x> <y> <pointer_id>`, `K <android_keycode>`, `STOP`/`BYE`, and optional `PING`.
+- The V4L2 C2 APEX hot-deploy is also active after reboot: `com.android.hardware.media.c2.v4l2` is mounted active/factory, `vendor.media.c2.v4l2` is running, and `IComponentStore/v4l2` is registered.
+
+Implemented in senderd:
+- Add `--input-inject-mode bridge` plus aliases `platform`, `platform-bridge`, `platform_bridge`, `system-app`, and `system_app`.
+- Add a long-lived TCP client for `127.0.0.1:5276`; it sends `DISPLAY` once on connect and forwards the already mapped AAP touch/key events using the bridge's exact protocol.
+- Bridge connection is lazy on the first injected touch/key event. A broken socket is dropped so the next event can reconnect; an interrupted active gesture may be lost until the next DOWN, while the bridge itself cancels active touch on disconnect.
+- Keep the existing 16 ms MOVE throttle for the platform bridge to avoid flooding framework injection.
+- Keep `app_process`, `/dev/uinput`, and shell injection as explicit A/B fallbacks; do not remove the proven paths yet.
+- Change repository `config.toml` baseline from `inject_mode = "app"` to `inject_mode = "bridge"`.
+
+Immediate test:
+1. Build/push the changed senderd and baseline config only; no new AAOS image burn is required because ArdaInputBridge is already hot-deployed and boot-active.
+2. Run `config-check` and require `--input-inject-mode bridge`.
+3. Start DHU, run `aap-run`, then tap/swipe continuously.
+4. Require sender logs `INPUT_PLATFORM_BRIDGE addr=127.0.0.1:5276` and `INPUT_PLATFORM_TOUCH_INJECT`; require Android logcat `ArdaInputBridge: client connected` with no `injectInputEvent failed`.
+5. Verify no new `app_process ... com.arda.input.InputServer` child exists during the session.
+6. After input is stable, separately force `c2.v4l2.avc.encoder` in the capture path and prove the active encoder from Codec2 runtime logs.
+
+## v54 secured platform input bridge transport
+
+Observed security issue in v53:
+- The platform-signed persistent InputBridge owned `INJECT_EVENTS` but accepted unauthenticated TCP clients on localhost. Loopback was only a routing boundary, not an authorization boundary.
+- The bridge also requested `INTERNET` solely for the TCP transport.
+- A local client could connect to the single blocking server and hold the connection, preventing senderd from reaching the injector.
+
+Implemented:
+- Replace `127.0.0.1:5276` TCP with a filesystem UNIX-domain socket at `/data/user_de/0/com.arda.inputbridge/files/arda-input.sock`.
+- The bridge starts the socket server only for Android user 0.
+- Set the socket node to mode `0600`.
+- Read kernel peer credentials immediately after `accept()` and accept only UID 0, matching the current root `arda-senderd` runtime required by `/dev/usb_accessory`. Unauthorized peers are closed before the line protocol is read.
+- Remove `android.permission.INTERNET` from ArdaInputBridge.
+- Keep the proven line protocol and AAP touch/key mapping unchanged: `DISPLAY`, `T`, `K`, `STOP`/`BYE`, `PING`.
+- Senderd now uses `UnixStream` and reconnect behavior remains lazy/event-driven.
+
+Security boundary for the current PoC/runtime:
+- DAC (`0600`) blocks ordinary application UIDs from opening the filesystem socket.
+- Kernel peer credentials are checked by the privileged bridge and only root UID is authorized.
+- Root remains trusted because the current senderd session itself must run as root to open `/dev/usb_accessory`.
+
+Future hardening when senderd becomes an init-managed platform daemon:
+- Give senderd a dedicated Android UID/SELinux domain.
+- Move the socket to an init-created path with a dedicated SELinux type.
+- Replace the temporary root UID allow-list with the dedicated daemon UID/domain.
+- Keep Binder/AIDL as an optional later replacement; it is not required for the current transport hardening.
+
+Immediate test:
+1. Build and hot-deploy `ArdaInputBridge`; verify the old TCP listener on `5276` is gone.
+2. Require the UNIX socket node to exist with mode `srw-------`.
+3. Run senderd as root with `inject_mode = bridge`; require `INPUT_PLATFORM_BRIDGE transport=unix-filesystem` and `peer_auth=SO_PEERCRED/root-uid`.
+4. Require bridge log `client accepted uid=0` and successful tap/swipe injection.
+5. Attempt a connection from a normal app UID only if a controlled test helper is available; the bridge must log `rejected peer uid=...`.
+6. After secure input is stable, return to sensor/VHAL work. The next architecture target is a Wasmtime/WebAssembly VHAL translation layer while preserving the proven AAP/TLS/SDR path.

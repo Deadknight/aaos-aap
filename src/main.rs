@@ -194,8 +194,8 @@ Commands:
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
-  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
-      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default input injection mode is uinput; app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --video-first-frame-kick to synthesize a tiny AAOS input event after native capture starts if the first frame waits for a screen change; modes include edge tap, center tap, center-cancel, center-move-cancel, wm-nudge, touch-cancel, wakeup key, and explicit keyevent. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
+  aap-session-probe ... --input-open [--input-key-binding|--no-input-key-binding] [--input-inject] [--input-inject-mode bridge|uinput|app|shell] [--input-app-move-min-ms N] [--input-key-inject] [--quiet-ping|--log-ping] [--log-level quiet|summary|normal|verbose]
+      Opens the HU InputSourceService channel, logs touchscreen/touchpad/key/rotary reports, optionally sends key binding request, and can inject touchscreen/key events into Android. The default CLI input injection mode is uinput; the platform-integrated privileged bridge is available via --input-inject-mode bridge and is the current ARDA baseline. app_process/framework remains available via --input-inject-mode app, with shell fallback also available. Ping request/response logs are quiet by default in session mode. Use --log-level quiet/summary for low-latency testing; --log-level verbose restores wire/per-frame logs. Use --fast-start to reduce WM settle to 300ms, enable startup timing logs, and use a conservative first-frame restart guard. Use --video-first-frame-kick to synthesize a tiny AAOS input event after native capture starts if the first frame waits for a screen change; modes include edge tap, center tap, center-cancel, center-move-cancel, wm-nudge, touch-cancel, wakeup key, and explicit keyevent. Use --display-profile waveshare-79 to apply the known Waveshare 7.9 rotation/DHU-priority profile, or --wm-rotation 90/270 for manual correction.
 
   aap-session-probe ... --audio-open [--audio-stream all|media|guidance|system|telephony] [--audio-test-tone|--audio-capture] [--audio-capture-source remote_submix|mic|default] [--audio-dump|--audio-dump-dir PATH] [--mic-open] [--mic-dump PATH] [--no-audio-ack]
       Opens HU audio MediaSinkService channels, sends PCM setup/start, dumps inbound phone PCM data when requested, and ACKs received audio packets.
@@ -3269,10 +3269,10 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--input-inject-mode" | "--input-touch-mode" | "--touch-inject-mode" => {
                 i += 1;
-                let value = argv.get(i).ok_or("--input-inject-mode requires uinput|app|shell")?.to_ascii_lowercase();
+                let value = argv.get(i).ok_or("--input-inject-mode requires bridge|uinput|app|shell")?.to_ascii_lowercase();
                 input_inject_mode = match value.as_str() {
-                    "app" | "framework" | "java" | "app-process" | "app_process" | "inputd" | "uinput" | "shell" | "motionevent" | "shell-motionevent" | "input" => value,
-                    other => return Err(format!("--input-inject-mode unsupported value: {other}; use uinput|app|shell").into()),
+                    "bridge" | "platform" | "platform-bridge" | "platform_bridge" | "system-app" | "system_app" | "app" | "framework" | "java" | "app-process" | "app_process" | "inputd" | "uinput" | "shell" | "motionevent" | "shell-motionevent" | "input" => value,
+                    other => return Err(format!("--input-inject-mode unsupported value: {other}; use bridge|uinput|app|shell").into()),
                 };
             }
             "--input-app-move-min-ms" | "--app-input-move-min-ms" | "--input-move-min-ms" => {

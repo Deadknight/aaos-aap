@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::screenrecord::preferred_codec_name;
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
-use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, TouchInjectAction, TouchInjector};
+use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, PlatformInputBridgeInjector, TouchInjectAction, TouchInjector};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -2733,6 +2733,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut input_touch_map: Option<InputTouchMap> = None;
     let mut input_touch_injector: Option<TouchInjector> = None;
     let mut input_app_injector: Option<AppProcessInputInjector> = None;
+    let mut input_bridge_injector: Option<PlatformInputBridgeInjector> = None;
     let mut input_touch_inject_events = 0usize;
     let mut input_app_move_drop_events = 0usize;
     let mut last_app_move_inject_at: Option<std::time::Instant> = None;
@@ -3287,6 +3288,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             } else if config.input_inject
                                 && !is_shell_touch_inject_mode(&config.input_inject_mode)
                                 && !is_app_process_input_inject_mode(&config.input_inject_mode)
+                                && !is_platform_input_bridge_mode(&config.input_inject_mode)
                                 && input_touch_injector.is_none()
                             {
                                 match TouchInjector::create(map.target_width, map.target_height) {
@@ -3688,7 +3690,89 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                     };
 
                                     if let Some(action) = action {
-                                        if is_app_process_input_inject_mode(&config.input_inject_mode) {
+                                        if is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                            if input_bridge_injector.is_none() {
+                                                let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                                match PlatformInputBridgeInjector::create(display_id) {
+                                                    Ok((injector, report)) => {
+                                                        for line in report.lines() {
+                                                            let line = format!("INPUT_PLATFORM_BRIDGE {line}");
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                        input_bridge_injector = Some(injector);
+                                                    }
+                                                    Err(err) => {
+                                                        let line = format!("INPUT_PLATFORM_BRIDGE connect failed: {err}");
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                }
+                                            }
+
+                                            let mut drop_bridge_move = false;
+                                            if matches!(action, TouchInjectAction::Move) && config.input_app_move_min_ms > 0 {
+                                                let now = std::time::Instant::now();
+                                                if let Some(last) = last_app_move_inject_at {
+                                                    if now.duration_since(last).as_millis() < config.input_app_move_min_ms as u128 {
+                                                        drop_bridge_move = true;
+                                                    }
+                                                }
+                                                if !drop_bridge_move {
+                                                    last_app_move_inject_at = Some(now);
+                                                }
+                                            } else if !matches!(action, TouchInjectAction::Move) {
+                                                last_app_move_inject_at = None;
+                                            }
+
+                                            if drop_bridge_move {
+                                                input_app_move_drop_events += 1;
+                                                if session_log_enabled(LOG_VERBOSE) && (input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0) {
+                                                    let line = format!(
+                                                        "INPUT_PLATFORM_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
+                                                        pointer.x,
+                                                        pointer.y,
+                                                        x,
+                                                        y,
+                                                        pointer.pointer_id,
+                                                        input_app_move_drop_events,
+                                                        config.input_app_move_min_ms
+                                                    );
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                            } else {
+                                                let inject_result = match input_bridge_injector.as_mut() {
+                                                    Some(injector) => injector.inject_touch(action, x, y, pointer.pointer_id),
+                                                    None => Err(io::Error::new(io::ErrorKind::NotConnected, "platform input bridge is not available")),
+                                                };
+                                                match inject_result {
+                                                    Ok(()) => {
+                                                        input_touch_inject_events += 1;
+                                                        if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                            let line = format!(
+                                                                "INPUT_PLATFORM_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                action,
+                                                                pointer.x,
+                                                                pointer.y,
+                                                                x,
+                                                                y,
+                                                                pointer.pointer_id,
+                                                                input_touch_inject_events
+                                                            );
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        input_bridge_injector = None;
+                                                        let line = format!("INPUT_PLATFORM_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                }
+                                            }
+                                        } else if is_app_process_input_inject_mode(&config.input_inject_mode) {
                                             if input_app_injector.is_none() {
                                                 let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
                                                 match AppProcessInputInjector::create(display_id) {
@@ -3853,7 +3937,34 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                     continue;
                                 }
                                 if let Some(android_code) = input::android_passthrough_keycode(key.keycode) {
-                                    let key_result = if is_app_process_input_inject_mode(&config.input_inject_mode) {
+                                    let key_result = if is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                        if input_bridge_injector.is_none() {
+                                            let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                            match PlatformInputBridgeInjector::create(display_id) {
+                                                Ok((injector, report)) => {
+                                                    for line in report.lines() {
+                                                        let line = format!("INPUT_PLATFORM_BRIDGE {line}");
+                                                        println!("{line}");
+                                                        log_line(&mut dump, &line)?;
+                                                    }
+                                                    input_bridge_injector = Some(injector);
+                                                }
+                                                Err(err) => {
+                                                    let line = format!("INPUT_PLATFORM_KEY_INJECT connect failed: {err}");
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                            }
+                                        }
+                                        let result = match input_bridge_injector.as_mut() {
+                                            Some(injector) => injector.inject_key_press(android_code),
+                                            None => Err(io::Error::new(io::ErrorKind::NotConnected, "platform input bridge is not available")),
+                                        };
+                                        if result.is_err() {
+                                            input_bridge_injector = None;
+                                        }
+                                        result
+                                    } else if is_app_process_input_inject_mode(&config.input_inject_mode) {
                                         if input_app_injector.is_none() {
                                             let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
                                             match AppProcessInputInjector::create(display_id) {
@@ -4580,6 +4691,11 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         let _ = injector.force_up();
         println!("SESSION_CLEANUP uinput force_up sent");
         let _ = log_line(&mut dump, "SESSION_CLEANUP uinput force_up sent");
+    }
+    if let Some(injector) = input_bridge_injector.as_mut() {
+        injector.stop();
+        println!("SESSION_CLEANUP platform input bridge client stopped");
+        let _ = log_line(&mut dump, "SESSION_CLEANUP platform input bridge client stopped");
     }
     if let Some(injector) = input_app_injector.as_mut() {
         injector.stop();
@@ -6217,6 +6333,13 @@ fn build_ssl_frame(tls_bytes: &[u8]) -> AapFrame {
         final_length: None,
         payload,
     }
+}
+
+fn is_platform_input_bridge_mode(mode: &str) -> bool {
+    matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "bridge" | "platform" | "platform-bridge" | "platform_bridge" | "system-app" | "system_app"
+    )
 }
 
 fn is_app_process_input_inject_mode(mode: &str) -> bool {

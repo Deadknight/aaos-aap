@@ -38,9 +38,10 @@ first_frame_kick = false
 open = true
 key_binding = true
 inject = true
-# Waveshare 7.9 / 270-degree setup: framework/app injection uses logical display
-# coordinates directly. uinput remains available for isolated A/B tests.
-inject_mode = "app"
+# Waveshare 7.9 / 270-degree setup: the platform bridge injects mapped logical
+# display coordinates through the privileged system_ext InputManager bridge.
+# app/uinput/shell remain available for isolated A/B tests.
+inject_mode = "bridge"
 app_move_min_ms = 16
 
 [audio]

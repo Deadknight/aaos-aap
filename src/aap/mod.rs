@@ -1526,7 +1526,7 @@ impl SensorOsForwarder {
             self.location_initialized = true;
         }
         let location_arg = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
-        let accuracy_arg = format!("{:.1}", location.accuracy_m.max(1.0));
+        let accuracy_arg = format!("{:.1}", location.accuracy_m.unwrap_or(1.0).max(1.0));
         let args = [
             "providers",
             "set-test-provider-location",
@@ -3016,6 +3016,16 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if config.sensor_open {
                         println!("selected sensor source={:?}", sensor_candidate);
                         log_line(&mut dump, &format!("selected sensor source={:?}", sensor_candidate))?;
+                        if let (Some(pipeline), Some(sensor_source)) =
+                            (sensor_pipeline.as_mut(), sensor_candidate.as_ref())
+                        {
+                            for line in pipeline.process_location_characterization(
+                                sensor_source.location_characterization,
+                            ) {
+                                println!("{line}");
+                                log_line(&mut dump, &line)?;
+                            }
+                        }
                     }
                     if let Some(input) = input_candidate.as_ref() {
                         let touchscreens = input

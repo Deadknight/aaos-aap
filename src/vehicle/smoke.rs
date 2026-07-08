@@ -353,6 +353,122 @@ pub fn router_smoke(socket_path: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+
+pub fn manager_bridge_smoke(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(4);
+    let mut vhal = RouterWireClient::connect(
+        socket_path,
+        pb::ClientRole::ROLE_VHAL,
+        "arda-manager-bridge-smoke-vhal",
+        timeout,
+    )?;
+
+    let request_id = 7_002;
+    let set_request = make_vhal_set_f32(
+        request_id,
+        PROP_HVAC_TEMPERATURE_SET,
+        AREA_DRIVER,
+        23.0,
+        monotonic_nanos(),
+    );
+    let result = vhal.send_vhal_set(set_request)?;
+    println!(
+        "VEHICLE_MANAGER_BRIDGE_SMOKE_SET_RESULT request={} handled={} status={} error={:?}",
+        result.request_id(),
+        result.handled(),
+        result.status(),
+        result.error(),
+    );
+    if !result.handled() || result.status() != 0 {
+        return Err(format!(
+            "manager bridge set request was not handled: status={} error={:?}",
+            result.status(),
+            result.error(),
+        )
+        .into());
+    }
+    println!("VEHICLE_MANAGER_BRIDGE_SMOKE_SET_HANDLED=YES");
+
+    let mut confirmed = false;
+    for _ in 0..8 {
+        let message = vhal.recv()?;
+        if message.has_vhal_set_error()
+            && message.vhal_set_error().request_id() == request_id
+        {
+            let error = message.vhal_set_error();
+            return Err(format!(
+                "manager bridge command failed request={} status={} error={:?}",
+                error.request_id(),
+                error.status(),
+                error.error(),
+            )
+            .into());
+        }
+        if !message.has_vhal_events() {
+            continue;
+        }
+        for event in message.vhal_events().events() {
+            if event.property_id() == PROP_HVAC_TEMPERATURE_SET
+                && event.area_id() == AREA_DRIVER
+                && event.value_type() == pb::ValueType::VALUE_F32
+                && (event.float_value() - 23.0).abs() < 0.001
+            {
+                confirmed = true;
+                println!(
+                    "VEHICLE_MANAGER_BRIDGE_SMOKE_CONFIRMED property={}({}) area={} value={:.3}",
+                    property_name(event.property_id()),
+                    event.property_id(),
+                    event.area_id(),
+                    event.float_value(),
+                );
+                break;
+            }
+        }
+        if confirmed {
+            break;
+        }
+    }
+    if !confirmed {
+        return Err("manager bridge did not return adapter-confirmed HVAC state".into());
+    }
+    println!("VEHICLE_MANAGER_BRIDGE_SMOKE_CONFIRMED_STATE=YES");
+
+    thread::sleep(Duration::from_millis(2_250));
+    let nonce = 0xA2_0001u64;
+    let mut ping = pb::Ping::new();
+    ping.set_nonce(nonce);
+    let mut ping_envelope = super::wire::envelope();
+    ping_envelope.set_ping(ping);
+    vhal.send(&ping_envelope)?;
+
+    let mut saw_pong = false;
+    for _ in 0..8 {
+        let message = vhal.recv()?;
+        if message.has_vhal_set_error()
+            && message.vhal_set_error().request_id() == request_id
+        {
+            let error = message.vhal_set_error();
+            return Err(format!(
+                "manager bridge ACK did not clear router command request={} status={} error={:?}",
+                error.request_id(),
+                error.status(),
+                error.error(),
+            )
+            .into());
+        }
+        if message.has_pong() && message.pong().nonce() == nonce {
+            saw_pong = true;
+            break;
+        }
+    }
+    if !saw_pong {
+        return Err("manager bridge smoke did not receive router Pong".into());
+    }
+    println!("VEHICLE_MANAGER_BRIDGE_SMOKE_ACK_ROUND_TRIP=YES");
+    println!("VEHICLE_MANAGER_BRIDGE_SMOKE_OK=YES");
+    Ok(())
+}
+
 fn recv_vhal_events(
     client: &mut RouterWireClient,
 ) -> Result<Vec<pb::VhalEvent>, Box<dyn std::error::Error>> {

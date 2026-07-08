@@ -617,3 +617,274 @@ Remaining Phase 1.1 gate:
 3. Require `VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES`,
    `VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES`, and `VEHICLE_ROUTER_SMOKE_OK=YES`.
 4. Only then close Phase 1.1 and begin Vehicle Manager / adapter AIDL Phase 2.
+
+## v57 Phase 1.1 closed / Phase 2.0 started
+
+Raspberry Pi runtime validation completed on 2026-07-07:
+
+```text
+SENSOR_GATE_SMOKE_OK=YES
+SENSOR_WASM_SMOKE_OK=YES
+VEHICLE_POLICY_SMOKE_GENERIC_PROPERTY_PASS_THROUGH=YES
+VEHICLE_POLICY_SMOKE_OK=YES
+VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES
+VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES
+VEHICLE_ROUTER_SMOKE_OK=YES
+```
+
+Phase 1.1 is closed.
+
+Phase 2.0 adds the platform-side third-party adapter boundary. Canonical source is `Deadknight/android_vendor_arda` under `vehicle/`; the AOSP destination is `vendor/arda/vehicle/`:
+
+```text
+arda.vehicle.adapter AIDL
+arda-vehicle-adapter-sdk
+ArdaVehicleManager
+ArdaVehicleSmokeAdapter
+```
+
+Security model:
+
+```text
+adapter cannot choose source_id
+manager allocates source_id and priority
+capability grants are explicit subsets
+service ComponentName + Android signing lineage bind the grant
+single-signer certificate rotation follows verified SigningInfo history
+multi-signer packages require an exact signer set
+```
+
+Phase 2.0 discovers, grants, binds and validates adapter callbacks. It intentionally logs accepted
+signals/acks rather than talking to `vehicle-routerd` yet.
+
+Next: Phase 2.1 manager-to-router bridge using the existing protocol v2 without changing the proven
+AAP/TLS/SDR path.
+
+## Phase 2.0 runtime closed / Phase 2.1 manager-router bridge source — 2026-07-08
+
+Authoritative Raspberry Pi Phase 2.0 runtime result:
+
+```text
+ARDA_VM_GRANT_OK ... source=10000 priority=100 publish=[2, 3] commands=[16]
+ARDA_VM_STATUS ... grants=1 ... granted=true signer_ok=true connected=true ready=true
+ARDA_VM_RESCAN user=10
+ARDA_VM_BIND_REQUEST ... source=10000
+ARDA_VM_ADAPTER_READY ... source=10000
+SMOKE_ADAPTER_HOST_CONNECTED
+ARDA_VM_SIGNAL_ACCEPT ... property=291504903 area=0 type=4
+ARDA_VM_SIGNAL_ACCEPT ... property=358614274 area=1 type=4
+ARDA_PHASE2_0_RUNTIME_GATE=PASS
+```
+
+Phase 2.0 status: CLOSED.
+
+Phase 2.1 current source implements the real `ArdaVehicleManager` <-> `vehicle-routerd` protocol-v2
+bridge without changing the proven AAP/TLS/SDR path or adding a second signal namespace.
+
+Key architecture:
+
+```text
+one granted adapter/source
+    -> one ROLE_MANAGER LocalSocket
+    -> Hello protocol 2
+    -> RegisterSource from stored manager grant
+    -> VehicleSignals with manager-injected source_id
+    <- VehicleCommands
+    -> one-way AIDL adapter delivery
+    <- CommandAck
+    -> CommandAcks
+```
+
+Use one router connection per source rather than multiplexing all adapters on one manager socket.
+Protocol v2 has no `UnregisterSource`; router cleanup is client-connection scoped. Per-source sockets
+make revoke, user-switch and adapter-disconnect cleanup fail closed using the existing proven
+`cleanup_client()` behavior, with no router protocol change.
+
+Additional Phase 2.1 hardening:
+- bounded latest-state retention per `(propertyId, areaId)` while the router is unavailable;
+- no ACK replay across router reconnects;
+- finite handshake read timeout;
+- command boundary validation before Binder delivery;
+- current-connection checks around adapter-ready activation;
+- stale rejected connections cannot remove a newer replacement binding;
+- product source remains canonical under `vendor/arda/vehicle`;
+- production product includes only `ArdaVehicleManager`; smoke adapter remains opt-in.
+
+New end-to-end smoke command:
+
+```text
+vehicle-manager-bridge-smoke
+```
+
+It verifies:
+
+```text
+VHAL set
+ -> router command dispatch
+ -> Manager per-source bridge
+ -> AIDL smoke adapter
+ -> CommandAck
+ -> adapter-confirmed state publish
+ -> router
+ -> VHAL event
+```
+
+and waits beyond the router's command timeout before a Ping/Pong drain so a late matching
+`VhalSetError` proves the ACK round-trip failed.
+
+Phase 2.1 status is SOURCE IMPLEMENTED / REAL BUILD + ENFORCING PI RUNTIME PENDING. The artifact
+preparation environment has no Cargo; do not mark Rust compile passed until the existing Android
+Docker build succeeds. Real AOSP/Soong build is also required for the Java protobuf-lite module.
+
+Do not solve a Manager -> router SELinux denial by switching the product to permissive. If the
+new enforcing smoke runner captures AVC denials, package `vehicle-routerd` as an init-managed daemon
+with a dedicated SELinux domain/socket policy next.
+
+## Phase 2.1 enforcing boundary / Phase 2.2 router platformization — 2026-07-08
+
+Real Phase 2.1 Android Docker Rust and canonical vendor-path Soong builds passed. The Manager's
+`LocalSocket` ordering bug was closed by connecting before applying the handshake timeout.
+
+The first actual enforcing Pi connect now fails on the exact platform boundary:
+
+```text
+avc: denied { write }
+scontext=u:r:system_app:s0
+tcontext=u:object_r:socket_device:s0
+tclass=sock_file
+permissive=0
+```
+
+The router is ready and the generic `/dev/socket/arda_vehicle_router` inode exists, but the generic
+`system_app` Manager is correctly denied access to generic `socket_device`. Do not add a broad
+`system_app -> socket_device` allow rule and do not use permissive mode as a pass condition.
+
+Phase 2.2 source platformizes this boundary:
+
+```text
+init
+  -> creates + binds + listens arda_vehicle_router stream socket
+  -> labels socket arda_vehicle_router_socket
+  -> starts /system_ext/bin/arda-senderd vehicle-routerd
+  -> arda_vehicle_router domain
+  -> ANDROID_SOCKET_arda_vehicle_router inherited fd
+
+com.arda.vehicle.manager
+  -> package-specific arda_vehicle_manager domain
+  -> narrow unix_socket_connect to arda_vehicle_router
+```
+
+Rust validates the inherited fd is open, `SOCK_STREAM`, already listening, and bound to the expected
+default pathname before taking ownership. The existing manual `UnixListener::bind()` path remains as a
+fallback when the init socket environment variable is absent or a custom `--socket` path is used.
+
+Product integration now includes `arda-vehicle-routerd` with `ArdaVehicleManager`; the smoke adapter
+remains opt-in. The generated Android ARM64 `arda-senderd` binary is staged into the Soong prebuilt
+module by `scripts/stage-arda-vehicle-router-prebuilt.sh` and is intentionally Git-ignored.
+
+The exact Enforcing AVC closure added only the permissions proven by runtime:
+
+```text
+allow arda_vehicle_manager arda_vehicle_router_socket:sock_file write;
+allow arda_vehicle_manager arda_vehicle_router_socket:unix_stream_socket connectto;
+allow arda_vehicle_router self:process execmem;
+```
+
+The userdebug/eng `su` smoke client receives the same narrow socket-type `connectto` allowance; no
+generic `system_app -> socket_device` permission was added.
+
+## Phase 2.2 enforcing AVC closure — 2026-07-08
+
+The canonical system_ext executable label fix passed on the Pi. Under Enforcing, init now creates the
+`arda_vehicle_router_socket`, starts `arda-senderd` in `u:r:arda_vehicle_router:s0`, and the Manager
+runs in `u:r:arda_vehicle_manager:s0`.
+
+The next exact runtime AVCs were:
+
+```text
+avc: denied { connectto }
+scontext=u:r:arda_vehicle_manager:s0
+tcontext=u:object_r:arda_vehicle_router_socket:s0
+tclass=unix_stream_socket
+permissive=0
+
+avc: denied { execmem }
+scontext=u:r:arda_vehicle_router:s0
+tcontext=u:r:arda_vehicle_router:s0
+tclass=process
+permissive=0
+```
+
+The init-created listening socket carries the dedicated socket object type, so the generic
+`unix_socket_connect(..., serverdomain)` macro's server-domain `connectto` rule does not match this
+endpoint. Phase 2.2 now grants only `sock_file write` plus `unix_stream_socket connectto` from the
+Manager to `arda_vehicle_router_socket`. The same narrow socket-type rule is available to `su` only in
+userdebug/eng for the root smoke client.
+
+Wasmtime JIT is allowed `self:process execmem` only in the dedicated `arda_vehicle_router` domain. Do
+not copy this permission to Manager, apps, `system_app`, or generic domains. Do not pre-authorize any
+further Wasmtime permission; rerun the Enforcing gate and add only permissions proven by exact AVCs.
+
+Next authoritative gate: rebuild the exact system_ext policy/hash/precompiled-policy set, deploy only
+the coherent SELinux artifacts, reboot, require router service/socket/domain plus Manager domain, then
+rerun the Manager bridge VHAL SET -> AIDL adapter -> ACK -> confirmed-state smoke under Enforcing.
+
+## Phase 2.1 / Phase 2.2 closed — 2026-07-08
+
+Authoritative final Raspberry Pi Enforcing runtime result:
+
+```text
+MANAGER_BRIDGE_MANAGER_DOMAIN=PASS
+MANAGER_BRIDGE_ROUTER_REGISTRATION=PASS
+VEHICLE_MANAGER_BRIDGE_SMOKE_SET_HANDLED=YES
+VEHICLE_MANAGER_BRIDGE_SMOKE_CONFIRMED_STATE=YES
+VEHICLE_MANAGER_BRIDGE_SMOKE_ACK_ROUND_TRIP=YES
+VEHICLE_MANAGER_BRIDGE_SMOKE_OK=YES
+MANAGER_BRIDGE_ENFORCING_RUNTIME_GATE=PASS selinux=Enforcing
+```
+
+The proven command path is:
+
+```text
+VHAL SET
+  -> vehicle-routerd
+  -> per-source Manager bridge
+  -> one-way AIDL adapter command
+  -> CommandAck OK
+  -> adapter confirmed-state publish
+  -> vehicle-routerd
+  -> VHAL event
+```
+
+Platform contexts are proven under Enforcing:
+
+```text
+/system_ext/bin/arda-senderd        u:object_r:arda_vehicle_router_exec:s0
+/dev/socket/arda_vehicle_router     u:object_r:arda_vehicle_router_socket:s0
+arda-senderd                        u:r:arda_vehicle_router:s0
+com.arda.vehicle.manager            u:r:arda_vehicle_manager:s0
+```
+
+The router uses the init-created listening socket through
+`ANDROID_SOCKET_arda_vehicle_router`, reports `VEHICLE_ROUTER_SOCKET_MODE=init_inherited`, and starts
+the builtin Wasmtime vehicle policy engine successfully.
+
+Phase 2.1 status: CLOSED.
+Phase 2.2 status: CLOSED.
+
+Canonical platform source ownership:
+
+```text
+Deadknight/android_vendor_arda
+  branch arda-aaos16
+  vehicle/
+  commit b53e5473d31de98573cb426c6618bdc9cc699e07
+
+Deadknight/android_device_brcm_rpi4
+  branch arda-aaos16
+  commit 0b13b2a565056f0b32a23abe9acc362401524b1a
+```
+
+`aaos-aap` no longer owns a duplicate in-repo Vehicle platform tree. Its Rust router, proto, Wasmtime
+policy and smoke tooling remain here; Android Vehicle Manager/AIDL/SEPolicy/init source lives in
+`android_vendor_arda/vehicle`.

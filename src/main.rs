@@ -59,6 +59,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "vehicle-routerd" => vehicle_routerd(args.collect()),
         "vehicle-policy-smoke" => vehicle_policy_smoke(args.collect()),
         "vehicle-router-smoke" => vehicle_router_smoke(args.collect()),
+        "vehicle-manager-bridge-smoke" => vehicle_manager_bridge_smoke(args.collect()),
         "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
         "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
         "config-check" => config_check(args.collect()),
@@ -151,6 +152,9 @@ Commands:
 
   vehicle-router-smoke [--socket PATH]
       Connects to a running vehicle-routerd as root and verifies the full bidirectional router flow, including request-versus-confirmed-state behavior.
+
+  vehicle-manager-bridge-smoke [--socket PATH]
+      Connects only as a VHAL client and verifies VHAL set -> vehicle-routerd -> ArdaVehicleManager -> AIDL adapter -> CommandAck + confirmed-state publish -> VHAL.
 
   aaos-aoa-gadget [--udc fe980000.usb] [--wait-ms 10000] [--name arda] [--no-bind] [--check] [--unbind]
       Legacy/manual gadget bootstrap. Normal AAP commands no longer auto-create or rebind USB gadget state.
@@ -2918,6 +2922,33 @@ fn vehicle_router_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Err
         return Err("--socket must not be empty".into());
     }
     vehicle::smoke::router_smoke(&socket_path)
+}
+
+fn vehicle_manager_bridge_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut socket_path = vehicle::wire::DEFAULT_ROUTER_SOCKET.to_string();
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--socket" => {
+                i += 1;
+                socket_path = argv
+                    .get(i)
+                    .ok_or("--socket requires PATH")?
+                    .to_string();
+            }
+            other => {
+                return Err(format!(
+                    "unknown vehicle-manager-bridge-smoke arg: {other}"
+                )
+                .into())
+            }
+        }
+        i += 1;
+    }
+    if socket_path.trim().is_empty() {
+        return Err("--socket must not be empty".into());
+    }
+    vehicle::smoke::manager_bridge_smoke(&socket_path)
 }
 
 fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

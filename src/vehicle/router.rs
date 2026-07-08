@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,7 +23,7 @@ use super::policy::{ready_line, VehiclePolicyEngine};
 use super::wire::{
     self, envelope, pb, peer_credentials, read_envelope, vehicle_command_to_pb,
     vehicle_signal_from_pb, vhal_event_to_pb, vhal_set_from_pb, write_envelope,
-    ROUTER_PROTOCOL_VERSION,
+    DEFAULT_ROUTER_SOCKET, ROUTER_PROTOCOL_VERSION,
 };
 
 const UID_ROOT: u32 = 0;
@@ -29,6 +31,7 @@ const UID_SYSTEM: u32 = 1000;
 const ANDROID_PER_USER_RANGE: u32 = 100_000;
 const UID_VEHICLE_NETWORK: u32 = 1054;
 const ROUTER_SOCKET_GID_SYSTEM: u32 = 1000;
+const INIT_ROUTER_SOCKET_ENV: &str = "ANDROID_SOCKET_arda_vehicle_router";
 const SIGNAL_SOURCE_STALE_AFTER: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -133,15 +136,6 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
         ROUTER_SOCKET_GID_SYSTEM,
     );
 
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| startup_io_error("create_parent", parent, err))?;
-    }
-    if socket_path.exists() {
-        fs::remove_file(socket_path)
-            .map_err(|err| startup_io_error("remove_stale_socket", socket_path, err))?;
-    }
-
     let (policy, abi_version) = VehiclePolicyEngine::new(
         &config.wasm_spec,
         config.fuel_per_call,
@@ -157,24 +151,15 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
         )
     );
 
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|err| startup_io_error("bind_socket", socket_path, err))?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))
-        .map_err(|err| startup_io_error("chmod_socket_0660", socket_path, err))?;
-    set_socket_owner(socket_path, UID_ROOT, ROUTER_SOCKET_GID_SYSTEM).map_err(|err| {
-        startup_io_error(
-            "chown_socket_root_system_requires_privilege",
-            socket_path,
-            err,
-        )
-    })?;
+    let (listener, socket_mode) = open_router_listener(socket_path)?;
 
     println!(
-        "VEHICLE_ROUTER_READY socket={} mode=0660 uid={} gid={} protocol={} allowed_roles=root:SIGNAL_SOURCE|VHAL|MANAGER,system_appid:MANAGER,vehicle_network:VHAL",
+        "VEHICLE_ROUTER_READY socket={} mode=0660 uid={} gid={} protocol={} socket_mode={} allowed_roles=root:SIGNAL_SOURCE|VHAL|MANAGER,system_appid:MANAGER,vehicle_network:VHAL",
         config.socket_path,
         UID_ROOT,
         ROUTER_SOCKET_GID_SYSTEM,
         ROUTER_PROTOCOL_VERSION,
+        socket_mode,
     );
 
     let state = Arc::new(Mutex::new(RouterState {
@@ -210,6 +195,154 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
         }
     }
     Ok(())
+}
+
+fn open_router_listener(socket_path: &Path) -> io::Result<(UnixListener, &'static str)> {
+    if socket_path == Path::new(DEFAULT_ROUTER_SOCKET) {
+        if let Some(raw_value) = env::var_os(INIT_ROUTER_SOCKET_ENV) {
+            let value = raw_value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{INIT_ROUTER_SOCKET_ENV} is not valid UTF-8"),
+                )
+            })?;
+            let fd: RawFd = value.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid {INIT_ROUTER_SOCKET_ENV} fd: {value}"),
+                )
+            })?;
+            validate_inherited_listener_fd(fd)?;
+
+            let listener = unsafe { UnixListener::from_raw_fd(fd) };
+            let local_addr = listener.local_addr().map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("inherited router socket local_addr failed fd={fd}: {err}"),
+                )
+            })?;
+            let actual_path = local_addr.as_pathname().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("inherited router socket fd={fd} is unnamed"),
+                )
+            })?;
+            if actual_path != socket_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "inherited router socket path mismatch fd={fd} expected={} actual={}",
+                        socket_path.display(),
+                        actual_path.display(),
+                    ),
+                ));
+            }
+
+            println!(
+                "VEHICLE_ROUTER_SOCKET_MODE=init_inherited env={} fd={} socket={} listening=true",
+                INIT_ROUTER_SOCKET_ENV,
+                fd,
+                socket_path.display(),
+            );
+            return Ok((listener, "init_inherited"));
+        }
+    } else if env::var_os(INIT_ROUTER_SOCKET_ENV).is_some() {
+        println!(
+            "VEHICLE_ROUTER_INIT_SOCKET_IGNORED reason=custom_socket_path env={} socket={}",
+            INIT_ROUTER_SOCKET_ENV,
+            socket_path.display(),
+        );
+    }
+
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| startup_io_error("create_parent", parent, err))?;
+    }
+    if socket_path.exists() {
+        fs::remove_file(socket_path)
+            .map_err(|err| startup_io_error("remove_stale_socket", socket_path, err))?;
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|err| startup_io_error("bind_socket", socket_path, err))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))
+        .map_err(|err| startup_io_error("chmod_socket_0660", socket_path, err))?;
+    set_socket_owner(socket_path, UID_ROOT, ROUTER_SOCKET_GID_SYSTEM).map_err(|err| {
+        startup_io_error(
+            "chown_socket_root_system_requires_privilege",
+            socket_path,
+            err,
+        )
+    })?;
+
+    println!(
+        "VEHICLE_ROUTER_SOCKET_MODE=manual_bind socket={} mode=0660 uid={} gid={}",
+        socket_path.display(),
+        UID_ROOT,
+        ROUTER_SOCKET_GID_SYSTEM,
+    );
+    Ok((listener, "manual_bind"))
+}
+
+fn validate_inherited_listener_fd(fd: RawFd) -> io::Result<()> {
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("negative inherited router socket fd={fd}"),
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("inherited router socket fd={fd} is not open: {err}"),
+        ));
+    }
+
+    let socket_type = socket_option_i32(fd, libc::SO_TYPE)?;
+    if socket_type != libc::SOCK_STREAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "inherited router socket fd={fd} has type={socket_type}, expected SOCK_STREAM={}",
+                libc::SOCK_STREAM,
+            ),
+        ));
+    }
+
+    let accepting = socket_option_i32(fd, libc::SO_ACCEPTCONN)?;
+    if accepting != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("inherited router socket fd={fd} is not listening SO_ACCEPTCONN={accepting}"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn socket_option_i32(fd: RawFd, option: libc::c_int) -> io::Result<i32> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected getsockopt length fd={fd} option={option} len={len}"),
+        ));
+    }
+    Ok(value)
 }
 
 

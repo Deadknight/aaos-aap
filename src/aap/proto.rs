@@ -11,7 +11,7 @@ pub mod protos {
 
 use protobuf::{Enum, Message};
 use self::protos::protos::*;
-use crate::sensor::{ArdaSensorEvent, GpsSatelliteInfo};
+use crate::sensor::ArdaSensorEvent;
 
 pub fn control_message_name(id: u16) -> &'static str {
     match ControlMessageType::from_i32(id as i32) {
@@ -830,7 +830,6 @@ pub struct MediaSourceSelection {
 pub struct SensorSourceSelection {
     pub service_id: i32,
     pub sensors: Vec<SensorTypeInfo>,
-    pub location_characterization: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1305,26 +1304,19 @@ fn summarize_service_discovery_response_body(
                     }
                 })
                 .collect::<Vec<_>>();
-            let location_characterization = sensor
-                .has_location_characterization()
-                .then(|| sensor.location_characterization());
             kinds.push(format!(
-                "sensor_source sensors={} [{}] location_characterization={}",
+                "sensor_source sensors={} [{}]",
                 sensors.len(),
                 sensors
                     .iter()
                     .map(|sensor| format!("{}({})", sensor.name, sensor.value))
                     .collect::<Vec<_>>()
-                    .join(","),
-                location_characterization
-                    .map(|value| format!("0x{value:08x}"))
-                    .unwrap_or_else(|| "absent".to_string()),
+                    .join(",")
             ));
             if sensor_source.is_none() {
                 sensor_source = Some(SensorSourceSelection {
                     service_id: svc.id(),
                     sensors,
-                    location_characterization,
                 });
             }
         }
@@ -1487,38 +1479,14 @@ pub fn parse_sensor_error_payload(payload: &[u8]) -> Option<String> {
     ))
 }
 
-fn json_option_f64(value: Option<f64>, precision: usize) -> String {
-    value
-        .map(|number| format!("{number:.precision$}"))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn gps_satellites_json(satellites: &[GpsSatelliteInfo]) -> String {
-    satellites
-        .iter()
-        .map(|satellite| {
-            format!(
-                "{{\"prn\":{},\"snr\":{:.3},\"used_in_fix\":{},\"azimuth_deg\":{},\"elevation_deg\":{}}}",
-                satellite.prn,
-                satellite.snr,
-                satellite.used_in_fix,
-                json_option_f64(satellite.azimuth_deg, 3),
-                json_option_f64(satellite.elevation_deg, 3),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 #[derive(Debug, Clone)]
 pub struct DecodedLocationFix {
-    pub timestamp_raw: Option<u64>,
     pub latitude_deg: f64,
     pub longitude_deg: f64,
-    pub accuracy_m: Option<f64>,
-    pub altitude_m: Option<f64>,
-    pub speed_mps: Option<f64>,
-    pub bearing_deg: Option<f64>,
+    pub accuracy_m: f64,
+    pub altitude_m: f64,
+    pub speed_mps: f64,
+    pub bearing_deg: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1606,30 +1574,22 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
 
     let location = msg.location_data.last().map(|loc| {
         let fix = DecodedLocationFix {
-            timestamp_raw: loc.has_timestamp().then(|| loc.timestamp()),
             latitude_deg: loc.latitude_e7() as f64 / 10_000_000.0,
             longitude_deg: loc.longitude_e7() as f64 / 10_000_000.0,
-            accuracy_m: loc.has_accuracy_e3().then(|| loc.accuracy_e3() as f64 / 1000.0),
-            altitude_m: loc.has_altitude_e2().then(|| loc.altitude_e2() as f64 / 100.0),
-            speed_mps: loc.has_speed_e3().then(|| loc.speed_e3() as f64 / 1000.0),
-            bearing_deg: loc.has_bearing_e6().then(|| loc.bearing_e6() as f64 / 1_000_000.0),
+            accuracy_m: loc.accuracy_e3() as f64 / 1000.0,
+            altitude_m: loc.altitude_e2() as f64 / 100.0,
+            speed_mps: loc.speed_e3() as f64 / 1000.0,
+            bearing_deg: loc.bearing_e6() as f64 / 1_000_000.0,
         };
         details.push(format!(
-            "location(timestamp_raw={:?},lat={:.7},lon={:.7},acc_m={:?},alt_m={:?},speed_mps={:?},bearing={:?})",
-            fix.timestamp_raw, fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
+            "location(lat={:.7},lon={:.7},acc_m={:.1},alt_m={:.1},speed_mps={:.2},bearing={:.1})",
+            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
         ));
         json_fields.push(format!(
-            "\"location\":{{\"timestamp_raw\":{},\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{},\"altitude_m\":{},\"speed_mps\":{},\"bearing_deg\":{}}}",
-            fix.timestamp_raw.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
-            fix.latitude_deg,
-            fix.longitude_deg,
-            json_option_f64(fix.accuracy_m, 3),
-            json_option_f64(fix.altitude_m, 2),
-            json_option_f64(fix.speed_mps, 3),
-            json_option_f64(fix.bearing_deg, 3),
+            "\"location\":{{\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{:.3},\"altitude_m\":{:.2},\"speed_mps\":{:.3},\"bearing_deg\":{:.3}}}",
+            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
         ));
         events.push(ArdaSensorEvent::Location {
-            timestamp_raw: fix.timestamp_raw,
             latitude_deg: fix.latitude_deg,
             longitude_deg: fix.longitude_deg,
             accuracy_m: fix.accuracy_m,
@@ -1775,37 +1735,9 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         events.push(ArdaSensorEvent::Gyroscope { x, y, z });
     }
     if let Some(sat) = msg.gps_satellite_data.last() {
-        let in_view = sat.has_number_in_view().then(|| sat.number_in_view());
-        let satellites = sat
-            .satellites
-            .iter()
-            .map(|item| GpsSatelliteInfo {
-                prn: item.prn(),
-                snr: item.snr_e3() as f64 / 1000.0,
-                used_in_fix: item.used_in_fix(),
-                azimuth_deg: item.has_azimuth_e3().then(|| item.azimuth_e3() as f64 / 1000.0),
-                elevation_deg: item.has_elevation_e3().then(|| item.elevation_e3() as f64 / 1000.0),
-            })
-            .collect::<Vec<_>>();
-        details.push(format!(
-            "gps_satellites use={} view={:?} listed={} satellites={:?}",
-            sat.number_in_use(),
-            in_view,
-            satellites.len(),
-            satellites,
-        ));
-        json_fields.push(format!(
-            "\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{},\"satellites\":[{}]}}",
-            sat.number_in_use(),
-            in_view.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
-            satellites.len(),
-            gps_satellites_json(&satellites),
-        ));
-        events.push(ArdaSensorEvent::GpsSatellite {
-            in_use: sat.number_in_use(),
-            in_view,
-            satellites,
-        });
+        details.push(format!("gps_satellites use={} view={} listed={}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
+        json_fields.push(format!("\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{}}}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
+        events.push(ArdaSensorEvent::GpsSatellite { in_use: sat.number_in_use(), in_view: sat.number_in_view(), listed: sat.satellites.len() });
     }
     if let Some(toll) = msg.toll_card_data.last() {
         let present = toll.is_card_present();
@@ -1832,463 +1764,6 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
     })
 }
 
-
-pub fn sensor_proto_fidelity_smoke() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    fn close(actual: f64, expected: f64) -> bool {
-        (actual - expected).abs() <= 0.000_001
-    }
-
-    let mut batch = SensorBatch::new();
-
-    let mut location = LocationData::new();
-    location.set_timestamp(1_783_525_000_123);
-    location.set_latitude_e7(399_330_000);
-    location.set_longitude_e7(328_590_000);
-    location.set_accuracy_e3(3_000);
-    location.set_altitude_e2(95_000);
-    location.set_speed_e3(13_800);
-    location.set_bearing_e6(90_000_000);
-    batch.location_data.push(location);
-
-    let mut compass = CompassData::new();
-    compass.set_bearing_e6(123_456_000);
-    compass.set_pitch_e6(-12_500_000);
-    compass.set_roll_e6(7_250_000);
-    batch.compass_data.push(compass);
-
-    let mut speed = SpeedData::new();
-    speed.set_speed_e3(27_750);
-    speed.set_cruise_engaged(true);
-    speed.set_cruise_set_speed(30_000);
-    batch.speed_data.push(speed);
-
-    let mut rpm = RpmData::new();
-    rpm.set_rpm_e3(4_321_000);
-    batch.rpm_data.push(rpm);
-
-    let mut odometer = OdometerData::new();
-    odometer.set_kms_e1(1_234_567);
-    odometer.set_trip_kms_e1(890);
-    batch.odometer_data.push(odometer);
-
-    let mut fuel = FuelData::new();
-    fuel.set_fuel_level(73);
-    fuel.set_range(456);
-    fuel.set_low_fuel_warning(true);
-    batch.fuel_data.push(fuel);
-
-    let mut parking_brake = ParkingBrakeData::new();
-    parking_brake.set_parking_brake(true);
-    batch.parking_brake_data.push(parking_brake);
-
-    let mut gear = GearData::new();
-    gear.set_gear(Gear::GEAR_DRIVE);
-    batch.gear_data.push(gear);
-
-    let mut diagnostics = DiagnosticsData::new();
-    diagnostics.set_dtc(b"P0420".to_vec());
-    batch.diagnostics_data.push(diagnostics);
-
-    let mut night = NightModeData::new();
-    night.set_night_mode(true);
-    batch.night_mode_data.push(night);
-
-    let mut environment = EnvironmentData::new();
-    environment.set_temperature_e3(-5_125);
-    environment.set_pressure_e3(101_325);
-    environment.set_rain(77);
-    batch.environment_data.push(environment);
-
-    let mut hvac = HvacData::new();
-    hvac.set_target_temperature_e3(21_500);
-    hvac.set_current_temperature_e3(19_875);
-    batch.hvac_data.push(hvac);
-
-    let mut driving_status = DrivingStatusData::new();
-    driving_status.set_status(0x0b);
-    batch.driving_status_data.push(driving_status);
-
-    let mut dead_reckoning = DeadReckoningData::new();
-    dead_reckoning.set_steering_angle_e1(-123);
-    dead_reckoning.wheel_speed_e3.push(10_000);
-    dead_reckoning.wheel_speed_e3.push(10_100);
-    dead_reckoning.wheel_speed_e3.push(10_200);
-    dead_reckoning.wheel_speed_e3.push(10_300);
-    batch.dead_reckoning_data.push(dead_reckoning);
-
-    let mut passenger = PassengerData::new();
-    passenger.set_passenger_present(true);
-    batch.passenger_data.push(passenger);
-
-    let mut door = DoorData::new();
-    door.set_hood_open(true);
-    door.set_trunk_open(false);
-    door.door_open.push(true);
-    door.door_open.push(false);
-    door.door_open.push(true);
-    door.door_open.push(false);
-    batch.door_data.push(door);
-
-    let mut light = LightData::new();
-    light.set_head_light_state(HeadLightState::HEAD_LIGHT_STATE_ON);
-    light.set_turn_indicator_state(TurnIndicatorState::TURN_INDICATOR_RIGHT);
-    light.set_hazard_lights_on(true);
-    batch.light_data.push(light);
-
-    let mut tire_pressure = TirePressureData::new();
-    tire_pressure.tire_pressures_e2.push(24_550);
-    tire_pressure.tire_pressures_e2.push(24_600);
-    tire_pressure.tire_pressures_e2.push(24_725);
-    tire_pressure.tire_pressures_e2.push(24_875);
-    batch.tire_pressure_data.push(tire_pressure);
-
-    let mut accelerometer = AccelerometerData::new();
-    accelerometer.set_acceleration_x_e3(1_234);
-    accelerometer.set_acceleration_y_e3(-2_500);
-    accelerometer.set_acceleration_z_e3(9_806);
-    batch.accelerometer_data.push(accelerometer);
-
-    let mut gyroscope = GyroscopeData::new();
-    gyroscope.set_rotation_speed_x_e3(-125);
-    gyroscope.set_rotation_speed_y_e3(250);
-    gyroscope.set_rotation_speed_z_e3(375);
-    batch.gyroscope_data.push(gyroscope);
-
-    let mut satellite_data = GpsSatelliteData::new();
-    satellite_data.set_number_in_use(1);
-    satellite_data.set_number_in_view(2);
-
-    let mut used = GpsSatellite::new();
-    used.set_prn(7);
-    used.set_snr_e3(42_500);
-    used.set_used_in_fix(true);
-    used.set_azimuth_e3(180_250);
-    used.set_elevation_e3(45_500);
-    satellite_data.satellites.push(used);
-
-    let mut visible = GpsSatellite::new();
-    visible.set_prn(19);
-    visible.set_snr_e3(18_000);
-    visible.set_used_in_fix(false);
-    satellite_data.satellites.push(visible);
-    batch.gps_satellite_data.push(satellite_data);
-
-    let mut toll_card = TollCardData::new();
-    toll_card.set_is_card_present(true);
-    batch.toll_card_data.push(toll_card);
-
-    batch
-        .energy_model_control
-        .push(self::protos::ev::EnergyModelControl::new());
-
-    let mut payload = Vec::new();
-    payload.extend_from_slice(
-        &(SensorMessageId::SENSOR_MESSAGE_BATCH.value() as u16).to_be_bytes(),
-    );
-    payload.extend_from_slice(&batch.write_to_bytes()?);
-
-    let parsed = parse_sensor_batch_payload(&payload)
-        .ok_or("synthetic all-sensor SENSOR_MESSAGE_BATCH did not parse")?;
-    let expected_kind_ids = (1..=23).collect::<Vec<_>>();
-    let actual_kind_ids = parsed
-        .events
-        .iter()
-        .map(ArdaSensorEvent::kind_id)
-        .collect::<Vec<_>>();
-    if actual_kind_ids != expected_kind_ids {
-        return Err(format!(
-            "synthetic SensorBatch kind coverage mismatch expected={expected_kind_ids:?} actual={actual_kind_ids:?} summary={}",
-            parsed.summary,
-        )
-        .into());
-    }
-
-    let fix = parsed.location.as_ref().ok_or("synthetic location missing")?;
-    if fix.timestamp_raw != Some(1_783_525_000_123)
-        || !close(fix.latitude_deg, 39.933)
-        || !close(fix.longitude_deg, 32.859)
-        || !fix.accuracy_m.map(|value| close(value, 3.0)).unwrap_or(false)
-        || !fix.altitude_m.map(|value| close(value, 950.0)).unwrap_or(false)
-        || !fix.speed_mps.map(|value| close(value, 13.8)).unwrap_or(false)
-        || !fix.bearing_deg.map(|value| close(value, 90.0)).unwrap_or(false)
-    {
-        return Err(format!("synthetic location fidelity mismatch: {fix:?}").into());
-    }
-
-    match &parsed.events[0] {
-        ArdaSensorEvent::Location { .. } => {}
-        event => return Err(format!("location event mismatch: {event:?}").into()),
-    }
-    match &parsed.events[1] {
-        ArdaSensorEvent::Compass {
-            bearing_deg,
-            pitch_deg,
-            roll_deg,
-        } if close(*bearing_deg, 123.456)
-            && close(*pitch_deg, -12.5)
-            && close(*roll_deg, 7.25) => {}
-        event => return Err(format!("compass fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[2] {
-        ArdaSensorEvent::Speed {
-            speed_mps,
-            cruise_engaged,
-            cruise_set_speed_raw,
-        } if close(*speed_mps, 27.75)
-            && *cruise_engaged
-            && *cruise_set_speed_raw == 30_000 => {}
-        event => return Err(format!("speed fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[3] {
-        ArdaSensorEvent::Rpm { rpm } if close(*rpm, 4_321.0) => {}
-        event => return Err(format!("rpm fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[4] {
-        ArdaSensorEvent::Odometer {
-            kilometers,
-            trip_kilometers,
-        } if close(*kilometers, 123_456.7) && close(*trip_kilometers, 89.0) => {}
-        event => return Err(format!("odometer fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[5] {
-        ArdaSensorEvent::Fuel {
-            level_raw,
-            range_raw,
-            low_fuel_warning,
-        } if *level_raw == 73 && *range_raw == 456 && *low_fuel_warning => {}
-        event => return Err(format!("fuel fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[6] {
-        ArdaSensorEvent::ParkingBrake { engaged } if *engaged => {}
-        event => return Err(format!("parking brake fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[7] {
-        ArdaSensorEvent::Gear {
-            aap_gear,
-            android_gear,
-        } if *aap_gear == Gear::GEAR_DRIVE.value() && *android_gear == Some(0x0008) => {}
-        event => return Err(format!("gear fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[8] {
-        ArdaSensorEvent::Diagnostics { dtc } if dtc.as_slice() == b"P0420" => {}
-        event => return Err(format!("diagnostics fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[9] {
-        ArdaSensorEvent::NightMode { enabled } if *enabled => {}
-        event => return Err(format!("night mode fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[10] {
-        ArdaSensorEvent::Environment {
-            temperature_c,
-            pressure,
-            rain_raw,
-        } if close(*temperature_c, -5.125)
-            && close(*pressure, 101.325)
-            && *rain_raw == 77 => {}
-        event => return Err(format!("environment fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[11] {
-        ArdaSensorEvent::Hvac {
-            target_temperature_c,
-            current_temperature_c,
-        } if close(*target_temperature_c, 21.5)
-            && close(*current_temperature_c, 19.875) => {}
-        event => return Err(format!("hvac fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[12] {
-        ArdaSensorEvent::DrivingStatus { status } if *status == 0x0b => {}
-        event => return Err(format!("driving status fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[13] {
-        ArdaSensorEvent::DeadReckoning {
-            steering_angle_deg,
-            wheel_speed_mps,
-        } if close(*steering_angle_deg, -12.3)
-            && wheel_speed_mps.len() == 4
-            && wheel_speed_mps
-                .iter()
-                .zip([10.0, 10.1, 10.2, 10.3])
-                .all(|(actual, expected)| close(*actual, expected)) => {}
-        event => return Err(format!("dead reckoning fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[14] {
-        ArdaSensorEvent::Passenger { present } if *present => {}
-        event => return Err(format!("passenger fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[15] {
-        ArdaSensorEvent::Door {
-            hood_open,
-            trunk_open,
-            door_open,
-        } if *hood_open
-            && !*trunk_open
-            && door_open.len() == 4
-            && door_open[0]
-            && !door_open[1]
-            && door_open[2]
-            && !door_open[3] => {}
-        event => return Err(format!("door fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[16] {
-        ArdaSensorEvent::Light {
-            head_light_state,
-            turn_indicator_state,
-            hazard_lights_on,
-        } if *head_light_state == HeadLightState::HEAD_LIGHT_STATE_ON.value()
-            && *turn_indicator_state == TurnIndicatorState::TURN_INDICATOR_RIGHT.value()
-            && *hazard_lights_on => {}
-        event => return Err(format!("light fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[17] {
-        ArdaSensorEvent::TirePressure { pressures }
-            if pressures.len() == 4
-                && pressures
-                    .iter()
-                    .zip([245.5, 246.0, 247.25, 248.75])
-                    .all(|(actual, expected)| close(*actual, expected)) => {}
-        event => return Err(format!("tire pressure fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[18] {
-        ArdaSensorEvent::Accelerometer { x, y, z }
-            if close(*x, 1.234) && close(*y, -2.5) && close(*z, 9.806) => {}
-        event => return Err(format!("accelerometer fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[19] {
-        ArdaSensorEvent::Gyroscope { x, y, z }
-            if close(*x, -0.125) && close(*y, 0.25) && close(*z, 0.375) => {}
-        event => return Err(format!("gyroscope fidelity mismatch: {event:?}").into()),
-    }
-    let satellite_event = match &parsed.events[20] {
-        ArdaSensorEvent::GpsSatellite {
-            in_use,
-            in_view,
-            satellites,
-        } => (*in_use, *in_view, satellites),
-        event => return Err(format!("gps satellite event mismatch: {event:?}").into()),
-    };
-    if satellite_event.0 != 1 || satellite_event.1 != Some(2) || satellite_event.2.len() != 2 {
-        return Err(format!("synthetic satellite aggregate mismatch: {satellite_event:?}").into());
-    }
-    let first = &satellite_event.2[0];
-    if first.prn != 7
-        || !close(first.snr, 42.5)
-        || !first.used_in_fix
-        || !first.azimuth_deg.map(|value| close(value, 180.25)).unwrap_or(false)
-        || !first.elevation_deg.map(|value| close(value, 45.5)).unwrap_or(false)
-    {
-        return Err(format!("synthetic satellite fidelity mismatch: {first:?}").into());
-    }
-    let second = &satellite_event.2[1];
-    if second.prn != 19
-        || !close(second.snr, 18.0)
-        || second.used_in_fix
-        || second.azimuth_deg.is_some()
-        || second.elevation_deg.is_some()
-    {
-        return Err(format!("optional satellite fields lost presence semantics: {second:?}").into());
-    }
-    match &parsed.events[21] {
-        ArdaSensorEvent::TollCard { present } if *present => {}
-        event => return Err(format!("toll card fidelity mismatch: {event:?}").into()),
-    }
-    match &parsed.events[22] {
-        ArdaSensorEvent::EnergyModel { present } if *present => {}
-        event => return Err(format!("energy model presence mismatch: {event:?}").into()),
-    }
-
-    if !crate::vehicle::model::sensor_event_to_vehicle_signals(&parsed.events[0]).is_empty() {
-        return Err("location unexpectedly mapped to VehicleProperty/VHAL".into());
-    }
-
-    let characterization = 0x0000_00c6u32;
-
-    let mut service_discovery = ServiceDiscoveryResponse::new();
-    let mut service = Service::new();
-    service.set_id(7);
-    let mut sensor_source = SensorSourceService::new();
-    sensor_source.set_location_characterization(characterization);
-    service.set_sensor_source_service(sensor_source);
-    service_discovery.services.push(service);
-
-    let mut service_payload = Vec::new();
-    service_payload.extend_from_slice(
-        &(ControlMessageType::MESSAGE_SERVICE_DISCOVERY_RESPONSE.value() as u16).to_be_bytes(),
-    );
-    service_payload.extend_from_slice(&service_discovery.write_to_bytes()?);
-    let service_summary = parse_service_discovery_response_control_payload(
-        &service_payload,
-        "highest",
-    )?
-    .ok_or("synthetic ServiceDiscoveryResponse did not parse")?;
-    let selected_sensor = service_summary
-        .sensor_source
-        .ok_or("synthetic SensorSourceService missing")?;
-    if selected_sensor.location_characterization != Some(characterization) {
-        return Err(format!(
-            "location characterization fidelity mismatch expected=0x{characterization:08x} actual={:?}",
-            selected_sensor.location_characterization,
-        )
-        .into());
-    }
-
-    let signal = crate::vehicle::model::location_characterization_signal(characterization)?;
-    let capability = crate::vehicle::model::validate_vehicle_signal(&signal)?;
-    if capability != crate::vehicle::model::Capability::Location {
-        return Err(format!(
-            "location characterization capability mismatch actual={}",
-            capability.name(),
-        )
-        .into());
-    }
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "SENSOR_PROTO_BATCH_ALL_FIELDS encoded_bytes={} events={} summary={}",
-        payload.len(),
-        parsed.events.len(),
-        parsed.summary,
-    ));
-    lines.push(format!(
-        "SENSOR_PROTO_ALL_23_EVENT_KINDS=YES ids={:?}",
-        actual_kind_ids,
-    ));
-    lines.extend(parsed.events.iter().map(|event| {
-        format!(
-            "SENSOR_PROTO_SENSOR_FIDELITY kind={} name={} {}",
-            event.kind_id(),
-            event.name(),
-            event.summary(),
-        )
-    }));
-    lines.push(format!(
-        "SENSOR_PROTO_LOCATION_FIDELITY timestamp_raw={:?} lat={:.7} lon={:.7} accuracy_m={:?} altitude_m={:?} speed_mps={:?} bearing_deg={:?}",
-        fix.timestamp_raw,
-        fix.latitude_deg,
-        fix.longitude_deg,
-        fix.accuracy_m,
-        fix.altitude_m,
-        fix.speed_mps,
-        fix.bearing_deg,
-    ));
-    lines.push(format!(
-        "SENSOR_PROTO_GNSS_SATELLITE_FIDELITY in_use={} in_view={:?} satellites={:?}",
-        satellite_event.0,
-        satellite_event.1,
-        satellite_event.2,
-    ));
-    lines.push("SENSOR_PROTO_LOCATION_NOT_VHAL=YES".to_string());
-    lines.push(format!(
-        "SENSOR_PROTO_SDR_LOCATION_CHARACTERIZATION service_id={} value=0x{characterization:08x}",
-        selected_sensor.service_id,
-    ));
-    lines.push(format!(
-        "SENSOR_PROTO_LOCATION_CHARACTERIZATION property={}({}) value=0x{characterization:08x} capability=LOCATION",
-        crate::vehicle::model::property_name(signal.property_id),
-        signal.property_id,
-    ));
-    lines.push("SENSOR_PROTO_FIDELITY_SMOKE_OK=YES".to_string());
-    Ok(lines)
-}
 
 /// Build a MESSAGE_CHANNEL_CLOSE_NOTIFICATION control payload.
 /// Returned bytes include the 2-byte AAP control message id followed by the

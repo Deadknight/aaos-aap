@@ -28,7 +28,6 @@ pub const PROP_HVAC_FAN_SPEED: i32 = 356_517_120;
 pub const PROP_HVAC_TEMPERATURE_CURRENT: i32 = 358_614_274;
 pub const PROP_HVAC_TEMPERATURE_SET: i32 = 358_614_275;
 pub const PROP_HVAC_POWER_ON: i32 = 354_419_984;
-pub const PROP_LOCATION_CHARACTERIZATION: i32 = 289_410_064;
 
 pub const VALUE_BOOL: i32 = 1;
 pub const VALUE_I32: i32 = 2;
@@ -44,7 +43,6 @@ pub enum Capability {
     HvacState,
     BodyState,
     ChargingState,
-    Location,
     HvacControl,
     BodyControl,
     ChargingControl,
@@ -58,7 +56,6 @@ impl Capability {
             Self::HvacState => 3,
             Self::BodyState => 4,
             Self::ChargingState => 5,
-            Self::Location => 6,
             Self::HvacControl => 16,
             Self::BodyControl => 17,
             Self::ChargingControl => 18,
@@ -72,7 +69,6 @@ impl Capability {
             Self::HvacState => "HVAC_STATE",
             Self::BodyState => "BODY_STATE",
             Self::ChargingState => "CHARGING_STATE",
-            Self::Location => "LOCATION",
             Self::HvacControl => "HVAC_CONTROL",
             Self::BodyControl => "BODY_CONTROL",
             Self::ChargingControl => "CHARGING_CONTROL",
@@ -86,7 +82,6 @@ impl Capability {
             3 => Some(Self::HvacState),
             4 => Some(Self::BodyState),
             5 => Some(Self::ChargingState),
-            6 => Some(Self::Location),
             16 => Some(Self::HvacControl),
             17 => Some(Self::BodyControl),
             18 => Some(Self::ChargingControl),
@@ -242,7 +237,6 @@ pub fn property_name(property_id: i32) -> &'static str {
         PROP_HVAC_TEMPERATURE_CURRENT => "HVAC_TEMPERATURE_CURRENT",
         PROP_HVAC_TEMPERATURE_SET => "HVAC_TEMPERATURE_SET",
         PROP_HVAC_POWER_ON => "HVAC_POWER_ON",
-        PROP_LOCATION_CHARACTERIZATION => "LOCATION_CHARACTERIZATION",
         _ => "UNKNOWN_PROPERTY",
     }
 }
@@ -475,15 +469,6 @@ const SUPPORTED_PROPERTY_RULES: &[PropertyRule] = &[
         false,
         true,
     ),
-    PropertyRule::i32(
-        PROP_LOCATION_CHARACTERIZATION,
-        Capability::Location,
-        None,
-        0.0,
-        i32::MAX as f64,
-        true,
-        false,
-    ),
 ];
 
 fn property_rule(property_id: i32) -> Option<PropertyRule> {
@@ -695,29 +680,6 @@ pub fn sensor_event_to_vehicle_signals(event: &ArdaSensorEvent) -> Vec<VehicleSi
         ],
         _ => Vec::new(),
     }
-}
-
-pub fn location_characterization_signal(value: u32) -> Result<VehicleSignal, String> {
-    if value > i32::MAX as u32 {
-        return Err(format!(
-            "location_characterization_out_of_i32_range value=0x{value:08x}",
-        ));
-    }
-    const DEAD_RECKONED: u32 = 0x0000_0080;
-    const RAW_GNSS_ONLY: u32 = 0x0000_0100;
-    let terminal_mode = value & (DEAD_RECKONED | RAW_GNSS_ONLY);
-    if terminal_mode != DEAD_RECKONED && terminal_mode != RAW_GNSS_ONLY {
-        return Err(format!(
-            "location_characterization_terminal_mode_invalid value=0x{value:08x} expected_exactly_one_of=DEAD_RECKONED|RAW_GNSS_ONLY",
-        ));
-    }
-    Ok(VehicleSignal {
-        source_id: AAP_SENSOR_SOURCE_ID,
-        property_id: PROP_LOCATION_CHARACTERIZATION,
-        area_id: AREA_GLOBAL,
-        value: VehicleValue::I32(value as i32),
-        timestamp_nanos: monotonic_nanos(),
-    })
 }
 
 pub fn monotonic_nanos() -> i64 {

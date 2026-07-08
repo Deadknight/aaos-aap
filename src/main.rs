@@ -55,8 +55,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-capture-repeat-test" | "native-repeat-test" => native_capture_repeat_test(args.collect()),
         "input-test" => input_test(args.collect()),
         "sensor-gate-smoke" => sensor_gate_smoke(),
-        "sensor-proto-fidelity-smoke" => sensor_proto_fidelity_smoke(),
-        "sensor-location-router-smoke" => sensor_location_router_smoke(args.collect()),
         "sensor-wasm-smoke" => sensor_wasm_smoke(args.collect()),
         "vehicle-routerd" => vehicle_routerd(args.collect()),
         "vehicle-policy-smoke" => vehicle_policy_smoke(args.collect()),
@@ -142,12 +140,6 @@ Commands:
 
   sensor-gate-smoke
       Regression-checks that sensor parameter/config flags do not implicitly enable SensorSource or VHAL forwarding; only explicit master/destination flags may do so.
-
-  sensor-proto-fidelity-smoke
-      Builds a real protobuf SensorBatch through the generated AAP proto types, then verifies production parser fidelity for full LocationData optional fields, full GNSS satellite detail, location exclusion from VHAL, and LOCATION_CHARACTERIZATION VehicleProperty mapping.
-
-  sensor-location-router-smoke [--socket PATH]
-      Registers a sensor source with LOCATION capability, publishes LOCATION_CHARACTERIZATION, and requires the router/Wasmtime VHAL stream to preserve property id, area, type, and value.
 
   sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
       Loads the local Wasmtime vehicle policy through the sensor compatibility smoke path and verifies deterministic dry-run VHAL events.
@@ -2700,13 +2692,6 @@ fn aap_fragment_smoke() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn sensor_proto_fidelity_smoke() -> Result<(), Box<dyn std::error::Error>> {
-    for line in aap::proto::sensor_proto_fidelity_smoke()? {
-        println!("{line}");
-    }
-    Ok(())
-}
-
 fn sensor_gate_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let baseline = parse_aap_tls_handshake_probe_args(vec![
         "--no-sensor-open".to_string(),
@@ -2754,32 +2739,6 @@ fn sensor_gate_smoke() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("SENSOR_GATE_SMOKE_OK=YES");
     Ok(())
-}
-
-fn sensor_location_router_smoke(
-    argv: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut socket_path = vehicle::wire::DEFAULT_ROUTER_SOCKET.to_string();
-    let mut i = 0usize;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--socket" => {
-                i += 1;
-                socket_path = argv
-                    .get(i)
-                    .ok_or("--socket requires PATH")?
-                    .to_string();
-            }
-            other => {
-                return Err(format!("unknown sensor-location-router-smoke arg: {other}").into())
-            }
-        }
-        i += 1;
-    }
-    if socket_path.trim().is_empty() {
-        return Err("--socket must not be empty".into());
-    }
-    vehicle::smoke::sensor_location_router_smoke(&socket_path)
 }
 
 fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

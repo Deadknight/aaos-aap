@@ -1,30 +1,19 @@
 use crate::vehicle::client::SensorRouterPublisher;
 use crate::vehicle::model::{
-    location_characterization_signal, property_name, sensor_event_to_vehicle_signals,
-    VehicleSignal, AAP_SENSOR_SOURCE_ID,
+    property_name, sensor_event_to_vehicle_signals, VehicleSignal, AAP_SENSOR_SOURCE_ID,
 };
 use crate::vehicle::policy::{ready_line, VehiclePolicyEngine};
 use crate::vehicle::wire::DEFAULT_ROUTER_SOCKET;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct GpsSatelliteInfo {
-    pub prn: i32,
-    pub snr: f64,
-    pub used_in_fix: bool,
-    pub azimuth_deg: Option<f64>,
-    pub elevation_deg: Option<f64>,
-}
-
 #[derive(Debug, Clone)]
 pub enum ArdaSensorEvent {
     Location {
-        timestamp_raw: Option<u64>,
         latitude_deg: f64,
         longitude_deg: f64,
-        accuracy_m: Option<f64>,
-        altitude_m: Option<f64>,
-        speed_mps: Option<f64>,
-        bearing_deg: Option<f64>,
+        accuracy_m: f64,
+        altitude_m: f64,
+        speed_mps: f64,
+        bearing_deg: f64,
     },
     Compass {
         bearing_deg: f64,
@@ -105,8 +94,8 @@ pub enum ArdaSensorEvent {
     },
     GpsSatellite {
         in_use: i32,
-        in_view: Option<i32>,
-        satellites: Vec<GpsSatelliteInfo>,
+        in_view: i32,
+        listed: usize,
     },
     TollCard {
         present: bool,
@@ -176,7 +165,6 @@ impl ArdaSensorEvent {
     pub fn abi_values(&self) -> [f64; 6] {
         match self {
             Self::Location {
-                timestamp_raw: _,
                 latitude_deg,
                 longitude_deg,
                 accuracy_m,
@@ -186,10 +174,10 @@ impl ArdaSensorEvent {
             } => [
                 *latitude_deg,
                 *longitude_deg,
-                accuracy_m.unwrap_or(0.0),
-                altitude_m.unwrap_or(0.0),
-                speed_mps.unwrap_or(0.0),
-                bearing_deg.unwrap_or(0.0),
+                *accuracy_m,
+                *altitude_m,
+                *speed_mps,
+                *bearing_deg,
             ],
             Self::Compass {
                 bearing_deg,
@@ -326,14 +314,14 @@ impl ArdaSensorEvent {
             Self::GpsSatellite {
                 in_use,
                 in_view,
-                satellites,
+                listed,
             } => [
                 *in_use as f64,
-                in_view.unwrap_or(0) as f64,
-                satellites.len() as f64,
-                satellites.iter().filter(|sat| sat.used_in_fix).count() as f64,
-                satellites.first().map(|sat| sat.prn as f64).unwrap_or(0.0),
-                satellites.first().map(|sat| sat.snr).unwrap_or(0.0),
+                *in_view as f64,
+                *listed as f64,
+                0.0,
+                0.0,
+                0.0,
             ],
             Self::TollCard { present } | Self::EnergyModel { present } => {
                 [bool_number(*present), 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -344,7 +332,6 @@ impl ArdaSensorEvent {
     pub fn summary(&self) -> String {
         match self {
             Self::Location {
-                timestamp_raw,
                 latitude_deg,
                 longitude_deg,
                 accuracy_m,
@@ -352,8 +339,8 @@ impl ArdaSensorEvent {
                 speed_mps,
                 bearing_deg,
             } => format!(
-                "kind={}({}) timestamp_raw={:?} lat={:.7} lon={:.7} accuracy_m={:?} altitude_m={:?} speed_mps={:?} bearing_deg={:?}",
-                self.kind_id(), self.name(), timestamp_raw, latitude_deg, longitude_deg, accuracy_m, altitude_m, speed_mps, bearing_deg
+                "kind={}({}) lat={:.7} lon={:.7} accuracy_m={:.3} altitude_m={:.2} speed_mps={:.3} bearing_deg={:.3}",
+                self.kind_id(), self.name(), latitude_deg, longitude_deg, accuracy_m, altitude_m, speed_mps, bearing_deg
             ),
             Self::Compass {
                 bearing_deg,
@@ -467,10 +454,10 @@ impl ArdaSensorEvent {
             Self::GpsSatellite {
                 in_use,
                 in_view,
-                satellites,
+                listed,
             } => format!(
-                "kind={}({}) in_use={} in_view={:?} listed={} satellites={:?}",
-                self.kind_id(), self.name(), in_use, in_view, satellites.len(), satellites
+                "kind={}({}) in_use={} in_view={} listed={}",
+                self.kind_id(), self.name(), in_use, in_view, listed
             ),
             Self::TollCard { present } => format!(
                 "kind={}({}) present={}",
@@ -516,7 +503,6 @@ pub struct SensorPipeline {
     mode: SensorPipelineMode,
     events_seen: u64,
     signals_seen: u64,
-    location_characterization_seen: Option<u32>,
 }
 
 impl SensorPipeline {
@@ -527,7 +513,7 @@ impl SensorPipeline {
             let publisher =
                 SensorRouterPublisher::connect(DEFAULT_ROUTER_SOCKET, AAP_SENSOR_SOURCE_ID)?;
             let ready = format!(
-                "SENSOR_VEHICLE_ROUTER ready socket={} source_id={} source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE,LOCATION direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
+                "SENSOR_VEHICLE_ROUTER ready socket={} source_id={} source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
                 DEFAULT_ROUTER_SOCKET,
                 AAP_SENSOR_SOURCE_ID,
                 config.vhal_min_interval_ms,
@@ -537,7 +523,6 @@ impl SensorPipeline {
                     mode: SensorPipelineMode::Router(publisher),
                     events_seen: 0,
                     signals_seen: 0,
-                    location_characterization_seen: None,
                 },
                 ready,
             ));
@@ -562,63 +547,9 @@ impl SensorPipeline {
                 mode: SensorPipelineMode::DryRun(policy),
                 events_seen: 0,
                 signals_seen: 0,
-                location_characterization_seen: None,
             },
             ready,
         ))
-    }
-
-    pub fn process_location_characterization(&mut self, value: Option<u32>) -> Vec<String> {
-        let Some(value) = value else {
-            return vec!["SENSOR_LOCATION_CHARACTERIZATION absent vhal_publish=false".to_string()];
-        };
-        if self.location_characterization_seen == Some(value) {
-            return vec![format!(
-                "SENSOR_LOCATION_CHARACTERIZATION unchanged value=0x{value:08x} vhal_publish=false"
-            )];
-        }
-        let signal = match location_characterization_signal(value) {
-            Ok(signal) => signal,
-            Err(err) => {
-                return vec![format!(
-                    "SENSOR_LOCATION_CHARACTERIZATION rejected value=0x{value:08x} error={err} fail_closed=true"
-                )]
-            }
-        };
-        match &mut self.mode {
-            SensorPipelineMode::Router(publisher) => {
-                match publisher.publish(std::slice::from_ref(&signal)) {
-                    Ok(()) => {
-                        self.location_characterization_seen = Some(value);
-                        vec![format!(
-                            "SENSOR_LOCATION_CHARACTERIZATION published property={}({}) area={} value=0x{value:08x}",
-                            property_name(signal.property_id),
-                            signal.property_id,
-                            signal.area_id,
-                        )]
-                    }
-                    Err(err) => vec![format!(
-                        "SENSOR_LOCATION_CHARACTERIZATION failed value=0x{value:08x} error={err} fail_closed=true"
-                    )],
-                }
-            }
-            SensorPipelineMode::DryRun(policy) => {
-                let synthetic = ArdaSensorEvent::Location {
-                    timestamp_raw: None,
-                    latitude_deg: 0.0,
-                    longitude_deg: 0.0,
-                    accuracy_m: None,
-                    altitude_m: None,
-                    speed_mps: None,
-                    bearing_deg: None,
-                };
-                let lines = process_dry_run_signal(policy, &synthetic, &signal);
-                if !lines.iter().any(|line| line.contains("SENSOR_WASM_TRAP")) {
-                    self.location_characterization_seen = Some(value);
-                }
-                lines
-            }
-        }
     }
 
     pub fn process_events(&mut self, events: &[ArdaSensorEvent]) -> Vec<String> {

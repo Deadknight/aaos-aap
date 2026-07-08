@@ -1,12 +1,12 @@
 use std::thread;
 use std::time::Duration;
 
-use super::client::{make_vhal_set_f32, RouterWireClient, SensorRouterPublisher};
+use super::client::{make_vhal_set_f32, RouterWireClient};
 use super::model::{
-    location_characterization_signal, monotonic_nanos, property_name, smoke_vehicle_signals,
-    Capability, VehicleSignal, VehicleValue, VhalSetRequest, AREA_DRIVER, AREA_GLOBAL,
-    PROP_EV_BATTERY_LEVEL, PROP_EV_CURRENT_BATTERY_CAPACITY, PROP_FUEL_LEVEL,
-    PROP_HVAC_TEMPERATURE_SET, PROP_LOCATION_CHARACTERIZATION, PROP_PERF_VEHICLE_SPEED,
+    monotonic_nanos, property_name, smoke_vehicle_signals, Capability, VehicleSignal,
+    VehicleValue, VhalSetRequest, AREA_DRIVER, AREA_GLOBAL, PROP_EV_BATTERY_LEVEL,
+    PROP_EV_CURRENT_BATTERY_CAPACITY, PROP_FUEL_LEVEL, PROP_HVAC_TEMPERATURE_SET,
+    PROP_PERF_VEHICLE_SPEED,
 };
 use super::policy::{ready_line, VehiclePolicyEngine};
 use super::wire::pb;
@@ -353,51 +353,6 @@ pub fn router_smoke(socket_path: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-
-pub fn sensor_location_router_smoke(
-    socket_path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = Duration::from_secs(3);
-    let mut vhal = RouterWireClient::connect(
-        socket_path,
-        pb::ClientRole::ROLE_VHAL,
-        "arda-sensor-location-smoke-vhal",
-        timeout,
-    )?;
-    let mut sensor = SensorRouterPublisher::connect(socket_path, 9_904)?;
-    let characterization = 0x0000_00c6u32;
-    let signal = location_characterization_signal(characterization)?;
-    sensor.publish(std::slice::from_ref(&signal))?;
-
-    let events = recv_vhal_events(&mut vhal)?;
-    for event in &events {
-        println!(
-            "SENSOR_LOCATION_ROUTER_SMOKE_VHAL_EVENT property={}({}) area={} type={:?} int_value={} ",
-            property_name(event.property_id()),
-            event.property_id(),
-            event.area_id(),
-            event.value_type(),
-            event.int32_value(),
-        );
-    }
-    let matched = events.iter().any(|event| {
-        event.property_id() == PROP_LOCATION_CHARACTERIZATION
-            && event.area_id() == AREA_GLOBAL
-            && event.value_type() == pb::ValueType::VALUE_I32
-            && event.int32_value() == characterization as i32
-    });
-    if !matched {
-        return Err(format!(
-            "router did not emit LOCATION_CHARACTERIZATION value=0x{characterization:08x}"
-        )
-        .into());
-    }
-
-    println!("SENSOR_LOCATION_ROUTER_SMOKE_PROPERTY_ID=PASS");
-    println!("SENSOR_LOCATION_ROUTER_SMOKE_CAPABILITY=LOCATION");
-    println!("SENSOR_LOCATION_ROUTER_SMOKE_OK=YES");
-    Ok(())
-}
 
 pub fn manager_bridge_smoke(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(4);

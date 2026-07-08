@@ -179,11 +179,7 @@ impl SensorRouterPublisher {
             source_id,
             "AAP SensorSource",
             10,
-            &[
-                Capability::Powertrain,
-                Capability::HvacState,
-                Capability::Location,
-            ],
+            &[Capability::Powertrain, Capability::HvacState],
             &[],
         )?;
         Ok(Self { client, source_id })

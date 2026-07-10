@@ -1042,3 +1042,42 @@ the Phase 3.0B2 `ArdaGnssStatusProvider` LMS fallback are removed by the AOSP mi
 is part of this phase. Phase 3.0B3 remains open until Android/Soong build, policy coherence, HAL service
 registration, synthetic bridge runtime, and real AAP location delivery through stock `GPS_PROVIDER`
 are proven.
+
+## Phase 3.0B3 — Standard GNSS AIDL location path closed (2026-07-10)
+
+Runtime path:
+
+`AAP SensorBatch.location_data -> arda-senderd -> ARDA GNSS bridge -> android.hardware.gnss.IGnss/default -> stock GnssNative / GPS_PROVIDER -> Maps and GMS fused`
+
+Final platform identity:
+
+- Canonical vendor GNSS checkpoint: `72fe5c085ce32c1a43452c05b75eb92d888c9156`
+- Soong module: `android.hardware.gnss-service.arda`
+- Executable: `/system_ext/bin/hw/android.hardware.gnss-service.arda`
+- Init service: `arda.gnss-hal`
+- AIDL instance: `android.hardware.gnss.IGnss/default`
+- SELinux domain: `arda_gnss_hal`
+- Location remains outside VehicleProperty, VHAL, and Wasm.
+- No fake boot/default location is generated.
+- The latest real AAP fix is replayed only while the AAP GNSS bridge client remains connected, with fresh callback timestamps.
+- Per-replay info logging is disabled; replay behavior remains active.
+- Real runtime observation: Maps no longer remains in `Waiting for GPS`; subsequent real AAP location commands move Maps.
+- `GpsSatelliteData` Android GNSS SV mapping remains pending rather than fabricating constellation/baseband semantics.
+
+Checkpoint markers:
+
+`ARDA_PHASE3_0B3_STANDARD_GNSS_AIDL_SERVICE=PASS`
+
+`ARDA_PHASE3_0B3_STOCK_GPS_PROVIDER_PATH=PASS`
+
+`ARDA_PHASE3_0B3_MAPS_LOCATION_DELIVERY=PASS`
+
+`ARDA_PHASE3_0B3_GMS_FUSED_DELIVERY=PASS`
+
+`ARDA_PHASE3_0B3_ACTIVE_FIX_REPLAY=PASS`
+
+`ARDA_PHASE3_0B3_MAPS_WAITING_FOR_GPS_RESOLVED=YES`
+
+`ARDA_PHASE3_0B3_REAL_AAP_LOCATION_RUNTIME=PASS`
+
+`ARDA_PHASE3_0B3_LOCATION_CLOSED=YES`

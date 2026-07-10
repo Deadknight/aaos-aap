@@ -1051,7 +1051,6 @@ Runtime path:
 
 Final platform identity:
 
-- Canonical vendor GNSS checkpoint: `72fe5c085ce32c1a43452c05b75eb92d888c9156`
 - Soong module: `android.hardware.gnss-service.arda`
 - Executable: `/system_ext/bin/hw/android.hardware.gnss-service.arda`
 - Init service: `arda.gnss-hal`
@@ -1081,3 +1080,7 @@ Checkpoint markers:
 `ARDA_PHASE3_0B3_REAL_AAP_LOCATION_RUNTIME=PASS`
 
 `ARDA_PHASE3_0B3_LOCATION_CLOSED=YES`
+
+Canonical vendor GNSS checkpoint: `72fe5c085ce32c1a43452c05b75eb92d888c9156`
+Ubuntu AOSP device GNSS checkpoint: `2551dd2cdcabef976f3d8c66b9d56772034f2b82`
+Canonical device GNSS integration checkpoint: `787c5b67e54b31e22af70c918481417ef149fb2f`

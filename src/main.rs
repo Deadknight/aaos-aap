@@ -1,6 +1,7 @@
 mod aap;
 mod capture;
 mod config;
+mod gnss_hal;
 mod h264;
 mod input;
 mod native;
@@ -55,6 +56,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "native-capture-repeat-test" | "native-repeat-test" => native_capture_repeat_test(args.collect()),
         "input-test" => input_test(args.collect()),
         "sensor-gate-smoke" => sensor_gate_smoke(),
+        "sensor-proto-smoke" => sensor_proto_smoke(),
+        "location-bridge-smoke" => location_bridge_smoke(args.collect()),
         "sensor-wasm-smoke" => sensor_wasm_smoke(args.collect()),
         "vehicle-routerd" => vehicle_routerd(args.collect()),
         "vehicle-policy-smoke" => vehicle_policy_smoke(args.collect()),
@@ -140,6 +143,12 @@ Commands:
 
   sensor-gate-smoke
       Regression-checks that sensor parameter/config flags do not implicitly enable SensorSource or VHAL forwarding; only explicit master/destination flags may do so.
+
+  sensor-proto-smoke
+      Builds a real protobuf SensorBatch covering all 23 AAP sensor event kinds and verifies LocationData optional presence plus full GPS satellite detail fidelity.
+
+  location-bridge-smoke [--lat 39.9000000] [--lon 32.8000000] [--accuracy 3.0] [--altitude 900.0] [--speed 0.0] [--bearing 0.0]
+      Sends one synthetic fix over the dedicated ARDA location-provider bridge. This exercises GPS_PROVIDER without cmd location/test-provider injection.
 
   sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
       Loads the local Wasmtime vehicle policy through the sensor compatibility smoke path and verifies deterministic dry-run VHAL events.
@@ -2739,6 +2748,50 @@ fn sensor_gate_smoke() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("SENSOR_GATE_SMOKE_OK=YES");
     Ok(())
+}
+
+fn sensor_proto_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    aap::proto::sensor_proto_smoke().map_err(|err| err.into())
+}
+
+fn location_bridge_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut latitude_deg = 39.9f64;
+    let mut longitude_deg = 32.8f64;
+    let mut accuracy_m = Some(3.0f64);
+    let mut altitude_m = Some(900.0f64);
+    let mut speed_mps = Some(0.0f64);
+    let mut bearing_deg = Some(0.0f64);
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--lat" => { i += 1; latitude_deg = argv.get(i).ok_or("--lat requires degrees")?.parse()?; }
+            "--lon" => { i += 1; longitude_deg = argv.get(i).ok_or("--lon requires degrees")?.parse()?; }
+            "--accuracy" => { i += 1; accuracy_m = Some(argv.get(i).ok_or("--accuracy requires meters")?.parse()?); }
+            "--no-accuracy" => accuracy_m = None,
+            "--altitude" => { i += 1; altitude_m = Some(argv.get(i).ok_or("--altitude requires meters")?.parse()?); }
+            "--no-altitude" => altitude_m = None,
+            "--speed" => { i += 1; speed_mps = Some(argv.get(i).ok_or("--speed requires meters/second")?.parse()?); }
+            "--no-speed" => speed_mps = None,
+            "--bearing" => { i += 1; bearing_deg = Some(argv.get(i).ok_or("--bearing requires degrees")?.parse()?); }
+            "--no-bearing" => bearing_deg = None,
+            other => return Err(format!("unknown location-bridge-smoke arg: {other}").into()),
+        }
+        i += 1;
+    }
+    let fix = aap::proto::DecodedLocationFix {
+        timestamp_raw: None, latitude_deg, longitude_deg, accuracy_m,
+        altitude_m, speed_mps, bearing_deg,
+    };
+    let mut bridge = gnss_hal::PlatformGnssHalBridge::new(0);
+    match bridge.publish_fix(&fix)? {
+        gnss_hal::GnssHalPublishOutcome::Published { connected } => {
+            println!("ARDA_GNSS_HAL_BRIDGE_CONNECT socket={} connected={}", gnss_hal::GNSS_HAL_SOCKET_NAME, connected);
+            println!("ARDA_GNSS_HAL_FIX_PUBLISHED lat={:.7} lon={:.7} accuracy_m={:?} altitude_m={:?} speed_mps={:?} bearing_deg={:?}", latitude_deg, longitude_deg, accuracy_m, altitude_m, speed_mps, bearing_deg);
+            println!("ARDA_LOCATION_BRIDGE_SMOKE_OK=YES");
+            Ok(())
+        }
+        gnss_hal::GnssHalPublishOutcome::Throttled => Err("GNSS HAL bridge smoke unexpectedly throttled".into()),
+    }
 }
 
 fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

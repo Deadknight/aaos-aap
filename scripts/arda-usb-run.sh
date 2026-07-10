@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PI="${PI:-1000000028c0b59c}"
+PI="${PI:-192.168.1.21:5555}"
 DHU_SERIAL="${DHU_SERIAL:-1000000028c0b59c}"
 REMOTE_BIN="/data/local/tmp/arda-senderd"
 REMOTE_CONFIG="/data/local/tmp/arda-config.toml"
@@ -16,7 +16,7 @@ Usage:
   scripts/arda-usb-run.sh [--build] [--] [aap-run CLI overrides...]
 
 Environment:
-  PI=1000000028c0b59c
+  PI=192.168.1.21:5555
   DHU_SERIAL=1000000028c0b59c
   ARDA_CONFIG=/path/to/config.toml
   ARDA_CERT_DIR=$HOME/Downloads/certs
@@ -24,8 +24,8 @@ Environment:
 Examples:
   ./scripts/arda-usb-run.sh
   ./scripts/arda-usb-run.sh --build
-  PI=192.168.1.15:5555 ./scripts/arda-usb-run.sh
-  PI=192.168.1.15:5555 ./scripts/arda-usb-run.sh -- --sensor-open --no-sensor-forward-vhal
+  PI=192.168.1.21:5555 ./scripts/arda-usb-run.sh
+  PI=192.168.1.21:5555 ./scripts/arda-usb-run.sh -- --sensor-open --no-sensor-forward-vhal
   ./scripts/arda-usb-run.sh -- --log-level summary
 EOF
 }

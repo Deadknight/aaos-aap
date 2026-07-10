@@ -11,7 +11,7 @@ pub mod protos {
 
 use protobuf::{Enum, Message};
 use self::protos::protos::*;
-use crate::sensor::ArdaSensorEvent;
+use crate::sensor::{ArdaSensorEvent, GpsSatelliteInfo};
 
 pub fn control_message_name(id: u16) -> &'static str {
     match ControlMessageType::from_i32(id as i32) {
@@ -830,6 +830,7 @@ pub struct MediaSourceSelection {
 pub struct SensorSourceSelection {
     pub service_id: i32,
     pub sensors: Vec<SensorTypeInfo>,
+    pub location_characterization: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1304,19 +1305,24 @@ fn summarize_service_discovery_response_body(
                     }
                 })
                 .collect::<Vec<_>>();
+            let location_characterization = sensor
+                .has_location_characterization()
+                .then(|| sensor.location_characterization());
             kinds.push(format!(
-                "sensor_source sensors={} [{}]",
+                "sensor_source sensors={} [{}] location_characterization={:?}",
                 sensors.len(),
                 sensors
                     .iter()
                     .map(|sensor| format!("{}({})", sensor.name, sensor.value))
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
+                location_characterization,
             ));
             if sensor_source.is_none() {
                 sensor_source = Some(SensorSourceSelection {
                     service_id: svc.id(),
                     sensors,
+                    location_characterization,
                 });
             }
         }
@@ -1481,12 +1487,13 @@ pub fn parse_sensor_error_payload(payload: &[u8]) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct DecodedLocationFix {
+    pub timestamp_raw: Option<u64>,
     pub latitude_deg: f64,
     pub longitude_deg: f64,
-    pub accuracy_m: f64,
-    pub altitude_m: f64,
-    pub speed_mps: f64,
-    pub bearing_deg: f64,
+    pub accuracy_m: Option<f64>,
+    pub altitude_m: Option<f64>,
+    pub speed_mps: Option<f64>,
+    pub bearing_deg: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1517,6 +1524,14 @@ fn android_vehicle_gear_from_aap(gear: Gear) -> Option<i32> {
         // Android currently exposes up to GEAR_NINTH in android.car.VehicleGear.
         Gear::GEAR_10 => None,
     }
+}
+
+fn json_u64_option(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+}
+
+fn json_f64_option(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.6}")).unwrap_or_else(|| "null".to_string())
 }
 
 pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> {
@@ -1574,22 +1589,27 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
 
     let location = msg.location_data.last().map(|loc| {
         let fix = DecodedLocationFix {
+            timestamp_raw: loc.has_timestamp().then(|| loc.timestamp()),
             latitude_deg: loc.latitude_e7() as f64 / 10_000_000.0,
             longitude_deg: loc.longitude_e7() as f64 / 10_000_000.0,
-            accuracy_m: loc.accuracy_e3() as f64 / 1000.0,
-            altitude_m: loc.altitude_e2() as f64 / 100.0,
-            speed_mps: loc.speed_e3() as f64 / 1000.0,
-            bearing_deg: loc.bearing_e6() as f64 / 1_000_000.0,
+            accuracy_m: loc.has_accuracy_e3().then(|| loc.accuracy_e3() as f64 / 1000.0),
+            altitude_m: loc.has_altitude_e2().then(|| loc.altitude_e2() as f64 / 100.0),
+            speed_mps: loc.has_speed_e3().then(|| loc.speed_e3() as f64 / 1000.0),
+            bearing_deg: loc.has_bearing_e6().then(|| loc.bearing_e6() as f64 / 1_000_000.0),
         };
         details.push(format!(
-            "location(lat={:.7},lon={:.7},acc_m={:.1},alt_m={:.1},speed_mps={:.2},bearing={:.1})",
-            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
+            "location(timestamp_raw={:?},lat={:.7},lon={:.7},acc_m={:?},alt_m={:?},speed_mps={:?},bearing={:?})",
+            fix.timestamp_raw, fix.latitude_deg, fix.longitude_deg, fix.accuracy_m,
+            fix.altitude_m, fix.speed_mps, fix.bearing_deg,
         ));
         json_fields.push(format!(
-            "\"location\":{{\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{:.3},\"altitude_m\":{:.2},\"speed_mps\":{:.3},\"bearing_deg\":{:.3}}}",
-            fix.latitude_deg, fix.longitude_deg, fix.accuracy_m, fix.altitude_m, fix.speed_mps, fix.bearing_deg
+            "\"location\":{{\"timestamp_raw\":{},\"lat\":{:.7},\"lon\":{:.7},\"accuracy_m\":{},\"altitude_m\":{},\"speed_mps\":{},\"bearing_deg\":{}}}",
+            json_u64_option(fix.timestamp_raw), fix.latitude_deg, fix.longitude_deg,
+            json_f64_option(fix.accuracy_m), json_f64_option(fix.altitude_m),
+            json_f64_option(fix.speed_mps), json_f64_option(fix.bearing_deg),
         ));
         events.push(ArdaSensorEvent::Location {
+            timestamp_raw: fix.timestamp_raw,
             latitude_deg: fix.latitude_deg,
             longitude_deg: fix.longitude_deg,
             accuracy_m: fix.accuracy_m,
@@ -1735,9 +1755,26 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         events.push(ArdaSensorEvent::Gyroscope { x, y, z });
     }
     if let Some(sat) = msg.gps_satellite_data.last() {
-        details.push(format!("gps_satellites use={} view={} listed={}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
-        json_fields.push(format!("\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{}}}", sat.number_in_use(), sat.number_in_view(), sat.satellites.len()));
-        events.push(ArdaSensorEvent::GpsSatellite { in_use: sat.number_in_use(), in_view: sat.number_in_view(), listed: sat.satellites.len() });
+        let in_view = sat.has_number_in_view().then(|| sat.number_in_view());
+        let satellites = sat.satellites.iter().map(|entry| GpsSatelliteInfo {
+            prn: entry.prn(),
+            snr: entry.snr_e3() as f64 / 1000.0,
+            used_in_fix: entry.used_in_fix(),
+            azimuth: entry.has_azimuth_e3().then(|| entry.azimuth_e3() as f64 / 1000.0),
+            elevation: entry.has_elevation_e3().then(|| entry.elevation_e3() as f64 / 1000.0),
+        }).collect::<Vec<_>>();
+        details.push(format!("gps_satellites use={} view={:?} satellites={:?}", sat.number_in_use(), in_view, satellites));
+        json_fields.push(format!(
+            "\"gps_satellite\":{{\"in_use\":{},\"in_view\":{},\"listed\":{}}}",
+            sat.number_in_use(),
+            in_view.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
+            satellites.len(),
+        ));
+        events.push(ArdaSensorEvent::GpsSatellite {
+            in_use: sat.number_in_use(),
+            in_view,
+            satellites,
+        });
     }
     if let Some(toll) = msg.toll_card_data.last() {
         let present = toll.is_card_present();
@@ -1762,6 +1799,129 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         location,
         events,
     })
+}
+
+
+fn smoke_encode_varint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn smoke_field_varint(field: u32, value: u64, out: &mut Vec<u8>) {
+    smoke_encode_varint((field as u64) << 3, out);
+    smoke_encode_varint(value, out);
+}
+
+fn smoke_field_message(field: u32, body: &[u8], out: &mut Vec<u8>) {
+    smoke_encode_varint(((field as u64) << 3) | 2, out);
+    smoke_encode_varint(body.len() as u64, out);
+    out.extend_from_slice(body);
+}
+
+pub fn sensor_proto_smoke() -> Result<(), String> {
+    let mut batch = Vec::new();
+
+    let mut location = Vec::new();
+    smoke_field_varint(1, 123_456_789, &mut location);
+    smoke_field_varint(2, 399_000_000, &mut location);
+    smoke_field_varint(3, 328_000_000, &mut location);
+    smoke_field_message(1, &location, &mut batch);
+
+    let mut compass = Vec::new();
+    smoke_field_varint(1, 123_000_000, &mut compass);
+    smoke_field_message(2, &compass, &mut batch);
+    let mut speed = Vec::new();
+    smoke_field_varint(1, 13_800, &mut speed);
+    smoke_field_message(3, &speed, &mut batch);
+    let mut rpm = Vec::new();
+    smoke_field_varint(1, 1_500_000, &mut rpm);
+    smoke_field_message(4, &rpm, &mut batch);
+    let mut odometer = Vec::new();
+    smoke_field_varint(1, 123_456, &mut odometer);
+    smoke_field_message(5, &odometer, &mut batch);
+    smoke_field_message(6, &[], &mut batch);
+    let mut parking = Vec::new();
+    smoke_field_varint(1, 1, &mut parking);
+    smoke_field_message(7, &parking, &mut batch);
+    let mut gear = Vec::new();
+    smoke_field_varint(1, 100, &mut gear);
+    smoke_field_message(8, &gear, &mut batch);
+    smoke_field_message(9, &[], &mut batch);
+    smoke_field_message(10, &[], &mut batch);
+    smoke_field_message(11, &[], &mut batch);
+    smoke_field_message(12, &[], &mut batch);
+    let mut driving = Vec::new();
+    smoke_field_varint(1, 1, &mut driving);
+    smoke_field_message(13, &driving, &mut batch);
+    for field in 14..=20 {
+        smoke_field_message(field, &[], &mut batch);
+    }
+
+    let mut satellite = Vec::new();
+    smoke_field_varint(1, 7, &mut satellite);
+    smoke_field_varint(2, 42_500, &mut satellite);
+    smoke_field_varint(3, 1, &mut satellite);
+    smoke_field_varint(4, 120_000, &mut satellite);
+    let mut gps = Vec::new();
+    smoke_field_varint(1, 1, &mut gps);
+    smoke_field_message(3, &satellite, &mut gps);
+    smoke_field_message(21, &gps, &mut batch);
+    let mut toll = Vec::new();
+    smoke_field_varint(1, 1, &mut toll);
+    smoke_field_message(22, &toll, &mut batch);
+    smoke_field_message(23, &[], &mut batch);
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(SensorMessageId::SENSOR_MESSAGE_BATCH.value() as u16).to_be_bytes());
+    payload.extend_from_slice(&batch);
+    let parsed = parse_sensor_batch_payload(&payload)
+        .ok_or_else(|| "sensor proto smoke could not parse SensorBatch".to_string())?;
+    let kinds = parsed.events.iter().map(ArdaSensorEvent::kind_id).collect::<Vec<_>>();
+    let expected = (1..=23).collect::<Vec<_>>();
+    if kinds != expected {
+        return Err(format!("sensor proto smoke kind mismatch expected={expected:?} actual={kinds:?}"));
+    }
+    println!("SENSOR_PROTO_ALL_23_EVENT_KINDS=YES");
+
+    let location = parsed.events.iter().find_map(|event| match event {
+        ArdaSensorEvent::Location {
+            timestamp_raw, latitude_deg, longitude_deg, accuracy_m,
+            altitude_m, speed_mps, bearing_deg,
+        } => Some((*timestamp_raw, *latitude_deg, *longitude_deg, *accuracy_m,
+                   *altitude_m, *speed_mps, *bearing_deg)),
+        _ => None,
+    }).ok_or_else(|| "sensor proto smoke missing location event".to_string())?;
+    if location.0 != Some(123_456_789)
+        || (location.1 - 39.9).abs() > 0.000_000_1
+        || (location.2 - 32.8).abs() > 0.000_000_1
+        || location.3.is_some() || location.4.is_some()
+        || location.5.is_some() || location.6.is_some()
+    {
+        return Err(format!("sensor proto smoke location presence mismatch: {location:?}"));
+    }
+    println!("SENSOR_PROTO_LOCATION_OPTIONAL_PRESENCE=YES");
+
+    let gps = parsed.events.iter().find_map(|event| match event {
+        ArdaSensorEvent::GpsSatellite { in_use, in_view, satellites } => Some((*in_use, *in_view, satellites)),
+        _ => None,
+    }).ok_or_else(|| "sensor proto smoke missing gps satellite event".to_string())?;
+    let first = gps.2.first().ok_or_else(|| "sensor proto smoke missing satellite detail".to_string())?;
+    if gps.0 != 1 || gps.1.is_some() || gps.2.len() != 1 || first.prn != 7
+        || (first.snr - 42.5).abs() > 0.000_001 || !first.used_in_fix
+        || first.azimuth != Some(120.0) || first.elevation.is_some()
+    {
+        return Err(format!("sensor proto smoke gps fidelity mismatch: in_use={} in_view={:?} satellites={:?}", gps.0, gps.1, gps.2));
+    }
+    println!("SENSOR_PROTO_GPS_SATELLITE_FIDELITY=YES");
+    println!("SENSOR_PROTO_SMOKE_OK=YES");
+    Ok(())
 }
 
 

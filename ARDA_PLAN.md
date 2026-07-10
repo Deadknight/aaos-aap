@@ -888,3 +888,157 @@ Deadknight/android_device_brcm_rpi4
 `aaos-aap` no longer owns a duplicate in-repo Vehicle platform tree. Its Rust router, proto, Wasmtime
 policy and smoke tooling remain here; Android Vehicle Manager/AIDL/SEPolicy/init source lives in
 `android_vendor_arda/vehicle`.
+
+## Phase 3.0A fidelity repair + Phase 3.0B Android GPS provider bridge — 2026-07-09
+
+The 2026-07-09 source snapshot was older than the previously characterized Phase 3.0A sensor tree.
+The current Phase 3 patch therefore folds the required SensorBatch fidelity repair into the real
+location bridge instead of rebuilding a patch from memory.
+
+Rust now preserves:
+
+```text
+LocationData.timestamp presence
+LocationData latitude/longitude
+optional accuracy/altitude/speed/bearing presence
+GpsSatelliteData.number_in_view presence
+per-satellite PRN/SNR/used-in-fix/azimuth/elevation presence and values
+SensorSourceService.location_characterization presence
+all 23 SensorBatch event kinds
+```
+
+The exact protobuf regression gate is:
+
+```text
+sensor-proto-smoke
+```
+
+Required markers:
+
+```text
+SENSOR_PROTO_ALL_23_EVENT_KINDS=YES
+SENSOR_PROTO_LOCATION_OPTIONAL_PRESENCE=YES
+SENSOR_PROTO_GPS_SATELLITE_FIDELITY=YES
+SENSOR_PROTO_SMOKE_OK=YES
+```
+
+AAP `LocationData` does not enter VehicleSignals, VehicleProperty, the vehicle router, or Wasmtime.
+The location path is now deliberately separate:
+
+```text
+AAP SensorBatch.location_data
+  -> exact Rust protobuf decode
+  -> PlatformLocationBridge
+  -> abstract AF_UNIX socket arda_location_provider
+  -> platform ArdaLocationProvider
+  -> LocationProviderBase.reportLocation()
+  -> Android GPS_PROVIDER
+  -> fused/location consumers
+```
+
+The old `cmd location providers add-test-provider` / `set-test-provider-location` path is removed from
+sensor runtime forwarding. `--sensor-location-provider` remains only as a legacy CLI/config field and
+is ignored with a warning when location forwarding uses the dedicated platform bridge.
+
+The platform GNSS override is selected through:
+
+```text
+config_useGnssHardwareProvider=false
+config_gnssLocationProviderPackageName=com.arda.location.provider
+```
+
+A narrow LocationManagerService patch moves configured GNSS override discovery outside the
+`GnssNative.isSupported()` hardware gate. Hardware GNSS behavior is preserved when a HAL exists: the
+override owns `GPS_PROVIDER` and hardware remains available as `GPS_HARDWARE_PROVIDER`. With no GNSS
+HAL, the configured override can still own `GPS_PROVIDER`.
+
+Satellite metadata fidelity is retained in Rust but is not fabricated into framework `GnssStatus`.
+Phase 3.0B closes the location-fix provider path only.
+
+Platform apply helper:
+
+```text
+scripts/apply-arda-location-phase3-aosp.sh
+```
+
+Provider bridge smoke helper:
+
+```text
+scripts/run-arda-location-phase3-smoke.sh
+```
+
+Phase 3.0B is SOURCE IMPLEMENTED / BUILD + PI RUNTIME PENDING. Do not mark it closed until the exact
+protobuf markers, Android/Soong build, provider bind/socket gate, and real AAP runtime report through
+`GPS_PROVIDER` are proven.
+
+Do not force ambiguous AAP fuel, wheel-speed ordering, tire/door area, cruise, or satellite semantics
+into Android VehicleProperty IDs merely to increase the mapping count. Continue Phase 3.0C only from
+semantics that are exact in the authoritative AAP proto/runtime evidence.
+
+### Phase 3.0B2 - ARDA GNSS status plane (2026-07-09)
+
+Status: SOURCE IMPLEMENTED / BUILD + REAL AAP RUNTIME PENDING
+
+Runtime evidence from Phase 3.0B proved real AAP `LocationData` reaches the ARDA provider,
+`GPS_PROVIDER`, GMS fused input, and Maps direct GPS registrations with exact coordinate fidelity.
+Maps still showed `Searching for GPS...`. The frozen BP4A framework creates
+`GnssManagerService` only when `GnssNative.isSupported()`; with the ARDA GPS provider override
+and no hardware GNSS HAL, `registerGnssStatusCallback()` otherwise has no backend.
+
+Phase 3.0B2 adds a narrow ARDA-only GNSS status fallback in `system_server`:
+
+- real AAP `LocationData` published to Android GPS -> GNSS started + first-fix status
+- real AAP `GpsSatelliteData` -> `GnssStatus` only from listed satellite details
+- AAP PRN/SNR/used-in-fix/azimuth/elevation fidelity is preserved
+- constellation remains `CONSTELLATION_UNKNOWN` because AAP does not identify constellation
+- ephemeris, almanac, carrier frequency, and baseband C/N0 are never invented
+- satellite entries lacking required Android `GnssStatus` azimuth/elevation are skipped, not filled
+- location remains outside VehicleProperty/router Wasm/VHAL
+
+Required close markers include real Maps GNSS status listener registration plus:
+
+- `ARDA_GNSS_STATUS_FIX_PUBLISHED`
+- `ARDA_GNSS_STATUS_PROVIDER_STARTED`
+- `ARDA_GNSS_STATUS_PROVIDER_FIRST_FIX`
+- Maps no longer remaining indefinitely in `Searching for GPS...` after a real AAP fix
+
+
+### Phase 3.0B3 - Vendor GNSS AIDL HAL migration (2026-07-09)
+
+Status: SOURCE MIGRATION / BUILD + SYNTHETIC RUNTIME PENDING
+
+The Phase 3.0B2 framework GNSS-status fallback proved the missing Maps semantic layer, but it is
+diagnostic-only and superseded. Final integration moves location into a vendor GNSS AIDL HAL so the
+frozen stock Android location/GNSS services remain unmodified.
+
+```text
+AAP SensorBatch.location_data
+  -> exact Rust protobuf decode
+  -> PlatformGnssHalBridge
+  -> abstract AF_UNIX socket arda_gnss_hal
+  -> vendor android.hardware.gnss.IGnss/default
+  -> stock GnssNative / GnssManagerService / GnssLocationProvider / GnssStatusProvider
+  -> Android GPS_PROVIDER and consumers
+```
+
+`GpsSatelliteData` fidelity remains preserved in Rust. It is not forwarded to AIDL `GnssSvInfo` yet
+because AAP does not provide constellation or mandatory baseband C/N0 semantics. No constellation,
+baseband C/N0, NMEA, raw measurement, ephemeris, almanac, or carrier-frequency values are invented.
+
+Required source/runtime markers include:
+
+```text
+ARDA_GNSS_HAL_BRIDGE_CONNECT
+ARDA_GNSS_HAL_FIX_PUBLISHED
+ARDA_GNSS_HAL_SV_NOT_FORWARDED reason=aap_lacks_constellation_and_baseband_cn0
+ARDA_GNSS_HAL_READY socket=arda_gnss_hal
+ARDA_GNSS_HAL_CLIENT uid=0
+ARDA_GNSS_HAL_FIX_RECEIVED
+ARDA_GNSS_HAL_FIX_REPORTED
+```
+
+The old Java `ArdaLocationProvider`, its GNSS resource overlay, the Phase 3.0B LMS override gate, and
+the Phase 3.0B2 `ArdaGnssStatusProvider` LMS fallback are removed by the AOSP migration. No `repo sync`
+is part of this phase. Phase 3.0B3 remains open until Android/Soong build, policy coherence, HAL service
+registration, synthetic bridge runtime, and real AAP location delivery through stock `GPS_PROVIDER`
+are proven.

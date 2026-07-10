@@ -6,14 +6,24 @@ use crate::vehicle::policy::{ready_line, VehiclePolicyEngine};
 use crate::vehicle::wire::DEFAULT_ROUTER_SOCKET;
 
 #[derive(Debug, Clone)]
+pub struct GpsSatelliteInfo {
+    pub prn: i32,
+    pub snr: f64,
+    pub used_in_fix: bool,
+    pub azimuth: Option<f64>,
+    pub elevation: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub enum ArdaSensorEvent {
     Location {
+        timestamp_raw: Option<u64>,
         latitude_deg: f64,
         longitude_deg: f64,
-        accuracy_m: f64,
-        altitude_m: f64,
-        speed_mps: f64,
-        bearing_deg: f64,
+        accuracy_m: Option<f64>,
+        altitude_m: Option<f64>,
+        speed_mps: Option<f64>,
+        bearing_deg: Option<f64>,
     },
     Compass {
         bearing_deg: f64,
@@ -94,8 +104,8 @@ pub enum ArdaSensorEvent {
     },
     GpsSatellite {
         in_use: i32,
-        in_view: i32,
-        listed: usize,
+        in_view: Option<i32>,
+        satellites: Vec<GpsSatelliteInfo>,
     },
     TollCard {
         present: bool,
@@ -171,13 +181,14 @@ impl ArdaSensorEvent {
                 altitude_m,
                 speed_mps,
                 bearing_deg,
+                ..
             } => [
                 *latitude_deg,
                 *longitude_deg,
-                *accuracy_m,
-                *altitude_m,
-                *speed_mps,
-                *bearing_deg,
+                accuracy_m.unwrap_or(0.0),
+                altitude_m.unwrap_or(0.0),
+                speed_mps.unwrap_or(0.0),
+                bearing_deg.unwrap_or(0.0),
             ],
             Self::Compass {
                 bearing_deg,
@@ -314,14 +325,14 @@ impl ArdaSensorEvent {
             Self::GpsSatellite {
                 in_use,
                 in_view,
-                listed,
+                satellites,
             } => [
                 *in_use as f64,
-                *in_view as f64,
-                *listed as f64,
-                0.0,
-                0.0,
-                0.0,
+                in_view.unwrap_or(-1) as f64,
+                satellites.len() as f64,
+                satellites.iter().filter(|sat| sat.used_in_fix).count() as f64,
+                satellites.first().map(|sat| sat.prn as f64).unwrap_or(0.0),
+                satellites.first().map(|sat| sat.snr).unwrap_or(0.0),
             ],
             Self::TollCard { present } | Self::EnergyModel { present } => {
                 [bool_number(*present), 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -332,6 +343,7 @@ impl ArdaSensorEvent {
     pub fn summary(&self) -> String {
         match self {
             Self::Location {
+                timestamp_raw,
                 latitude_deg,
                 longitude_deg,
                 accuracy_m,
@@ -339,8 +351,8 @@ impl ArdaSensorEvent {
                 speed_mps,
                 bearing_deg,
             } => format!(
-                "kind={}({}) lat={:.7} lon={:.7} accuracy_m={:.3} altitude_m={:.2} speed_mps={:.3} bearing_deg={:.3}",
-                self.kind_id(), self.name(), latitude_deg, longitude_deg, accuracy_m, altitude_m, speed_mps, bearing_deg
+                "kind={}({}) timestamp_raw={:?} lat={:.7} lon={:.7} accuracy_m={:?} altitude_m={:?} speed_mps={:?} bearing_deg={:?}",
+                self.kind_id(), self.name(), timestamp_raw, latitude_deg, longitude_deg, accuracy_m, altitude_m, speed_mps, bearing_deg
             ),
             Self::Compass {
                 bearing_deg,
@@ -454,10 +466,10 @@ impl ArdaSensorEvent {
             Self::GpsSatellite {
                 in_use,
                 in_view,
-                listed,
+                satellites,
             } => format!(
-                "kind={}({}) in_use={} in_view={} listed={}",
-                self.kind_id(), self.name(), in_use, in_view, listed
+                "kind={}({}) in_use={} in_view={:?} satellites={:?}",
+                self.kind_id(), self.name(), in_use, in_view, satellites
             ),
             Self::TollCard { present } => format!(
                 "kind={}({}) present={}",

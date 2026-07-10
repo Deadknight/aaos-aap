@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use crate::capture::screenrecord::preferred_codec_name;
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
 use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, PlatformInputBridgeInjector, TouchInjectAction, TouchInjector};
-use crate::sensor::{SensorPipeline, SensorPipelineConfig};
+use crate::gnss_hal::{
+    GnssHalPublishOutcome, PlatformGnssHalBridge, GNSS_HAL_SOCKET_NAME,
+};
+use crate::sensor::{ArdaSensorEvent, SensorPipeline, SensorPipelineConfig};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -1489,20 +1492,21 @@ struct SensorChannelState {
 #[derive(Debug)]
 struct SensorOsForwarder {
     location_enabled: bool,
-    provider: String,
-    location_initialized: bool,
-    last_location_push: Option<Instant>,
-    location_min_interval: Duration,
+    gnss_hal_bridge: PlatformGnssHalBridge,
 }
 
 impl SensorOsForwarder {
     fn new(config: &TlsHandshakeProbeConfig) -> Self {
+        if config.sensor_forward_os && config.sensor_location_provider != "arda_gps" {
+            println!(
+                "ARDA_LOCATION_PROVIDER_OPTION_IGNORED legacy_provider={} socket={}",
+                config.sensor_location_provider,
+                GNSS_HAL_SOCKET_NAME,
+            );
+        }
         Self {
             location_enabled: config.sensor_forward_os,
-            provider: config.sensor_location_provider.clone(),
-            location_initialized: false,
-            last_location_push: None,
-            location_min_interval: Duration::from_millis(config.sensor_location_min_ms),
+            gnss_hal_bridge: PlatformGnssHalBridge::new(config.sensor_location_min_ms),
         }
     }
 
@@ -1514,40 +1518,71 @@ impl SensorOsForwarder {
         if !self.location_enabled {
             return Ok(());
         }
-        let now = Instant::now();
-        if let Some(last) = self.last_location_push {
-            if now.duration_since(last) < self.location_min_interval {
-                return Ok(());
-            }
-        }
-        if !self.location_initialized {
-            let _ = run_location_cmd(&["providers", "add-test-provider", self.provider.as_str()], dump, "SENSOR_OS_INIT add-test-provider");
-            let _ = run_location_cmd(&["providers", "set-test-provider-enabled", self.provider.as_str(), "true"], dump, "SENSOR_OS_INIT enable-provider");
-            self.location_initialized = true;
-        }
-        let location_arg = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
-        let accuracy_arg = format!("{:.1}", location.accuracy_m.max(1.0));
-        let args = [
-            "providers",
-            "set-test-provider-location",
-            self.provider.as_str(),
-            "--location",
-            location_arg.as_str(),
-            "--accuracy",
-            accuracy_arg.as_str(),
-        ];
-        match run_location_cmd(&args, dump, "SENSOR_OS_LOCATION") {
-            Ok(true) => {
-                self.last_location_push = Some(now);
-            }
-            Ok(false) | Err(_) => {
-                let fallback = format!("{:.7},{:.7}", location.latitude_deg, location.longitude_deg);
-                let fallback_args = ["set-location", fallback.as_str()];
-                if run_location_cmd(&fallback_args, dump, "SENSOR_OS_LOCATION fallback").unwrap_or(false) {
-                    self.last_location_push = Some(now);
+
+        match self.gnss_hal_bridge.publish_fix(location) {
+            Ok(GnssHalPublishOutcome::Published { connected }) => {
+                if connected {
+                    let line = format!(
+                        "ARDA_GNSS_HAL_BRIDGE_CONNECT socket={}",
+                        GNSS_HAL_SOCKET_NAME,
+                    );
+                    println!("{line}");
+                    log_line(dump, &line)?;
                 }
+
+                let line = format!(
+                    "ARDA_GNSS_HAL_FIX_PUBLISHED timestamp_raw={:?} lat={:.7} lon={:.7} accuracy_m={:?} altitude_m={:?} speed_mps={:?} bearing_deg={:?}",
+                    location.timestamp_raw,
+                    location.latitude_deg,
+                    location.longitude_deg,
+                    location.accuracy_m,
+                    location.altitude_m,
+                    location.speed_mps,
+                    location.bearing_deg,
+                );
+                session_log(dump, LOG_SUMMARY, &line)?;
+            }
+            Ok(GnssHalPublishOutcome::Throttled) => {}
+            Err(err) => {
+                let line = format!(
+                    "ARDA_GNSS_HAL_BRIDGE_ERROR socket={} event=FIX error={}",
+                    GNSS_HAL_SOCKET_NAME,
+                    err,
+                );
+                println!("{line}");
+                log_line(dump, &line)?;
             }
         }
+
+        Ok(())
+    }
+
+    fn push_gnss_satellite(
+        &mut self,
+        event: &ArdaSensorEvent,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if !self.location_enabled {
+            return Ok(());
+        }
+
+        let ArdaSensorEvent::GpsSatellite {
+            in_use,
+            in_view,
+            satellites,
+        } = event
+        else {
+            return Ok(());
+        };
+
+        let line = format!(
+            "ARDA_GNSS_HAL_SV_NOT_FORWARDED reason=aap_lacks_constellation_and_baseband_cn0 in_use={} in_view={:?} listed={}",
+            in_use,
+            in_view,
+            satellites.len(),
+        );
+        session_log(dump, LOG_SUMMARY, &line)?;
+
         Ok(())
     }
 }
@@ -1644,16 +1679,6 @@ fn make_sensor_jsonl_file(path: &Option<PathBuf>) -> io::Result<Option<File>> {
     Ok(Some(OpenOptions::new().create(true).write(true).truncate(true).open(path)?))
 }
 
-fn run_location_cmd(
-    args: &[&str],
-    dump: &mut Option<Box<dyn Write>>,
-    label: &str,
-) -> io::Result<bool> {
-    let mut cmd_args = Vec::with_capacity(args.len() + 1);
-    cmd_args.push("location");
-    cmd_args.extend_from_slice(args);
-    run_command_logged("/system/bin/cmd", &cmd_args, dump, label)
-}
 
 fn requested_sensor_types(sensor: &SensorChannelState, config: &TlsHandshakeProbeConfig) -> Vec<i32> {
     if !config.sensor_request_all {
@@ -4182,6 +4207,9 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
                     if let Some(location) = batch.location.as_ref() {
                         sensor_os_forwarder.push_location(location, &mut dump)?;
+                    }
+                    for event in &batch.events {
+                        sensor_os_forwarder.push_gnss_satellite(event, &mut dump)?;
                     }
                     if let Some(pipeline) = sensor_pipeline.as_mut() {
                         for line in pipeline.process_events(&batch.events) {

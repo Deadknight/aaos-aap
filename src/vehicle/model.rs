@@ -17,12 +17,16 @@ pub const PROP_ENGINE_RPM: i32 = 291_504_901;
 pub const PROP_PERF_ODOMETER: i32 = 291_504_644;
 pub const PROP_FUEL_LEVEL: i32 = 291_504_903;
 pub const PROP_RANGE_REMAINING: i32 = 291_504_904;
+pub const PROP_FUEL_LEVEL_LOW: i32 = 287_310_853;
 pub const PROP_EV_BATTERY_LEVEL: i32 = 291_504_905;
 pub const PROP_EV_CURRENT_BATTERY_CAPACITY: i32 = 291_504_909;
 pub const PROP_PARKING_BRAKE_ON: i32 = 287_310_850;
 pub const PROP_CURRENT_GEAR: i32 = 289_408_001;
 pub const PROP_GEAR_SELECTION: i32 = 289_408_000;
 pub const PROP_NIGHT_MODE: i32 = 287_310_855;
+pub const PROP_ELECTRONIC_TOLL_COLLECTION_CARD_STATUS: i32 = 289_410_874;
+pub const ETC_CARD_STATUS_UNKNOWN: i32 = 0;
+pub const ETC_CARD_STATUS_NOT_INSERTED: i32 = 3;
 pub const PROP_ENV_OUTSIDE_TEMPERATURE: i32 = 291_505_923;
 pub const PROP_HVAC_FAN_SPEED: i32 = 356_517_120;
 pub const PROP_HVAC_TEMPERATURE_CURRENT: i32 = 358_614_274;
@@ -226,12 +230,16 @@ pub fn property_name(property_id: i32) -> &'static str {
         PROP_PERF_ODOMETER => "PERF_ODOMETER",
         PROP_FUEL_LEVEL => "FUEL_LEVEL",
         PROP_RANGE_REMAINING => "RANGE_REMAINING",
+        PROP_FUEL_LEVEL_LOW => "FUEL_LEVEL_LOW",
         PROP_EV_BATTERY_LEVEL => "EV_BATTERY_LEVEL",
         PROP_EV_CURRENT_BATTERY_CAPACITY => "EV_CURRENT_BATTERY_CAPACITY",
         PROP_PARKING_BRAKE_ON => "PARKING_BRAKE_ON",
         PROP_CURRENT_GEAR => "CURRENT_GEAR",
         PROP_GEAR_SELECTION => "GEAR_SELECTION",
         PROP_NIGHT_MODE => "NIGHT_MODE",
+        PROP_ELECTRONIC_TOLL_COLLECTION_CARD_STATUS => {
+            "ELECTRONIC_TOLL_COLLECTION_CARD_STATUS"
+        },
         PROP_ENV_OUTSIDE_TEMPERATURE => "ENV_OUTSIDE_TEMPERATURE",
         PROP_HVAC_FAN_SPEED => "HVAC_FAN_SPEED",
         PROP_HVAC_TEMPERATURE_CURRENT => "HVAC_TEMPERATURE_CURRENT",
@@ -376,6 +384,13 @@ const SUPPORTED_PROPERTY_RULES: &[PropertyRule] = &[
         true,
         false,
     ),
+    PropertyRule::bool(
+        PROP_FUEL_LEVEL_LOW,
+        Capability::Energy,
+        None,
+        true,
+        false,
+    ),
     PropertyRule::f32(
         PROP_EV_BATTERY_LEVEL,
         Capability::Energy,
@@ -423,6 +438,15 @@ const SUPPORTED_PROPERTY_RULES: &[PropertyRule] = &[
         PROP_NIGHT_MODE,
         Capability::Powertrain,
         None,
+        true,
+        false,
+    ),
+    PropertyRule::i32(
+        PROP_ELECTRONIC_TOLL_COLLECTION_CARD_STATUS,
+        Capability::BodyState,
+        None,
+        0.0,
+        3.0,
         true,
         false,
     ),
@@ -607,18 +631,13 @@ pub fn sensor_event_to_vehicle_signals(event: &ArdaSensorEvent) -> Vec<VehicleSi
         // Location intentionally stays outside VHAL/Wasmtime. It will be sent to
         // Android GPS_PROVIDER through the dedicated ARDA location bridge.
         ArdaSensorEvent::Location { .. } => Vec::new(),
-        ArdaSensorEvent::Speed { speed_mps, .. } => vec![
-            make(
-                PROP_PERF_VEHICLE_SPEED,
-                AREA_GLOBAL,
-                VehicleValue::F32(*speed_mps as f32),
-            ),
-            make(
-                PROP_PERF_VEHICLE_SPEED_DISPLAY,
-                AREA_GLOBAL,
-                VehicleValue::F32(*speed_mps as f32),
-            ),
-        ],
+        // AAP speed_e3 is normalized to m/s and represents actual vehicle
+        // speed. It is not a speedometer/display-adjusted value.
+        ArdaSensorEvent::Speed { speed_mps, .. } => vec![make(
+            PROP_PERF_VEHICLE_SPEED,
+            AREA_GLOBAL,
+            VehicleValue::F32(*speed_mps as f32),
+        )],
         ArdaSensorEvent::Rpm { rpm } => vec![make(
             PROP_ENGINE_RPM,
             AREA_GLOBAL,
@@ -630,34 +649,54 @@ pub fn sensor_event_to_vehicle_signals(event: &ArdaSensorEvent) -> Vec<VehicleSi
             VehicleValue::F32(*kilometers as f32),
         )],
         // AAP FuelData does not define fuel_level/range units. Do not pretend
-        // those raw values are VHAL milliliters/meters.
-        ArdaSensorEvent::Fuel { .. } => Vec::new(),
+        // those raw values are VHAL milliliters/meters. The optional
+        // low_fuel_warning field does exactly match Android's dashboard warning
+        // semantics, but only publish it when the proto field is present.
+        ArdaSensorEvent::Fuel {
+            low_fuel_warning,
+            low_fuel_warning_present,
+            ..
+        } => {
+            if *low_fuel_warning_present {
+                vec![make(
+                    PROP_FUEL_LEVEL_LOW,
+                    AREA_GLOBAL,
+                    VehicleValue::Bool(*low_fuel_warning),
+                )]
+            } else {
+                Vec::new()
+            }
+        }
         ArdaSensorEvent::ParkingBrake { engaged } => vec![make(
             PROP_PARKING_BRAKE_ON,
             AREA_GLOBAL,
             VehicleValue::Bool(*engaged),
         )],
+        // AAP's legacy gear sensor semantics map to selected gear. A selected
+        // DRIVE value does not identify the transmission's actual numbered gear.
         ArdaSensorEvent::Gear { android_gear, .. } => android_gear
             .map(|gear| {
-                vec![
-                    make(
-                        PROP_CURRENT_GEAR,
-                        AREA_GLOBAL,
-                        VehicleValue::I32(gear),
-                    ),
-                    make(
-                        PROP_GEAR_SELECTION,
-                        AREA_GLOBAL,
-                        VehicleValue::I32(gear),
-                    ),
-                ]
+                vec![make(
+                    PROP_GEAR_SELECTION,
+                    AREA_GLOBAL,
+                    VehicleValue::I32(gear),
+                )]
             })
             .unwrap_or_default(),
-        ArdaSensorEvent::NightMode { enabled } => vec![make(
-            PROP_NIGHT_MODE,
-            AREA_GLOBAL,
-            VehicleValue::Bool(*enabled),
-        )],
+        ArdaSensorEvent::NightMode {
+            enabled,
+            enabled_present,
+        } => {
+            if *enabled_present {
+                vec![make(
+                    PROP_NIGHT_MODE,
+                    AREA_GLOBAL,
+                    VehicleValue::Bool(*enabled),
+                )]
+            } else {
+                Vec::new()
+            }
+        }
         ArdaSensorEvent::Environment { temperature_c, .. } => vec![make(
             PROP_ENV_OUTSIDE_TEMPERATURE,
             AREA_GLOBAL,
@@ -678,6 +717,21 @@ pub fn sensor_event_to_vehicle_signals(event: &ArdaSensorEvent) -> Vec<VehicleSi
                 VehicleValue::F32(*current_temperature_c as f32),
             ),
         ],
+        // AAP TollCardData only says whether a card is present. Presence does
+        // not prove VALID or INVALID status. Map absent to NOT_INSERTED and
+        // present to UNKNOWN without fabricating card validity.
+        ArdaSensorEvent::TollCard { present } => vec![make(
+            PROP_ELECTRONIC_TOLL_COLLECTION_CARD_STATUS,
+            AREA_GLOBAL,
+            VehicleValue::I32(if *present {
+                ETC_CARD_STATUS_UNKNOWN
+            } else {
+                ETC_CARD_STATUS_NOT_INSERTED
+            }),
+        )],
+        // Compass, driving restrictions, accelerometer, gyroscope and AAP GPS
+        // satellite metadata do not have exact standard VehicleProperty
+        // semantics. Keep them out of VHAL rather than inventing a property.
         _ => Vec::new(),
     }
 }

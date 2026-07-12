@@ -2846,10 +2846,12 @@ fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>
     let joined = lines.join("\n");
     let required = [
         "prop=PERF_VEHICLE_SPEED(291504647)",
-        "prop=PERF_VEHICLE_SPEED_DISPLAY(291504648)",
-        "prop=NIGHT_MODE(287310855)",
-        "prop=CURRENT_GEAR(289408001)",
+        "prop=PERF_ODOMETER(291504644)",
+        "prop=FUEL_LEVEL_LOW(287310853)",
+        "prop=PARKING_BRAKE_ON(287310850)",
         "prop=GEAR_SELECTION(289408000)",
+        "prop=NIGHT_MODE(287310855)",
+        "prop=ELECTRONIC_TOLL_COLLECTION_CARD_STATUS(289410874)",
         "prop=ENV_OUTSIDE_TEMPERATURE(291505923)",
     ];
     for marker in required {
@@ -2857,10 +2859,41 @@ fn sensor_wasm_smoke(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>
             return Err(format!("sensor wasm smoke missing expected output: {marker}").into());
         }
     }
+    let semantic_required = [
+        "SENSOR_VEHICLE_PROPERTY_SKIP event=FUEL kind=6 reason=no_vhal_property_mapping",
+        "SENSOR_VEHICLE_PROPERTY_SKIP event=NIGHT_MODE kind=10 reason=no_vhal_property_mapping",
+        "SENSOR_WASM_EVENT event=TOLL_CARD kind=22 source=1 property=ELECTRONIC_TOLL_COLLECTION_CARD_STATUS(289410874) area=0 value=3",
+        "SENSOR_WASM_EVENT event=TOLL_CARD kind=22 source=1 property=ELECTRONIC_TOLL_COLLECTION_CARD_STATUS(289410874) area=0 value=0",
+    ];
+    for marker in semantic_required {
+        if !joined.contains(marker) {
+            return Err(format!(
+                "sensor wasm smoke missing exact Phase 3.0C semantic evidence: {marker}"
+            )
+            .into());
+        }
+    }
+    let forbidden = [
+        "prop=PERF_VEHICLE_SPEED_DISPLAY(291504648)",
+        "prop=CURRENT_GEAR(289408001)",
+        "prop=FUEL_LEVEL(291504903)",
+        "prop=RANGE_REMAINING(291504904)",
+    ];
+    for marker in forbidden {
+        if joined.contains(marker) {
+            return Err(format!(
+                "sensor wasm smoke observed semantically unsafe AAP mapping: {marker}"
+            )
+            .into());
+        }
+    }
     if joined.contains("SENSOR_WASM_TRAP") || joined.contains("SENSOR_WASM_VHAL rejected") {
         return Err("sensor wasm smoke observed a trap or rejected command".into());
     }
 
+    println!("ARDA_PHASE3_0C_SAFE_ADVERTISED_SENSOR_MAPPINGS=7");
+    println!("ARDA_PHASE3_0C_UNMAPPED_ADVERTISED_SENSOR_KINDS=6");
+    println!("ARDA_PHASE3_0C_NO_FABRICATED_SENSOR_SEMANTICS=YES");
     println!("SENSOR_WASM_SMOKE_OK=YES");
     Ok(())
 }

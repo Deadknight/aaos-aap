@@ -1651,12 +1651,26 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
         events.push(ArdaSensorEvent::Odometer { kilometers: odometer_km, trip_kilometers: trip_km });
     }
     if let Some(fuel) = msg.fuel_data.last() {
-        details.push(format!("fuel={} range={} low={}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
-        json_fields.push(format!("\"fuel\":{{\"level\":{},\"range\":{},\"low\":{}}}", fuel.fuel_level(), fuel.range(), fuel.low_fuel_warning()));
+        let low_fuel_warning_present = fuel.has_low_fuel_warning();
+        details.push(format!(
+            "fuel={} range={} low={} low_present={}",
+            fuel.fuel_level(),
+            fuel.range(),
+            fuel.low_fuel_warning(),
+            low_fuel_warning_present,
+        ));
+        json_fields.push(format!(
+            "\"fuel\":{{\"level\":{},\"range\":{},\"low\":{},\"low_present\":{}}}",
+            fuel.fuel_level(),
+            fuel.range(),
+            fuel.low_fuel_warning(),
+            low_fuel_warning_present,
+        ));
         events.push(ArdaSensorEvent::Fuel {
             level_raw: fuel.fuel_level(),
             range_raw: fuel.range(),
             low_fuel_warning: fuel.low_fuel_warning(),
+            low_fuel_warning_present,
         });
     }
     if let Some(pb) = msg.parking_brake_data.last() {
@@ -1683,9 +1697,19 @@ pub fn parse_sensor_batch_payload(payload: &[u8]) -> Option<SensorBatchSummary> 
     }
     if let Some(night) = msg.night_mode_data.last() {
         let value = night.night_mode();
-        details.push(format!("night_mode={}", value));
-        json_fields.push(format!("\"night_mode\":{}", value));
-        events.push(ArdaSensorEvent::NightMode { enabled: value });
+        let enabled_present = night.has_night_mode();
+        details.push(format!(
+            "night_mode={} night_mode_present={}",
+            value, enabled_present
+        ));
+        json_fields.push(format!(
+            "\"night_mode\":{},\"night_mode_present\":{}",
+            value, enabled_present
+        ));
+        events.push(ArdaSensorEvent::NightMode {
+            enabled: value,
+            enabled_present,
+        });
     }
     if let Some(env) = msg.environment_data.last() {
         let temperature_c = env.temperature_e3() as f64 / 1000.0;

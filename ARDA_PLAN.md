@@ -1084,3 +1084,28 @@ Checkpoint markers:
 Canonical vendor GNSS checkpoint: `72fe5c085ce32c1a43452c05b75eb92d888c9156`
 Ubuntu AOSP device GNSS checkpoint: `2551dd2cdcabef976f3d8c66b9d56772034f2b82`
 Canonical device GNSS integration checkpoint: `787c5b67e54b31e22af70c918481417ef149fb2f`
+
+## Phase 3.0C — exhaustive safe advertised HU sensor mapping
+
+The current HU advertises 13 SensorSource kinds. Phase 3.0C maps every advertised kind that has an exact standard Android VehicleProperty semantic and leaves the rest outside VHAL rather than fabricating meaning.
+
+Mapped from AAP source `1`:
+
+- `SENSOR_SPEED(3)` -> `PERF_VEHICLE_SPEED` only. `PERF_VEHICLE_SPEED_DISPLAY` is intentionally not synthesized.
+- `SENSOR_ODOMETER(5)` -> `PERF_ODOMETER`.
+- `SENSOR_FUEL(6).low_fuel_warning` -> `FUEL_LEVEL_LOW` only when the optional proto field is present. Raw fuel level/range remain unmapped because AAP does not define the VHAL-required milliliter/meter units.
+- `SENSOR_PARKING_BRAKE(7)` -> `PARKING_BRAKE_ON`.
+- `SENSOR_GEAR(8)` -> `GEAR_SELECTION` only. `CURRENT_GEAR` is intentionally not synthesized from selected gear.
+- `SENSOR_NIGHT_MODE(10)` -> `NIGHT_MODE` only when the optional proto field is present.
+- `SENSOR_TOLL_CARD(22)` -> `ELECTRONIC_TOLL_COLLECTION_CARD_STATUS`: absent -> `NOT_INSERTED`, present -> `UNKNOWN`; card validity is never fabricated.
+
+Advertised but intentionally outside VehicleProperty mapping:
+
+- `SENSOR_LOCATION(1)` remains on the closed standard GNSS AIDL path.
+- `SENSOR_COMPASS(2)` has no exact standard heading/pitch/roll VehicleProperty.
+- `SENSOR_DRIVING_STATUS_DATA(13)` is Android Auto projection restriction state, not a physical VHAL property.
+- `SENSOR_ACCELEROMETER_DATA(19)` has no exact standard three-axis acceleration VehicleProperty.
+- `SENSOR_GYROSCOPE_DATA(20)` has no exact standard three-axis angular-velocity VehicleProperty.
+- `SENSOR_GPS_SATELLITE_DATA(21)` remains outside VHAL and GNSS status because AAP lacks exact Android constellation/baseband-CN0 semantics.
+
+Phase 3.0C preserves the boundary `AAP sensor ID -> Android VehicleProperty` in Rust and keeps the default Wasm policy generic/typed.

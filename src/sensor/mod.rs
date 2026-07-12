@@ -46,6 +46,7 @@ pub enum ArdaSensorEvent {
         level_raw: i32,
         range_raw: i32,
         low_fuel_warning: bool,
+        low_fuel_warning_present: bool,
     },
     ParkingBrake {
         engaged: bool,
@@ -59,6 +60,7 @@ pub enum ArdaSensorEvent {
     },
     NightMode {
         enabled: bool,
+        enabled_present: bool,
     },
     Environment {
         temperature_c: f64,
@@ -216,11 +218,12 @@ impl ArdaSensorEvent {
                 level_raw,
                 range_raw,
                 low_fuel_warning,
+                low_fuel_warning_present,
             } => [
                 *level_raw as f64,
                 *range_raw as f64,
                 bool_number(*low_fuel_warning),
-                0.0,
+                bool_number(*low_fuel_warning_present),
                 0.0,
                 0.0,
             ],
@@ -246,9 +249,17 @@ impl ArdaSensorEvent {
                 0.0,
                 0.0,
             ],
-            Self::NightMode { enabled } => {
-                [bool_number(*enabled), 0.0, 0.0, 0.0, 0.0, 0.0]
-            }
+            Self::NightMode {
+                enabled,
+                enabled_present,
+            } => [
+                bool_number(*enabled),
+                bool_number(*enabled_present),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
             Self::Environment {
                 temperature_c,
                 pressure,
@@ -382,9 +393,15 @@ impl ArdaSensorEvent {
                 level_raw,
                 range_raw,
                 low_fuel_warning,
+                low_fuel_warning_present,
             } => format!(
-                "kind={}({}) level_raw={} range_raw={} low_fuel_warning={}",
-                self.kind_id(), self.name(), level_raw, range_raw, low_fuel_warning
+                "kind={}({}) level_raw={} range_raw={} low_fuel_warning={} low_fuel_warning_present={}",
+                self.kind_id(),
+                self.name(),
+                level_raw,
+                range_raw,
+                low_fuel_warning,
+                low_fuel_warning_present,
             ),
             Self::ParkingBrake { engaged } => format!(
                 "kind={}({}) engaged={}",
@@ -401,9 +418,12 @@ impl ArdaSensorEvent {
                 "kind={}({}) dtc_len={} dtc_fnv1a32=0x{:08x}",
                 self.kind_id(), self.name(), dtc.len(), fnv1a32(dtc)
             ),
-            Self::NightMode { enabled } => format!(
-                "kind={}({}) enabled={}",
-                self.kind_id(), self.name(), enabled
+            Self::NightMode {
+                enabled,
+                enabled_present,
+            } => format!(
+                "kind={}({}) enabled={} enabled_present={}",
+                self.kind_id(), self.name(), enabled, enabled_present
             ),
             Self::Environment {
                 temperature_c,
@@ -525,7 +545,7 @@ impl SensorPipeline {
             let publisher =
                 SensorRouterPublisher::connect(DEFAULT_ROUTER_SOCKET, AAP_SENSOR_SOURCE_ID)?;
             let ready = format!(
-                "SENSOR_VEHICLE_ROUTER ready socket={} source_id={} source=AAP_SensorSource priority=10 publish=POWERTRAIN,HVAC_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
+                "SENSOR_VEHICLE_ROUTER ready socket={} source_id={} source=AAP_SensorSource priority=10 publish=POWERTRAIN,ENERGY,HVAC_STATE,BODY_STATE direct_vhal_shell=false wasm_location=routerd legacy_vhal_min_ms_ignored={}",
                 DEFAULT_ROUTER_SOCKET,
                 AAP_SENSOR_SOURCE_ID,
                 config.vhal_min_interval_ms,
@@ -692,11 +712,37 @@ pub fn smoke_events() -> Vec<ArdaSensorEvent> {
             cruise_engaged: false,
             cruise_set_speed_raw: 0,
         },
-        ArdaSensorEvent::NightMode { enabled: false },
+        ArdaSensorEvent::Odometer {
+            kilometers: 123_456.7,
+            trip_kilometers: 89.0,
+        },
+        ArdaSensorEvent::Fuel {
+            level_raw: 73,
+            range_raw: 456,
+            low_fuel_warning: true,
+            low_fuel_warning_present: true,
+        },
+        ArdaSensorEvent::Fuel {
+            level_raw: 99,
+            range_raw: 999,
+            low_fuel_warning: false,
+            low_fuel_warning_present: false,
+        },
+        ArdaSensorEvent::ParkingBrake { engaged: true },
+        ArdaSensorEvent::NightMode {
+            enabled: false,
+            enabled_present: true,
+        },
+        ArdaSensorEvent::NightMode {
+            enabled: false,
+            enabled_present: false,
+        },
         ArdaSensorEvent::Gear {
             aap_gear: 100,
             android_gear: Some(0x0008),
         },
+        ArdaSensorEvent::TollCard { present: false },
+        ArdaSensorEvent::TollCard { present: true },
         ArdaSensorEvent::Environment {
             temperature_c: 21.5,
             pressure: 101.325,

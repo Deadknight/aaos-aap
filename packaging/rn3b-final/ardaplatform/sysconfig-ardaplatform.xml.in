@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config>
+    <allow-in-power-save package="@PACKAGE@" />
+    <allow-in-data-usage-save package="@PACKAGE@" />
+
+    <install-in-user-type package="@PACKAGE@">
+        <install-in user-type="SYSTEM" />
+        <do-not-install-in user-type="FULL" />
+        <do-not-install-in user-type="PROFILE" />
+    </install-in-user-type>
+</config>

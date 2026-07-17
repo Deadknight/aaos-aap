@@ -155,7 +155,7 @@ Commands:
   sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
       Loads the local Wasmtime vehicle policy through the sensor compatibility smoke path and verifies deterministic dry-run VHAL events.
 
-  bt-bootstrapd --transport tcp --addr 127.0.0.1:5283 --bridge-token VALUE [--once]
+  bt-bootstrapd --config PATH [CLI overrides...]
   bt-bootstrapd --transport unix --socket /dev/socket/arda_bt_bridge --allow-uid UID [--bridge-token-file PATH]
       Owns the ARDA Bluetooth bootstrap protocol and state machine. An Android framework app remains the thin RFCOMM/SDP transport bridge. TCP is loopback-only for RN-3B debug; production uses an init-created Unix socket, SELinux and SO_PEERCRED.
 

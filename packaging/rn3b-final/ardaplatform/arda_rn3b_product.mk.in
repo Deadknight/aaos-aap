@@ -1,0 +1,11 @@
+# ARDA RN-3B device-wide transport core.
+PRODUCT_PACKAGES += \
+    ArdaPlatformPriv \
+    arda_senderd_rn3b \
+    arda_rn3b_bootstrap_supervisor \
+    arda_rn3b_bt_bootstrapd_rc \
+    arda_platform_privapp_permissions \
+    arda_platform_default_permissions \
+    arda_platform_sysconfig \
+    arda_rn3b_permission_bootstrap \
+    arda_rn3b_permission_bootstrap_rc

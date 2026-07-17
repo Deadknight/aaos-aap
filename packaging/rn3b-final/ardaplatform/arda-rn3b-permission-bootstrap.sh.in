@@ -1,0 +1,44 @@
+#!/system/bin/sh
+
+PACKAGE="@PACKAGE@"
+USER_ID=0
+TAG="ARDA_RN3B_AAOS"
+MAX_WAIT=60
+WAITED=0
+
+while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+    if /system/bin/pm path "$PACKAGE" >/dev/null 2>&1; then
+        break
+    fi
+    /system/bin/sleep 1
+    WAITED=$((WAITED + 1))
+done
+
+if ! /system/bin/pm path "$PACKAGE" >/dev/null 2>&1; then
+    /system/bin/log -t "$TAG" "ARDA_RN3B_AAOS_PERMISSION_BOOTSTRAP=FAIL reason=PACKAGE_NOT_FOUND"
+    exit 1
+fi
+
+FAILED=0
+for PERMISSION in \
+    android.permission.BLUETOOTH_CONNECT \
+    android.permission.BLUETOOTH_ADVERTISE \
+    android.permission.NEARBY_WIFI_DEVICES \
+    android.permission.POST_NOTIFICATIONS; do
+    if /system/bin/pm grant --user "$USER_ID" "$PACKAGE" "$PERMISSION" >/dev/null 2>&1; then
+        /system/bin/log -t "$TAG" \
+            "ARDA_RN3B_AAOS_PERMISSION_GRANT=PASS user=$USER_ID permission=$PERMISSION"
+    else
+        /system/bin/log -t "$TAG" \
+            "ARDA_RN3B_AAOS_PERMISSION_GRANT=FAIL user=$USER_ID permission=$PERMISSION"
+        FAILED=1
+    fi
+done
+
+if [ "$FAILED" -eq 0 ]; then
+    /system/bin/log -t "$TAG" "ARDA_RN3B_AAOS_PERMISSION_BOOTSTRAP=PASS user=$USER_ID"
+    exit 0
+fi
+
+/system/bin/log -t "$TAG" "ARDA_RN3B_AAOS_PERMISSION_BOOTSTRAP=FAIL reason=GRANT_FAILED"
+exit 1

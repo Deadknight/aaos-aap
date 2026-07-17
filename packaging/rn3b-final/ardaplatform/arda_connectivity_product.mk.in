@@ -1,0 +1,11 @@
+# ARDA device-wide connectivity transport core.
+PRODUCT_PACKAGES += \
+    ArdaPlatformPriv \
+    arda_connectivityd \
+    arda_connectivity_supervisor \
+    arda_connectivityd_rc \
+    arda_platform_privapp_permissions \
+    arda_platform_default_permissions \
+    arda_platform_sysconfig \
+    arda_rn3b_permission_bootstrap \
+    arda_rn3b_permission_bootstrap_rc

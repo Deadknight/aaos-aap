@@ -1,0 +1,75 @@
+android_app_import {
+    name: "ArdaPlatformPriv",
+    apk: "ArdaPlatform.apk",
+    certificate: "platform",
+    privileged: true,
+    product_specific: true,
+    dex_preopt: {
+        enabled: false,
+    },
+}
+
+cc_prebuilt_binary {
+    name: "arda_connectivityd",
+    srcs: ["arda-connectivityd"],
+    stem: "arda-connectivityd",
+    system_ext_specific: true,
+    check_elf_files: false,
+    strip: {
+        none: true,
+    },
+}
+
+sh_binary {
+    name: "arda_connectivity_supervisor",
+    src: "arda-connectivity-supervisor.sh",
+    filename: "arda-connectivity-supervisor",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_connectivityd_rc",
+    src: "arda-connectivityd.rc",
+    filename_from_src: true,
+    sub_dir: "init",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_platform_privapp_permissions",
+    src: "privapp-permissions-ardaplatform.xml",
+    filename_from_src: true,
+    sub_dir: "permissions",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_platform_default_permissions",
+    src: "default-permissions-ardaplatform.xml",
+    filename_from_src: true,
+    sub_dir: "default-permissions",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_platform_sysconfig",
+    src: "sysconfig-ardaplatform.xml",
+    filename_from_src: true,
+    sub_dir: "sysconfig",
+    product_specific: true,
+}
+
+sh_binary {
+    name: "arda_rn3b_permission_bootstrap",
+    src: "arda-rn3b-permission-bootstrap.sh",
+    filename: "arda-rn3b-permission-bootstrap",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_rn3b_permission_bootstrap_rc",
+    src: "arda-rn3b-permission-bootstrap.rc",
+    filename_from_src: true,
+    sub_dir: "init",
+    product_specific: true,
+}

@@ -1,0 +1,69 @@
+#!/system/bin/sh
+set -u
+
+SENDERD="/product/bin/arda-senderd"
+CONFIG="/data/user_de/0/@PACKAGE@/files/arda-rn3b.toml"
+LOG="/data/local/tmp/arda-rn3b-senderd.log"
+PID_FILE="/data/local/tmp/arda-rn3b-senderd.pid"
+POLL_SECONDS=1
+
+log_marker() {
+    marker="$1"
+    echo "$marker" >> "$LOG"
+    /system/bin/log -t ARDA_RN3B_SENDERD "$marker" 2>/dev/null || true
+}
+
+config_stamp() {
+    stat -c '%Y:%s' "$CONFIG" 2>/dev/null || echo missing
+}
+
+child_pid=""
+stop_child() {
+    if [ -n "$child_pid" ]; then
+        kill "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+        child_pid=""
+        rm -f "$PID_FILE"
+    fi
+}
+
+trap 'stop_child; exit 0' TERM INT HUP
+
+mkdir -p /data/local/tmp
+: > "$LOG"
+chmod 0600 "$LOG"
+log_marker "ARDA_RN3B_SENDERD_SUPERVISOR=START"
+log_marker "ARDA_RN3B_SENDERD_CONFIG_PATH=$CONFIG"
+
+while true; do
+    while [ ! -s "$CONFIG" ]; do
+        log_marker "ARDA_RN3B_SENDERD_CONFIG_WAIT=YES"
+        sleep "$POLL_SECONDS"
+    done
+
+    stamp="$(config_stamp)"
+    log_marker "ARDA_RN3B_SENDERD_CONFIG_READY=PASS stamp=$stamp"
+
+    "$SENDERD" bt-bootstrapd --config "$CONFIG" >> "$LOG" 2>&1 &
+    child_pid=$!
+    echo "$child_pid" > "$PID_FILE"
+    log_marker "ARDA_RN3B_SENDERD_CHILD_STARTED=PASS pid=$child_pid"
+
+    while kill -0 "$child_pid" 2>/dev/null; do
+        sleep "$POLL_SECONDS"
+        new_stamp="$(config_stamp)"
+        if [ "$new_stamp" != "$stamp" ]; then
+            log_marker "ARDA_RN3B_SENDERD_CONFIG_CHANGED=RESTART old=$stamp new=$new_stamp"
+            stop_child
+            break
+        fi
+    done
+
+    if [ -n "$child_pid" ]; then
+        wait "$child_pid" 2>/dev/null || true
+        child_pid=""
+        rm -f "$PID_FILE"
+        log_marker "ARDA_RN3B_SENDERD_CHILD_EXITED=RESTART"
+    fi
+    sleep "$POLL_SECONDS"
+done

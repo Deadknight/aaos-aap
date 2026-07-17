@@ -1,0 +1,9 @@
+service arda-rn3b-permission-bootstrap /product/bin/arda-rn3b-permission-bootstrap
+    class late_start
+    user root
+    group root system shell
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start arda-rn3b-permission-bootstrap

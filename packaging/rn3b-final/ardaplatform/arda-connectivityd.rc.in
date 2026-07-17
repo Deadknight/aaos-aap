@@ -1,0 +1,9 @@
+service arda-connectivityd /system/bin/sh /product/bin/arda-connectivity-supervisor
+    class late_start
+    user root
+    group root system shell bluetooth wifi inet
+    seclabel u:r:shell:s0
+    disabled
+
+on property:sys.boot_completed=1
+    start arda-connectivityd

@@ -88,7 +88,13 @@ enum JsonScalar {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = parse_args(args)?;
+    let expanded = crate::config::expand_bt_bootstrap_args(args)?;
+    if let Some(path) = expanded.config_path.as_ref() {
+        println!("ARDA_RN3B_SENDERD_CONFIG={}", path.display());
+    } else {
+        println!("ARDA_RN3B_SENDERD_CONFIG=none");
+    }
+    let config = parse_args(expanded.argv)?;
 
     println!("ARDA_RN3B_SENDERD_ROLE=PROTOCOL_STATE_MACHINE");
     println!("ARDA_RN3B_SENDERD_TRANSPORT={:?}", config.transport);
@@ -158,6 +164,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                 allowed_uids.push(args.get(index).ok_or("--allow-uid requires UID")?.parse()?);
             }
             "--once" => once = true,
+            "--no-once" => once = false,
             "--keep-bootstrap-rfcomm-open" => keep_bootstrap_rfcomm_open = true,
             "--no-keep-bootstrap-rfcomm-open" => keep_bootstrap_rfcomm_open = false,
             "--keep-bluetooth-profiles-connected" => keep_bluetooth_profiles_connected = true,

@@ -74,6 +74,147 @@ pub fn expand_aap_session_args(argv: Vec<String>) -> Result<ExpandedArgs, Box<dy
     })
 }
 
+
+
+pub fn expand_bt_bootstrap_args(argv: Vec<String>) -> Result<ExpandedArgs, Box<dyn std::error::Error>> {
+    let mut explicit = Vec::new();
+    let mut config_path: Option<PathBuf> = None;
+    let mut i = 0usize;
+
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--config" | "--config-file" => {
+                i += 1;
+                let path = argv.get(i).ok_or("--config requires a path")?;
+                if config_path.is_some() {
+                    return Err("only one --config may be supplied".into());
+                }
+                config_path = Some(PathBuf::from(path));
+            }
+            other => explicit.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let mut expanded = Vec::new();
+    if let Some(path) = config_path.as_ref() {
+        expanded.extend(load_bt_bootstrap_config(path)?);
+    }
+    // Explicit CLI values intentionally come last and therefore override TOML.
+    expanded.extend(explicit);
+
+    Ok(ExpandedArgs {
+        argv: expanded,
+        config_path,
+    })
+}
+
+fn load_bt_bootstrap_config(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("cannot read config {}: {err}", path.display()))?;
+    let mut values = parse_simple_toml(&text)?;
+
+    // `rn3b.*` is retained as a read-only compatibility alias for configs
+    // generated before the runtime service was renamed to arda-connectivityd.
+    for suffix in [
+        "transport",
+        "addr",
+        "socket",
+        "bridge_token",
+        "bridge_token_file",
+        "once",
+        "keep_bootstrap_rfcomm_open",
+        "keep_bluetooth_profiles_connected",
+    ] {
+        let legacy = format!("rn3b.{suffix}");
+        let canonical = format!("connectivity.{suffix}");
+        if let Some(value) = values.remove(&legacy) {
+            if values.insert(canonical.clone(), value).is_some() {
+                return Err(format!(
+                    "config contains both legacy {legacy} and canonical {canonical}"
+                )
+                .into());
+            }
+        }
+    }
+
+    let supported: HashSet<&'static str> = [
+        "connectivity.transport",
+        "connectivity.addr",
+        "connectivity.socket",
+        "connectivity.bridge_token",
+        "connectivity.bridge_token_file",
+        "connectivity.once",
+        "connectivity.keep_bootstrap_rfcomm_open",
+        "connectivity.keep_bluetooth_profiles_connected",
+    ]
+    .into_iter()
+    .collect();
+
+    for key in values.keys() {
+        if !supported.contains(key.as_str()) {
+            return Err(format!(
+                "unknown connectivity config key {key} in {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+
+    if values.contains_key("connectivity.bridge_token")
+        && values.contains_key("connectivity.bridge_token_file")
+    {
+        return Err(
+            "use only one of connectivity.bridge_token or connectivity.bridge_token_file".into(),
+        );
+    }
+
+    let mut out = Vec::new();
+    push_value(
+        &values,
+        "connectivity.transport",
+        "--transport",
+        &mut out,
+    )?;
+    push_value(&values, "connectivity.addr", "--addr", &mut out)?;
+    push_value(&values, "connectivity.socket", "--socket", &mut out)?;
+    push_value(
+        &values,
+        "connectivity.bridge_token",
+        "--bridge-token",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "connectivity.bridge_token_file",
+        "--bridge-token-file",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "connectivity.once",
+        "--once",
+        "--no-once",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "connectivity.keep_bootstrap_rfcomm_open",
+        "--keep-bootstrap-rfcomm-open",
+        "--no-keep-bootstrap-rfcomm-open",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "connectivity.keep_bluetooth_profiles_connected",
+        "--keep-bluetooth-profiles-connected",
+        "--no-keep-bluetooth-profiles-connected",
+        &mut out,
+    )?;
+
+    Ok(out)
+}
+
 pub fn render_resolved_args(argv: Vec<String>) -> Result<String, Box<dyn std::error::Error>> {
     let expanded = expand_aap_session_args(argv)?;
     let mut out = String::new();

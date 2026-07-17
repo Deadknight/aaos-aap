@@ -1109,3 +1109,27 @@ Advertised but intentionally outside VehicleProperty mapping:
 - `SENSOR_GPS_SATELLITE_DATA(21)` remains outside VHAL and GNSS status because AAP lacks exact Android constellation/baseband-CN0 semantics.
 
 Phase 3.0C preserves the boundary `AAP sensor ID -> Android VehicleProperty` in Rust and keeps the default Wasm policy generic/typed.
+
+## RN-3B Wi-Fi handoff MVP — 2026-07-14
+
+Validated before implementation:
+- senderd loopback bridge listener `127.0.0.1:5283` passed.
+- token auth passed.
+- HELLO / HELLO_ACK passed.
+- PING / PONG passed.
+
+Implemented in the current source:
+- Add operation 10 `INTERNET_OFFER`.
+- Add operation 11 `INTERNET_RESULT`.
+- Add operation 12 `INTERNET_STATUS`.
+- Add opt-in token-authenticated Wi-Fi listener, default test endpoint `0.0.0.0:5284`.
+- Add phone-hotspot mode: exact SSID/PSK/security -> AAOS `net-join` -> require target SSID plus wlan0 IPv4 -> return AAOS IP/port over the still-open Bluetooth bridge.
+- Add local-hotspot HTTP-proxy mode using the existing `net-proxy` helper.
+- Keep bootstrap RFCOMM open as fallback while the companion performs a second ARDBR001 + HELLO/PING gate over Wi-Fi.
+- Tighten `net-join`: an unrelated existing wlan0 connection no longer counts as success.
+- Add Mac smoke script `scripts/test-rn3b-wifi-handoff-macos.sh`.
+
+Still required outside this source archive:
+- Patch phone companion to start/inspect hotspot, send INTERNET_OFFER, read INTERNET_RESULT, then connect to returned AAOS Wi-Fi endpoint.
+- No ArdaPlatform protocol change is required if it remains a transparent RFCOMM byte pump.
+- Do not close RFCOMM until the direct Wi-Fi HELLO/PING/PONG gate passes.

@@ -182,3 +182,27 @@ Caveats:
 4. Add Mode B HTTP proxy in companion app.
 5. Add tun2socks full-device mode if Maps/GMS ignores HTTP proxy.
 6. Test Mode C only if phone hotspot/local-only mode is blocked or inconvenient.
+
+## Implemented RN-3B transport handoff
+
+The senderd RN-3B state machine now accepts `INTERNET_OFFER` as operation 10 after `HELLO`. For `phone_hotspot`, senderd:
+
+1. Enables AAOS Wi-Fi.
+2. Connects to the exact offered SSID with `cmd wifi connect-network`.
+3. Requires the target SSID to be reported connected and `wlan0` to have IPv4.
+4. Returns `INTERNET_RESULT` operation 11 with the AAOS Wi-Fi IP and port 5284.
+5. Keeps RFCOMM open as the fallback/bootstrap channel.
+6. Accepts a new token-authenticated direct Wi-Fi session on port 5284.
+
+The companion should then open a TCP connection to the returned `aaos_ip:port`, perform the existing `ARDBR001` authentication, and send `HELLO`/`PING` again. Only after the Wi-Fi `PONG` gate passes should it move later bulk traffic off RFCOMM.
+
+`local_hotspot_http_proxy` is also accepted. Its payload additionally requires:
+
+```json
+{
+  "phone_ip": "192.168.43.1",
+  "http_proxy_port": 8080
+}
+```
+
+The global Android HTTP proxy remains a partial internet bridge; it is not a substitute for future tun2socks full-device routing.

@@ -37,13 +37,20 @@ echo "Building Rust + embedded native C++ probe + app_process inputd for $TARGET
 echo "ANDROID_JAR=$ANDROID_JAR"
 echo "D8=$D8"
 
-# Patch/checkpoint archives are commonly applied with `rsync -av`, which preserves
-# source mtimes. Cargo's build-script rerun tracking is mtime-based, so an older
-# restored build.rs can otherwise leave a stale OUT_DIR/protos snapshot in target/.
-# Clean only this package for the selected Android target; dependency artifacts stay
-# cached, while build.rs/codegen/native/inputd are guaranteed to reflect this tree.
-echo "Refreshing arda-senderd target artifacts before codegen"
-cargo clean -p arda-senderd --target "$TARGET"
+# Patch/checkpoint archives are commonly applied with preserved mtimes. Cargo can
+# then consider an older restored source file unchanged and reuse a stale package
+# artifact. Remove only arda-senderd's target-specific outputs explicitly; dependency
+# artifacts remain cached, while the binary/build-script/codegen are rebuilt from the
+# current working tree every time this manual build script is invoked.
+echo "Refreshing arda-senderd package artifacts before codegen"
+release_dir="target/$TARGET/release"
+rm -rf \
+  "$release_dir"/.fingerprint/arda-senderd-* \
+  "$release_dir"/build/arda-senderd-* \
+  "$release_dir"/deps/arda_senderd-* \
+  "$release_dir"/arda-senderd \
+  "$release_dir"/arda-senderd.d
+echo "ARDA_RN3B_MANUAL_BUILD_FRESH_ARTIFACT_RESET=PASS"
 
 if [[ -n "$FEATURES" ]]; then
   cargo build --release --target "$TARGET" --features "$FEATURES"

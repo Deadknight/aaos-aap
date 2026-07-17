@@ -1,4 +1,5 @@
 mod aap;
+mod bluetooth;
 mod capture;
 mod config;
 mod gnss_hal;
@@ -60,6 +61,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "location-bridge-smoke" => location_bridge_smoke(args.collect()),
         "sensor-wasm-smoke" => sensor_wasm_smoke(args.collect()),
         "vehicle-routerd" => vehicle_routerd(args.collect()),
+        "bt-bootstrapd" | "bluetooth-bootstrapd" => bluetooth::run(args.collect()),
         "vehicle-policy-smoke" => vehicle_policy_smoke(args.collect()),
         "vehicle-router-smoke" => vehicle_router_smoke(args.collect()),
         "vehicle-manager-bridge-smoke" => vehicle_manager_bridge_smoke(args.collect()),
@@ -152,6 +154,10 @@ Commands:
 
   sensor-wasm-smoke [--wasm builtin|PATH] [--fuel N] [--max-commands N]
       Loads the local Wasmtime vehicle policy through the sensor compatibility smoke path and verifies deterministic dry-run VHAL events.
+
+  bt-bootstrapd --transport tcp --addr 127.0.0.1:5283 --bridge-token VALUE [--once]
+  bt-bootstrapd --transport unix --socket /dev/socket/arda_bt_bridge --allow-uid UID [--bridge-token-file PATH]
+      Owns the ARDA Bluetooth bootstrap protocol and state machine. An Android framework app remains the thin RFCOMM/SDP transport bridge. TCP is loopback-only for RN-3B debug; production uses an init-created Unix socket, SELinux and SO_PEERCRED.
 
   vehicle-routerd [--socket PATH] [--wasm builtin|PATH] [--fuel N] [--max-outputs N]
       Runs the central ARDA vehicle router. The router owns Wasmtime ABI v2, vehicle-signal arbitration, VHAL event routing, and vehicle-command dispatch.
@@ -912,7 +918,7 @@ fn net_status(_argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn net_join(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn net_join(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_net_join_args(argv)?;
     let security = args.security.clone().unwrap_or_else(|| {
         if args.psk.as_deref().unwrap_or_default().is_empty() {
@@ -959,8 +965,12 @@ fn net_join(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    wait_for_wifi_status(&args.ssid, Duration::from_millis(args.wait_ms));
-    net_status(Vec::new())
+    let connected = wait_for_wifi_status(&args.ssid, Duration::from_millis(args.wait_ms));
+    net_status(Vec::new())?;
+    if !connected {
+        return Err(format!("Wi-Fi did not connect to ssid='{}' within {}ms", args.ssid, args.wait_ms).into());
+    }
+    Ok(())
 }
 
 fn parse_net_join_args(argv: Vec<String>) -> Result<NetJoinArgs, Box<dyn std::error::Error>> {
@@ -1025,47 +1035,74 @@ fn validate_wifi_security(security: &str, psk: Option<&str>) -> Result<(), Box<d
     }
 }
 
-fn wait_for_wifi_status(ssid: &str, timeout: Duration) {
+fn wait_for_wifi_status(ssid: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() <= timeout {
         if let Ok(out) = run_command_output("cmd", &["wifi", "status"]) {
             let combined = format!("{}\n{}", out.stdout, out.stderr);
             if wifi_status_is_connected_to(&combined, ssid) {
-                println!("arda net: Wi-Fi connected after {}ms", start.elapsed().as_millis());
-                return;
+                if interface_has_ipv4("wlan0") {
+                    println!(
+                        "arda net: target Wi-Fi connected with IPv4 after {}ms",
+                        start.elapsed().as_millis()
+                    );
+                    return true;
+                }
+                println!(
+                    "arda net: target Wi-Fi associated; waiting for wlan0 IPv4 ({}ms)",
+                    start.elapsed().as_millis()
+                );
             }
-        }
-        if interface_has_ipv4("wlan0") {
-            println!("arda net: wlan0 has IPv4 after {}ms", start.elapsed().as_millis());
-            return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    println!("arda net: connection wait timed out after {}ms; printing current status", timeout.as_millis());
+    println!(
+        "arda net: connection wait timed out after {}ms; target ssid='{}' was not ready",
+        timeout.as_millis(),
+        ssid
+    );
+    false
 }
 
 fn wifi_status_is_connected_to(status: &str, ssid: &str) -> bool {
     let lower = status.to_ascii_lowercase();
-    if lower.contains("not connected") || lower.contains("is disconnected") || lower.contains("state: disconnected") {
+    if lower.contains("not connected")
+        || lower.contains("is disconnected")
+        || lower.contains("state: disconnected")
+    {
         return false;
     }
-    if status.contains(ssid) && (lower.contains("connected") || lower.contains("networkid") || lower.contains("bssid")) {
-        return true;
+    status.contains(ssid)
+        && (lower.contains("connected")
+            || lower.contains("networkid")
+            || lower.contains("bssid"))
+}
+
+pub(crate) fn interface_ipv4_address(iface: &str) -> Option<String> {
+    let output = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    lower.contains("wifi is connected") || lower.contains("state: connected")
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut fields = stdout.split_whitespace();
+    while let Some(field) = fields.next() {
+        if field == "inet" {
+            return fields
+                .next()
+                .and_then(|value| value.split('/').next())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 fn interface_has_ipv4(iface: &str) -> bool {
-    let query = format!("ip -4 addr show {iface} 2>/dev/null | grep -q ' inet '");
-    Command::new("sh")
-        .arg("-c")
-        .arg(query)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    interface_ipv4_address(iface).is_some()
 }
 
 fn net_disconnect(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1125,7 +1162,7 @@ fn find_wifi_network_id(list_stdout: &str, ssid: &str) -> Option<String> {
     None
 }
 
-fn net_proxy(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn net_proxy(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
 

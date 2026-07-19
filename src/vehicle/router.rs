@@ -457,46 +457,52 @@ fn handle_client(
         client_name,
     );
 
-    loop {
-        let message = match read_envelope(&mut stream) {
-            Ok(message) => message,
-            Err(err) if matches!(err.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => break,
-            Err(err) => return Err(err.into()),
-        };
-        if message.protocol_version() != ROUTER_PROTOCOL_VERSION {
-            eprintln!(
-                "VEHICLE_ROUTER_PROTOCOL_REJECT client={} version={}",
-                client_id,
-                message.protocol_version(),
-            );
-            break;
-        }
+    // After the client is inserted into RouterState, every exit path must release
+    // its registered sources. Capture all loop errors first so `?` and unexpected
+    // socket errors cannot bypass cleanup_client().
+    let session_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let message = match read_envelope(&mut stream) {
+                Ok(message) => message,
+                Err(err) if matches!(err.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => break,
+                Err(err) => return Err(err.into()),
+            };
+            if message.protocol_version() != ROUTER_PROTOCOL_VERSION {
+                eprintln!(
+                    "VEHICLE_ROUTER_PROTOCOL_REJECT client={} version={}",
+                    client_id,
+                    message.protocol_version(),
+                );
+                break;
+            }
 
-        if message.has_register_source() {
-            handle_register_source(client_id, role, &tx, message.register_source(), &state)?;
-        } else if message.has_vehicle_signals() {
-            handle_vehicle_signals(client_id, role, message.vehicle_signals(), &state)?;
-        } else if message.has_vhal_set_request() {
-            handle_vhal_set_request(
-                client_id,
-                role,
-                &tx,
-                message.vhal_set_request(),
-                &state,
-                &next_command_id,
-            )?;
-        } else if message.has_command_acks() {
-            handle_command_acks(client_id, role, message.command_acks(), &state)?;
-        } else if message.has_ping() {
-            let mut pong = pb::Pong::new();
-            pong.set_nonce(message.ping().nonce());
-            let mut response = envelope();
-            response.set_pong(pong);
-            let _ = tx.send(response);
-        } else {
-            eprintln!("VEHICLE_ROUTER_MESSAGE_REJECT client={} reason=unexpected_payload", client_id);
+            if message.has_register_source() {
+                handle_register_source(client_id, role, &tx, message.register_source(), &state)?;
+            } else if message.has_vehicle_signals() {
+                handle_vehicle_signals(client_id, role, message.vehicle_signals(), &state)?;
+            } else if message.has_vhal_set_request() {
+                handle_vhal_set_request(
+                    client_id,
+                    role,
+                    &tx,
+                    message.vhal_set_request(),
+                    &state,
+                    &next_command_id,
+                )?;
+            } else if message.has_command_acks() {
+                handle_command_acks(client_id, role, message.command_acks(), &state)?;
+            } else if message.has_ping() {
+                let mut pong = pb::Pong::new();
+                pong.set_nonce(message.ping().nonce());
+                let mut response = envelope();
+                response.set_pong(pong);
+                let _ = tx.send(response);
+            } else {
+                eprintln!("VEHICLE_ROUTER_MESSAGE_REJECT client={} reason=unexpected_payload", client_id);
+            }
         }
-    }
+        Ok(())
+    })();
 
     cleanup_client(client_id, &state);
     println!(
@@ -506,7 +512,7 @@ fn handle_client(
         role.name(),
         client_name,
     );
-    Ok(())
+    session_result
 }
 
 fn send_hello_reject(stream: &mut UnixStream, uid: u32, error: &str) -> io::Result<()> {

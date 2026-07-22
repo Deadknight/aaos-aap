@@ -380,16 +380,16 @@ Observed security issue in v53:
 - A local client could connect to the single blocking server and hold the connection, preventing senderd from reaching the injector.
 
 Implemented:
-- Replace `127.0.0.1:5276` TCP with a filesystem UNIX-domain socket at `/data/user_de/0/com.arda.inputbridge/files/arda-input.sock`.
+- Replace `127.0.0.1:5276` TCP with the Linux abstract UNIX-domain socket `arda_input_bridge`.
 - The bridge starts the socket server only for Android user 0.
-- Set the socket node to mode `0600`.
+- Do not create a filesystem socket node; this removes stale inode cleanup, chmod, and app-private directory traversal.
 - Read kernel peer credentials immediately after `accept()` and accept only UID 0, matching the current root `arda-senderd` runtime required by `/dev/usb_accessory`. Unauthorized peers are closed before the line protocol is read.
 - Remove `android.permission.INTERNET` from ArdaInputBridge.
 - Keep the proven line protocol and AAP touch/key mapping unchanged: `DISPLAY`, `T`, `K`, `STOP`/`BYE`, `PING`.
-- Senderd now uses `UnixStream` and reconnect behavior remains lazy/event-driven.
+- Senderd connects to the abstract namespace with `AF_UNIX`/`sockaddr_un`; reconnect behavior remains lazy/event-driven.
 
 Security boundary for the current PoC/runtime:
-- DAC (`0600`) blocks ordinary application UIDs from opening the filesystem socket.
+- SELinux grants abstract-socket `connectto` only to the dedicated `arda_vehicle_router` domain, with shell/su permitted only in userdebug builds.
 - Kernel peer credentials are checked by the privileged bridge and only root UID is authorized.
 - Root remains trusted because the current senderd session itself must run as root to open `/dev/usb_accessory`.
 
@@ -401,8 +401,8 @@ Future hardening when senderd becomes an init-managed platform daemon:
 
 Immediate test:
 1. Build and hot-deploy `ArdaInputBridge`; verify the old TCP listener on `5276` is gone.
-2. Require the UNIX socket node to exist with mode `srw-------`.
-3. Run senderd as root with `inject_mode = bridge`; require `INPUT_PLATFORM_BRIDGE transport=unix-filesystem` and `peer_auth=SO_PEERCRED/root-uid`.
+2. Require no `arda-input.sock` filesystem node and require bridge log `READY transport=unix-abstract name=arda_input_bridge`.
+3. Run senderd as root with `inject_mode = bridge`; require `INPUT_PLATFORM_BRIDGE transport=unix-abstract`, `socket_name=arda_input_bridge`, and `peer_auth=SO_PEERCRED/root-uid`.
 4. Require bridge log `client accepted uid=0` and successful tap/swipe injection.
 5. Attempt a connection from a normal app UID only if a controlled test helper is available; the bridge must log `rejected peer uid=...`.
 6. After secure input is stable, return to sensor/VHAL work. The next architecture target is a Wasmtime/WebAssembly VHAL translation layer while preserving the proven AAP/TLS/SDR path.

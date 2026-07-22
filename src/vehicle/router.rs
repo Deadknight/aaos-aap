@@ -34,6 +34,7 @@ const ROUTER_SOCKET_GID_SYSTEM: u32 = 1000;
 const INIT_ROUTER_SOCKET_ENV: &str = "ANDROID_SOCKET_arda_vehicle_router";
 const SIGNAL_SOURCE_STALE_AFTER: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const VEHICLE_INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -108,11 +109,18 @@ struct PendingCommand {
     deadline: Instant,
 }
 
+struct PendingVehicleInfo {
+    request_id: u64,
+    manager_client_id: u64,
+    deadline: Instant,
+}
+
 struct RouterState {
     clients: HashMap<u64, ClientHandle>,
     sources: HashMap<u32, SourceState>,
     selections: HashMap<SelectionKey, SignalSelection>,
     pending_commands: HashMap<u64, PendingCommand>,
+    pending_vehicle_info: HashMap<u64, PendingVehicleInfo>,
     policy: VehiclePolicyEngine,
 }
 
@@ -167,6 +175,7 @@ pub fn run_vehicle_router(config: VehicleRouterConfig) -> Result<(), Box<dyn std
         sources: HashMap::new(),
         selections: HashMap::new(),
         pending_commands: HashMap::new(),
+        pending_vehicle_info: HashMap::new(),
         policy,
     }));
     let next_client_id = Arc::new(AtomicU64::new(1));
@@ -382,7 +391,7 @@ fn handle_client(
     let (uid, gid, pid) = peer_credentials(&stream)?;
     let hello_envelope = read_envelope(&mut stream)?;
     if hello_envelope.protocol_version() != ROUTER_PROTOCOL_VERSION || !hello_envelope.has_hello() {
-        send_hello_reject(&mut stream, uid, "first frame must be protocol-v2 Hello")?;
+        send_hello_reject(&mut stream, uid, "first frame must be current-protocol Hello")?;
         return Ok(());
     }
     let hello = hello_envelope.hello();
@@ -491,6 +500,20 @@ fn handle_client(
                 )?;
             } else if message.has_command_acks() {
                 handle_command_acks(client_id, role, message.command_acks(), &state)?;
+            } else if message.has_vehicle_info_apply_request() {
+                handle_vehicle_info_apply_request(
+                    client_id,
+                    role,
+                    message.vehicle_info_apply_request(),
+                    &state,
+                )?;
+            } else if message.has_vehicle_info_apply_result() {
+                handle_vehicle_info_apply_result(
+                    client_id,
+                    role,
+                    message.vehicle_info_apply_result(),
+                    &state,
+                )?;
             } else if message.has_ping() {
                 let mut pong = pb::Pong::new();
                 pong.set_nonce(message.ping().nonce());
@@ -1031,6 +1054,115 @@ fn send_vhal_set_result(
     Ok(())
 }
 
+fn handle_vehicle_info_apply_request(
+    client_id: u64,
+    role: Role,
+    request: &pb::VehicleInfoApplyRequest,
+    state: &Arc<Mutex<RouterState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if role != Role::Manager {
+        return Err(format!("role {} cannot apply vehicle info", role.name()).into());
+    }
+    if request.request_id() == 0 {
+        return Err("vehicle info request_id must be non-zero".into());
+    }
+
+    let mut locked = state.lock().map_err(|_| "vehicle router state poisoned")?;
+    if locked.pending_vehicle_info.contains_key(&request.request_id()) {
+        return Err(format!(
+            "duplicate vehicle info request_id={}",
+            request.request_id(),
+        )
+        .into());
+    }
+
+    let vhal_clients = locked
+        .clients
+        .values()
+        .filter(|client| client.role == Role::Vhal)
+        .cloned()
+        .collect::<Vec<_>>();
+    if vhal_clients.len() != 1 {
+        let error = format!("expected one VHAL client, found {}", vhal_clients.len());
+        if let Some(manager) = locked.clients.get(&client_id) {
+            let mut result = pb::VehicleInfoApplyResult::new();
+            result.set_request_id(request.request_id());
+            result.set_applied(false);
+            result.set_error(error.clone());
+            let mut outgoing = envelope();
+            outgoing.set_vehicle_info_apply_result(result);
+            let _ = manager.tx.send(outgoing);
+        }
+        return Ok(());
+    }
+
+    let manager_id = locked
+        .clients
+        .get(&client_id)
+        .ok_or("manager client disappeared")?
+        .id;
+    let vhal_id = vhal_clients[0].id;
+    let vhal_tx = vhal_clients[0].tx.clone();
+    let mut outgoing = envelope();
+    outgoing.set_vehicle_info_apply_request(request.clone());
+    vhal_tx.send(outgoing)?;
+    locked.pending_vehicle_info.insert(
+        request.request_id(),
+        PendingVehicleInfo {
+            request_id: request.request_id(),
+            manager_client_id: manager_id,
+            deadline: Instant::now() + VEHICLE_INFO_TIMEOUT,
+        },
+    );
+    println!(
+        "VEHICLE_ROUTER_VEHICLE_INFO_FORWARD request={} manager_client={} vhal_client={} fuel={:?} connectors={:?}",
+        request.request_id(),
+        manager_id,
+        vhal_id,
+        request.fuel_types(),
+        request.connector_types(),
+    );
+    Ok(())
+}
+
+fn handle_vehicle_info_apply_result(
+    client_id: u64,
+    role: Role,
+    result: &pb::VehicleInfoApplyResult,
+    state: &Arc<Mutex<RouterState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if role != Role::Vhal {
+        return Err(format!("role {} cannot return vehicle info result", role.name()).into());
+    }
+    let mut locked = state.lock().map_err(|_| "vehicle router state poisoned")?;
+    let Some(pending) = locked.pending_vehicle_info.remove(&result.request_id()) else {
+        eprintln!(
+            "VEHICLE_ROUTER_VEHICLE_INFO_RESULT_DROP client={} request={} reason=unknown_request",
+            client_id,
+            result.request_id(),
+        );
+        return Ok(());
+    };
+    let Some(manager) = locked.clients.get(&pending.manager_client_id) else {
+        eprintln!(
+            "VEHICLE_ROUTER_VEHICLE_INFO_RESULT_DROP client={} request={} reason=manager_disconnected",
+            client_id,
+            result.request_id(),
+        );
+        return Ok(());
+    };
+    let mut outgoing = envelope();
+    outgoing.set_vehicle_info_apply_result(result.clone());
+    manager.tx.send(outgoing)?;
+    println!(
+        "VEHICLE_ROUTER_VEHICLE_INFO_RESULT request={} applied={} error={:?}",
+        result.request_id(),
+        result.applied(),
+        result.error(),
+    );
+    Ok(())
+}
+
 fn handle_command_acks(
     client_id: u64,
     role: Role,
@@ -1172,6 +1304,31 @@ fn cleanup_client(client_id: u64, state: &Arc<Mutex<RouterState>>) {
             broadcast_vhal_set_error_locked(&locked, &pending, 3, "adapter disconnected");
         }
     }
+
+    let disconnected_was_vhal = !locked.clients.values().any(|client| client.role == Role::Vhal);
+    let affected_vehicle_info = locked
+        .pending_vehicle_info
+        .values()
+        .filter(|pending| {
+            pending.manager_client_id == client_id || disconnected_was_vhal
+        })
+        .map(|pending| pending.request_id)
+        .collect::<Vec<_>>();
+    for request_id in affected_vehicle_info {
+        if let Some(pending) = locked.pending_vehicle_info.remove(&request_id) {
+            if pending.manager_client_id != client_id {
+                if let Some(manager) = locked.clients.get(&pending.manager_client_id) {
+                    let mut result = pb::VehicleInfoApplyResult::new();
+                    result.set_request_id(request_id);
+                    result.set_applied(false);
+                    result.set_error("VHAL client disconnected".to_string());
+                    let mut outgoing = envelope();
+                    outgoing.set_vehicle_info_apply_result(result);
+                    let _ = manager.tx.send(outgoing);
+                }
+            }
+        }
+    }
 }
 
 fn spawn_timeout_worker(state: Arc<Mutex<RouterState>>) {
@@ -1201,15 +1358,41 @@ fn spawn_timeout_worker(state: Arc<Mutex<RouterState>>) {
                 broadcast_vhal_set_error_locked(&locked, &pending, 4, "vehicle command timeout");
             }
         }
+
+        let expired_vehicle_info = locked
+            .pending_vehicle_info
+            .values()
+            .filter(|pending| pending.deadline <= now)
+            .map(|pending| pending.request_id)
+            .collect::<Vec<_>>();
+        for request_id in expired_vehicle_info {
+            if let Some(pending) = locked.pending_vehicle_info.remove(&request_id) {
+                eprintln!(
+                    "VEHICLE_ROUTER_VEHICLE_INFO_TIMEOUT request={} manager_client={}",
+                    pending.request_id,
+                    pending.manager_client_id,
+                );
+                if let Some(manager) = locked.clients.get(&pending.manager_client_id) {
+                    let mut result = pb::VehicleInfoApplyResult::new();
+                    result.set_request_id(request_id);
+                    result.set_applied(false);
+                    result.set_error("vehicle info apply timeout".to_string());
+                    let mut outgoing = envelope();
+                    outgoing.set_vehicle_info_apply_result(result);
+                    let _ = manager.tx.send(outgoing);
+                }
+            }
+        }
     });
 }
 
 pub fn router_state_summary(socket_path: &str) -> String {
     format!(
-        "router_socket={} protocol={} source_stale_ms={} command_timeout_ms={}",
+        "router_socket={} protocol={} source_stale_ms={} command_timeout_ms={} vehicle_info_timeout_ms={}",
         socket_path,
         ROUTER_PROTOCOL_VERSION,
         SIGNAL_SOURCE_STALE_AFTER.as_millis(),
         COMMAND_TIMEOUT.as_millis(),
+        VEHICLE_INFO_TIMEOUT.as_millis(),
     )
 }

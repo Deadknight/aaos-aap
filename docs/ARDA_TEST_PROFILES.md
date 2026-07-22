@@ -149,7 +149,7 @@ Zero means unlimited live frames. A previous test command omitted this and the d
 
 The Waveshare setup uses 1280x720 logical AAP coordinates while the physical/natural WM geometry is 720x1280 with a 270-degree rotation profile. The v54 platform bridge injects the already mapped logical display coordinates through `InputManagerGlobal.injectInputEvent()`.
 
-Senderd reaches the persistent privileged bridge through the secured filesystem UNIX socket at `/data/user_de/0/com.arda.inputbridge/files/arda-input.sock`. The socket is mode `0600` and the bridge verifies kernel peer credentials for the current root senderd runtime.
+Senderd reaches the persistent privileged bridge through the Linux abstract UNIX socket `arda_input_bridge`. No filesystem inode, app-data traversal, stale socket cleanup, or chmod step exists. SELinux permits `connectto` only from the dedicated `arda_vehicle_router` domain (plus controlled userdebug probe domains), and the bridge still verifies kernel peer credentials for the current root senderd runtime.
 
 The old `app_process` and uinput paths remain explicit A/B fallbacks but are not the baseline.
 

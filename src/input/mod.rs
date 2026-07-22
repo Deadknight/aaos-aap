@@ -10,7 +10,7 @@ use std::mem;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -143,15 +143,14 @@ impl TouchInjectAction {
 
 const INPUTD_JAR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arda_inputd.jar"));
 const INPUTD_JAR_PATH: &str = "/data/local/tmp/arda-inputd.jar";
-const PLATFORM_INPUT_BRIDGE_SOCKET_PATH: &str =
-    "/data/user_de/0/com.arda.inputbridge/files/arda-input.sock";
+const PLATFORM_INPUT_BRIDGE_SOCKET_NAME: &str = "arda_input_bridge";
 
 /// Client for the platform-integrated privileged ARDA input bridge.
 ///
 /// The bridge is a persistent system_ext app signed with the platform key. It
 /// owns INJECT_EVENTS and performs InputManagerGlobal.injectInputEvent() inside
 /// Android's framework process model. arda-senderd only forwards the already
-/// mapped AAP input reports over a root-authenticated local UNIX-domain socket line protocol:
+/// mapped AAP input reports over a root-authenticated abstract UNIX-domain socket line protocol:
 ///
 ///   DISPLAY <id>
 ///   T DOWN|MOVE|UP <x> <y> <pointer_id>
@@ -160,6 +159,77 @@ const PLATFORM_INPUT_BRIDGE_SOCKET_PATH: &str =
 pub struct PlatformInputBridgeInjector {
     stream: Option<UnixStream>,
     display_id: i32,
+}
+
+fn connect_abstract_unix_stream(name: &str) -> io::Result<UnixStream> {
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "abstract UNIX socket name is empty",
+        ));
+    }
+    if name_bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "abstract UNIX socket name contains NUL",
+        ));
+    }
+
+    let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
+    let max_name_len = address.sun_path.len().saturating_sub(1);
+    if name_bytes.len() > max_name_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "abstract UNIX socket name is too long: {} > {}",
+                name_bytes.len(),
+                max_name_len
+            ),
+        ));
+    }
+
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    address.sun_path[0] = 0;
+    for (dst, src) in address.sun_path[1..].iter_mut().zip(name_bytes.iter()) {
+        *dst = *src as c_char;
+    }
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let address_base = (&address as *const libc::sockaddr_un).cast::<u8>() as usize;
+    let path_base = address.sun_path.as_ptr().cast::<u8>() as usize;
+    let address_len = path_base
+        .saturating_sub(address_base)
+        .saturating_add(1)
+        .saturating_add(name_bytes.len());
+
+    let connect_result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            address_len as libc::socklen_t,
+        )
+    };
+
+    if connect_result != 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 impl PlatformInputBridgeInjector {
@@ -173,10 +243,10 @@ impl PlatformInputBridgeInjector {
         let mut report = String::new();
         report.push_str("arda platform input bridge client\n");
         report.push_str(&format!(
-            "socket_path={}\n",
-            PLATFORM_INPUT_BRIDGE_SOCKET_PATH
+            "socket_name={}\n",
+            PLATFORM_INPUT_BRIDGE_SOCKET_NAME
         ));
-        report.push_str("transport=unix-filesystem\n");
+        report.push_str("transport=unix-abstract\n");
         report.push_str("peer_auth=SO_PEERCRED/root-uid\n");
         report.push_str(&format!("display_id={}\n", display_id));
         report.push_str("protocol=line-v1\n");
@@ -185,7 +255,7 @@ impl PlatformInputBridgeInjector {
     }
 
     fn connect(&mut self) -> io::Result<()> {
-        let mut stream = UnixStream::connect(PLATFORM_INPUT_BRIDGE_SOCKET_PATH)?;
+        let mut stream = connect_abstract_unix_stream(PLATFORM_INPUT_BRIDGE_SOCKET_NAME)?;
         writeln!(stream, "DISPLAY {}", self.display_id)?;
         stream.flush()?;
         self.stream = Some(stream);

@@ -168,6 +168,18 @@ message VhalSetError {
   string error = 5;
 }
 
+message VehicleInfoApplyRequest {
+  uint64 request_id = 1;
+  repeated int32 fuel_types = 2;
+  repeated int32 connector_types = 3;
+}
+
+message VehicleInfoApplyResult {
+  uint64 request_id = 1;
+  bool applied = 2;
+  string error = 3;
+}
+
 message Ping {
   uint64 nonce = 1;
 }
@@ -192,4 +204,6 @@ message Envelope {
   VhalSetError vhal_set_error = 20;
   Ping ping = 21;
   Pong pong = 22;
+  VehicleInfoApplyRequest vehicle_info_apply_request = 23;
+  VehicleInfoApplyResult vehicle_info_apply_result = 24;
 }

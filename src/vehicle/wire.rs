@@ -6,7 +6,7 @@ use protobuf::{Enum, Message};
 
 use super::model::{VehicleCommand, VehicleSignal, VehicleValue, VhalEvent, VhalSetRequest};
 
-pub const ROUTER_PROTOCOL_VERSION: u32 = 2;
+pub const ROUTER_PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_ROUTER_SOCKET: &str = "/dev/socket/arda_vehicle_router";
 pub const MAX_ROUTER_FRAME_BYTES: usize = 1024 * 1024;
 

@@ -37,6 +37,17 @@ cp "$PLATFORM_APK" "$DEST/ArdaPlatform.apk"
 cp "$SENDERD_BIN" "$DEST/arda-connectivityd"
 chmod 0755 "$DEST/arda-connectivityd"
 cp "$TEMPLATE_DIR/Android.bp" "$DEST/Android.bp"
+cp "$TEMPLATE_DIR/arda-aap.toml" "$DEST/arda-aap.toml"
+chmod 0644 "$DEST/arda-aap.toml"
+
+# ARDA_AAP_AUTOSTART_STAGE_BEGIN
+cp "$TEMPLATE_DIR/arda-aap-autostart.sh" \
+  "$DEST/arda-aap-autostart.sh"
+chmod 0755 "$DEST/arda-aap-autostart.sh"
+cp "$TEMPLATE_DIR/arda-aap-autostart.rc" \
+  "$DEST/arda-aap-autostart.rc"
+chmod 0644 "$DEST/arda-aap-autostart.rc"
+# ARDA_AAP_AUTOSTART_STAGE_END
 
 sed "s|@PACKAGE@|$PLATFORM_PACKAGE|g" \
   "$TEMPLATE_DIR/privapp-permissions-ardaplatform.xml.in" \
@@ -96,6 +107,8 @@ echo "ARDA_RN3B_FINAL_STATIC_WIFI_SECRET_IN_IMAGE=NO"
 echo "ARDA_RN3B_FINAL_RUNTIME_PERMISSION_MODE=DEFAULT_GRANT_PLUS_BOOTSTRAP_USER0"
 echo "ARDA_RN3B_FINAL_CONNECTIVITY_SERVICE=arda-connectivityd"
 echo "ARDA_RN3B_FINAL_CONNECTIVITY_BINARY=/system_ext/bin/arda-connectivityd"
+echo "ARDA_RN3B_FINAL_AAP_AUTOSTART=INIT_USB_ACCESSORY_PROPERTY_TRIGGER"
+echo "ARDA_RN3B_FINAL_AAP_CONFIG=/product/etc/arda/arda-aap.toml"
 echo "ARDA_RN3B_FINAL_SENDERD_BOOT_MODE=INIT_SUPERVISED_TOML"
 echo "ARDA_RN3B_FINAL_SENDERD_CONFIG=/data/user_de/0/$PLATFORM_PACKAGE/files/arda-connectivity.toml"
 echo "ARDA_RN3B_FINAL_NEXT=lunch_aosp_rpi4_car-bp4a-userdebug_then_build_image"

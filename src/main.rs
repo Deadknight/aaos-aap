@@ -24,6 +24,8 @@ use capture::screenrecord::{preferred_codec_name, ScreenrecordConfig, Screenreco
 use h264::annexb::{AnnexBStreamParser, NalStats};
 
 const SIGTERM: c_int = 15;
+const AAP_BUILD_CONFIG_PATH: &str = "/product/etc/arda/arda-aap.toml";
+const AAP_TEST_CONFIG_PATH: &str = "/data/local/tmp/arda-config.toml";
 
 extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
@@ -69,11 +71,19 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
         "config-check" => config_check(args.collect()),
         "aap-run" | "run" => {
-            let mut argv = vec![
-                "--config".to_string(),
-                "/data/local/tmp/arda-config.toml".to_string(),
-            ];
-            argv.extend(args);
+            let mut argv: Vec<String> = args.collect();
+            let has_explicit_config = argv.iter().any(|arg| {
+                matches!(arg.as_str(), "--config" | "--config-file")
+            });
+            if !has_explicit_config {
+                argv.splice(
+                    0..0,
+                    [
+                        "--config".to_string(),
+                        default_aap_config_path().to_string(),
+                    ],
+                );
+            }
             aap_service_discovery_probe(argv)
         },
         "net-status" | "internet-status" => net_status(args.collect()),
@@ -103,6 +113,79 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         other => Err(format!("unknown command: {other}").into()),
+    }
+}
+
+fn path_is_nonempty(path: &str) -> bool {
+    fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false)
+}
+
+fn default_aap_config_path() -> &'static str {
+    if path_is_nonempty(AAP_BUILD_CONFIG_PATH) {
+        AAP_BUILD_CONFIG_PATH
+    } else {
+        AAP_TEST_CONFIG_PATH
+    }
+}
+
+fn read_property(name: &str) -> io::Result<String> {
+    let output = Command::new("/system/bin/getprop").arg(name).output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("getprop {name} exited with {}", output.status),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn reset_usb_gadget_after_aap_session() -> io::Result<()> {
+    println!("ARDA_AAP_USB_RESET_ON_EXIT begin target=adb");
+
+    let setprop = Command::new("/system/bin/setprop")
+        .args(["sys.usb.config", "adb"])
+        .status()?;
+    if !setprop.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("setprop sys.usb.config adb exited with {setprop}"),
+        ));
+    }
+
+    thread::sleep(Duration::from_millis(500));
+
+    let reset = Command::new("/system/bin/svc")
+        .args(["usb", "resetUsbGadget"])
+        .status()?;
+    if !reset.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("svc usb resetUsbGadget exited with {reset}"),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let config = read_property("sys.usb.config").unwrap_or_default();
+        let state = read_property("sys.usb.state").unwrap_or_default();
+        if config.split(',').any(|item| item == "adb")
+            && state.split(',').any(|item| item == "adb")
+        {
+            println!(
+                "ARDA_AAP_USB_RESET_ON_EXIT=PASS sys.usb.config={} sys.usb.state={}",
+                config, state
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "USB gadget did not return to adb: sys.usb.config={config} sys.usb.state={state}"
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -180,8 +263,9 @@ Commands:
   config-check [PATH]
       Parses an ARDA config.toml profile and prints the CLI arguments it resolves to.
 
-  aap-run [CLI overrides...]
-      Loads /data/local/tmp/arda-config.toml and starts the AAP session. Later CLI flags override config values.
+  aap-run [--config PATH] [CLI overrides...]
+      Loads /product/etc/arda/arda-aap.toml when present, otherwise falls back to /data/local/tmp/arda-config.toml. Later CLI flags override config values.
+      Use --usb-reset-on-exit to return the USB data gadget to adb after a USB accessory session ends.
 
   net-status
       Prints AAOS Wi-Fi, IP route, DNS and Android global proxy state.
@@ -2639,6 +2723,7 @@ struct AapTlsHandshakeProbeArgs {
     sensor_wasm_max_commands: usize,
     quiet_ping_logs: bool,
     log_level: String,
+    usb_reset_on_exit: bool,
 }
 
 fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -3180,7 +3265,8 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
     if args.max_frames == 64 {
         args.max_frames = 256;
     }
-    aap::tls_service_discovery_probe(aap::TlsHandshakeProbeConfig {
+    let usb_reset_on_exit = args.usb_reset_on_exit && args.transport == "usb-accessory";
+    let session_result = aap::tls_service_discovery_probe(aap::TlsHandshakeProbeConfig {
         transport: args.transport,
         usb_path: args.usb_path,
         addr: args.addr,
@@ -3261,7 +3347,18 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
-    })?;
+    });
+
+    if usb_reset_on_exit {
+        if let Err(reset_err) = reset_usb_gadget_after_aap_session() {
+            eprintln!("ARDA_AAP_USB_RESET_ON_EXIT=FAIL error={reset_err}");
+            if session_result.is_ok() {
+                return Err(reset_err.into());
+            }
+        }
+    }
+
+    session_result?;
     Ok(())
 }
 
@@ -3385,6 +3482,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut sensor_wasm_max_commands: usize = 16;
     let mut quiet_ping_logs = true;
     let mut log_level = String::from("normal");
+    let mut usb_reset_on_exit = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -3936,6 +4034,12 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 i += 1;
                 sensor_wasm_max_commands = argv.get(i).ok_or("--sensor-wasm-max-commands requires 1..256")?.parse::<usize>()?;
             }
+            "--usb-reset-on-exit" | "--reset-usb-on-exit" => {
+                usb_reset_on_exit = true;
+            }
+            "--no-usb-reset-on-exit" | "--no-reset-usb-on-exit" => {
+                usb_reset_on_exit = false;
+            }
             "--quiet-ping" | "--quiet-ping-logs" | "--no-ping-log" | "--no-ping-logs" => {
                 quiet_ping_logs = true;
             }
@@ -4198,6 +4302,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         sensor_wasm_max_commands,
         quiet_ping_logs,
         log_level,
+        usb_reset_on_exit,
     })
 }
 

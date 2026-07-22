@@ -1,0 +1,22 @@
+service arda_aap_session /system/bin/sh /product/bin/arda-aap-autostart
+    class late_start
+    user root
+    group root system shell bluetooth wifi inet input graphics audio camera
+    seclabel u:r:shell:s0
+    disabled
+    oneshot
+
+# Android USB Gadget HAL normally publishes one of these values when DHU has
+# completed the AOAP switch. Multiple start requests are harmless because init
+# keeps a named service singleton.
+on property:sys.usb.state=accessory
+    start arda_aap_session
+
+on property:sys.usb.state=accessory,adb
+    start arda_aap_session
+
+on property:sys.usb.config=accessory
+    start arda_aap_session
+
+on property:sys.usb.config=accessory,adb
+    start arda_aap_session

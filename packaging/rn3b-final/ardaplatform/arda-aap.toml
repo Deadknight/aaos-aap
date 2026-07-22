@@ -1,0 +1,64 @@
+# ARDA current bring-up baseline.
+#
+# This is intentionally conservative: video + input only. Audio and sensors are
+# disabled until the live USB video path is stable. CLI flags passed after
+# `aap-run` override these values for one-off A/B tests.
+
+[transport]
+mode = "usb-accessory"
+usb_path = "/dev/usb_accessory"
+# Kept for `--transport tcp` debugging only.
+tcp_addr = "0.0.0.0:5277"
+
+[session]
+keys = "/data/local/tmp/arda-certs"
+dump = "none"
+response = "1.7"
+max_frames = 12000
+timeout_ms = 60000
+max_bytes = 4194304
+quiet_ping = true
+log_level = "normal"
+# Return the USB data gadget to adb after DHU disconnect or Ctrl-C. Cable power is untouched.
+usb_reset_on_exit = true
+
+[video]
+native = true
+auto_config = true
+config_policy = "highest"
+bit_rate = 2500000
+frames = 0
+apply_wm_config = true
+wm_size_mode = "stream"
+wm_density_mode = "density"
+fast_start = true
+display_profile = "waveshare-79"
+# Old Android-12 first-frame dirty/kick hack. Keep off with platform screenrecord.
+first_frame_kick = false
+
+[input]
+open = true
+key_binding = true
+inject = true
+# Waveshare 7.9 / 270-degree setup: the platform bridge injects mapped logical
+# display coordinates through the privileged system_ext InputManager bridge.
+# app/uinput/shell remain available for isolated A/B tests.
+inject_mode = "bridge"
+app_move_min_ms = 16
+
+[audio]
+open = false
+stream = "media"
+
+[sensor]
+open = false
+request_all = true
+max_type = 23
+jsonl = "/data/local/tmp/arda-sensors.jsonl"
+forward_vhal = false
+vhal_min_ms = 500
+# Embedded Wasmtime policy by default. External OEM/vehicle policy modules can
+# be selected with a filesystem path while keeping AAP/TLS/SDR in Rust.
+wasm = "builtin"
+wasm_fuel = 50000
+wasm_max_commands = 16

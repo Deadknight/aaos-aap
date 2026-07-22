@@ -249,6 +249,7 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
         "session.max_bytes",
         "session.quiet_ping",
         "session.log_level",
+        "session.usb_reset_on_exit",
         "video.native",
         "video.auto_config",
         "video.config_policy",
@@ -309,6 +310,13 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
     push_value(&values, "session.max_bytes", "--max-bytes", &mut out)?;
     push_bool(&values, "session.quiet_ping", "--quiet-ping", "--log-ping", &mut out)?;
     push_value(&values, "session.log_level", "--log-level", &mut out)?;
+    push_bool(
+        &values,
+        "session.usb_reset_on_exit",
+        "--usb-reset-on-exit",
+        "--no-usb-reset-on-exit",
+        &mut out,
+    )?;
 
     push_bool_one_way(&values, "video.native", "--video-native", &mut out)?;
     push_bool(&values, "video.auto_config", "--video-auto-config", "--no-video-auto-config", &mut out)?;

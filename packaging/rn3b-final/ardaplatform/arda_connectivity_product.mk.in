@@ -8,4 +8,11 @@ PRODUCT_PACKAGES += \
     arda_platform_default_permissions \
     arda_platform_sysconfig \
     arda_rn3b_permission_bootstrap \
-    arda_rn3b_permission_bootstrap_rc
+    arda_rn3b_permission_bootstrap_rc \
+    arda_aap_config
+
+# ARDA_AAP_AUTOSTART_BEGIN
+PRODUCT_PACKAGES += \
+    arda_aap_autostart \
+    arda_aap_autostart_rc
+# ARDA_AAP_AUTOSTART_END

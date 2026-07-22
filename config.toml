@@ -19,6 +19,8 @@ timeout_ms = 60000
 max_bytes = 4194304
 quiet_ping = true
 log_level = "normal"
+# Return the USB data gadget to adb after DHU disconnect or Ctrl-C. Cable power is untouched.
+usb_reset_on_exit = true
 
 [video]
 native = true

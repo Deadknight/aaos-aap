@@ -73,3 +73,30 @@ prebuilt_etc {
     sub_dir: "init",
     product_specific: true,
 }
+
+// ARDA_AAP_BUILD_CONFIG_BEGIN
+prebuilt_etc {
+    name: "arda_aap_config",
+    src: "arda-aap.toml",
+    filename_from_src: true,
+    sub_dir: "arda",
+    product_specific: true,
+}
+// ARDA_AAP_BUILD_CONFIG_END
+
+// ARDA_AAP_AUTOSTART_BEGIN
+sh_binary {
+    name: "arda_aap_autostart",
+    src: "arda-aap-autostart.sh",
+    filename: "arda-aap-autostart",
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "arda_aap_autostart_rc",
+    src: "arda-aap-autostart.rc",
+    filename_from_src: true,
+    sub_dir: "init",
+    product_specific: true,
+}
+// ARDA_AAP_AUTOSTART_END

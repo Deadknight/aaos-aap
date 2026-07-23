@@ -16,6 +16,9 @@ dump = "none"
 response = "1.7"
 max_frames = 12000
 timeout_ms = 60000
+# After media starts, close a stale HU session when no inbound AAP frame is
+# observed for this long. Set 0 to disable.
+host_liveness_timeout_ms = 10000
 max_bytes = 4194304
 quiet_ping = true
 log_level = "normal"

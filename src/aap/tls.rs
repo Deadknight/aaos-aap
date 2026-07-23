@@ -29,8 +29,12 @@ pub struct AapTlsServer {
 
 impl AapTlsServer {
     pub fn new_phone_like(keys_path: &Path) -> io::Result<Self> {
-        let cert_path = keys_path.join("md_cert.pem");
-        let key_path = keys_path.join("md_key.pem");
+        let resolved_keys_path = crate::aap_key_update::resolve_keys_dir(keys_path);
+        let cert_path = resolved_keys_path.join("md_cert.pem");
+        let key_path = resolved_keys_path.join("md_key.pem");
+        if resolved_keys_path != keys_path {
+            println!("ARDA_AAP_KEY_UPDATE_KEYS=ACTIVE path={}", resolved_keys_path.display());
+        }
         let (certs, key) = load_cert_and_key(&cert_path, &key_path)?;
         let cert0 = certs
             .into_iter()

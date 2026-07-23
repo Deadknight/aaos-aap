@@ -147,6 +147,18 @@ fn load_bt_bootstrap_config(path: &Path) -> Result<Vec<String>, Box<dyn std::err
         "connectivity.once",
         "connectivity.keep_bootstrap_rfcomm_open",
         "connectivity.keep_bluetooth_profiles_connected",
+        "aap_key_update.enabled",
+        "aap_key_update.control_url",
+        "aap_key_update.allow_direct_internet",
+        "aap_key_update.check_on_start",
+        "aap_key_update.check_on_direct_ready",
+        "aap_key_update.check_on_proxy_ready",
+        "aap_key_update.check_interval_seconds",
+        "aap_key_update.connect_debounce_seconds",
+        "aap_key_update.retry_interval_seconds",
+        "aap_key_update.download_timeout_seconds",
+        "aap_key_update.max_manifest_bytes",
+        "aap_key_update.max_archive_bytes",
     ]
     .into_iter()
     .collect();
@@ -212,6 +224,84 @@ fn load_bt_bootstrap_config(path: &Path) -> Result<Vec<String>, Box<dyn std::err
         &mut out,
     )?;
 
+    push_bool(
+        &values,
+        "aap_key_update.enabled",
+        "--aap-key-update",
+        "--no-aap-key-update",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.control_url",
+        "--aap-key-control-url",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "aap_key_update.allow_direct_internet",
+        "--aap-key-direct-internet",
+        "--no-aap-key-direct-internet",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "aap_key_update.check_on_start",
+        "--aap-key-check-on-start",
+        "--no-aap-key-check-on-start",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "aap_key_update.check_on_direct_ready",
+        "--aap-key-check-on-direct-ready",
+        "--no-aap-key-check-on-direct-ready",
+        &mut out,
+    )?;
+    push_bool(
+        &values,
+        "aap_key_update.check_on_proxy_ready",
+        "--aap-key-check-on-proxy-ready",
+        "--no-aap-key-check-on-proxy-ready",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.check_interval_seconds",
+        "--aap-key-check-interval-seconds",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.connect_debounce_seconds",
+        "--aap-key-connect-debounce-seconds",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.retry_interval_seconds",
+        "--aap-key-retry-interval-seconds",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.download_timeout_seconds",
+        "--aap-key-download-timeout-seconds",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.max_manifest_bytes",
+        "--aap-key-max-manifest-bytes",
+        &mut out,
+    )?;
+    push_value(
+        &values,
+        "aap_key_update.max_archive_bytes",
+        "--aap-key-max-archive-bytes",
+        &mut out,
+    )?;
+
     Ok(out)
 }
 
@@ -246,6 +336,7 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
         "session.response",
         "session.max_frames",
         "session.timeout_ms",
+        "session.host_liveness_timeout_ms",
         "session.max_bytes",
         "session.quiet_ping",
         "session.log_level",
@@ -307,6 +398,12 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
     push_value(&values, "session.response", "--response", &mut out)?;
     push_value(&values, "session.max_frames", "--max-frames", &mut out)?;
     push_value(&values, "session.timeout_ms", "--timeout-ms", &mut out)?;
+    push_value(
+        &values,
+        "session.host_liveness_timeout_ms",
+        "--host-liveness-timeout-ms",
+        &mut out,
+    )?;
     push_value(&values, "session.max_bytes", "--max-bytes", &mut out)?;
     push_bool(&values, "session.quiet_ping", "--quiet-ping", "--log-ping", &mut out)?;
     push_value(&values, "session.log_level", "--log-level", &mut out)?;

@@ -54,6 +54,7 @@ struct Config {
     once: bool,
     keep_bootstrap_rfcomm_open: bool,
     keep_bluetooth_profiles_connected: bool,
+    aap_key_update: crate::aap_key_update::Config,
 }
 
 #[derive(Debug)]
@@ -112,9 +113,11 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!("ARDA_RN3B_PROXY_ROLE=PHONE_CELLULAR_HTTP_CONNECT_PROXY");
     println!("ARDA_RN3B_DATA_PATH=AAOS_WIFI_TO_PHONE_CELLULAR");
 
+    let key_updater = crate::aap_key_update::Runtime::start(config.aap_key_update.clone());
+
     match config.transport {
-        BridgeTransport::Tcp => run_tcp(&config),
-        BridgeTransport::Unix => run_unix(&config),
+        BridgeTransport::Tcp => run_tcp(&config, key_updater),
+        BridgeTransport::Unix => run_unix(&config, key_updater),
     }
 }
 
@@ -128,6 +131,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
     let mut once = false;
     let mut keep_bootstrap_rfcomm_open = true;
     let mut keep_bluetooth_profiles_connected = true;
+    let mut aap_key_update = crate::aap_key_update::Config::default();
 
     let mut index = 0usize;
     while index < args.len() {
@@ -178,6 +182,73 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                 index += 1;
                 let _ = args.get(index).ok_or("--wifi-handoff-addr requires HOST:PORT")?;
             }
+            "--aap-key-update" => aap_key_update.enabled = true,
+            "--no-aap-key-update" => aap_key_update.enabled = false,
+            "--aap-key-control-url" => {
+                index += 1;
+                aap_key_update.control_url = args
+                    .get(index)
+                    .ok_or("--aap-key-control-url requires HTTPS_URL")?
+                    .clone();
+            }
+            "--aap-key-direct-internet" => aap_key_update.allow_direct_internet = true,
+            "--no-aap-key-direct-internet" => aap_key_update.allow_direct_internet = false,
+            "--aap-key-check-on-start" => aap_key_update.check_on_start = true,
+            "--no-aap-key-check-on-start" => aap_key_update.check_on_start = false,
+            "--aap-key-check-on-direct-ready" => {
+                aap_key_update.check_on_direct_ready = true
+            }
+            "--no-aap-key-check-on-direct-ready" => {
+                aap_key_update.check_on_direct_ready = false
+            }
+            "--aap-key-check-on-proxy-ready" => {
+                aap_key_update.check_on_proxy_ready = true
+            }
+            "--no-aap-key-check-on-proxy-ready" => {
+                aap_key_update.check_on_proxy_ready = false
+            }
+            "--aap-key-check-interval-seconds" => {
+                index += 1;
+                aap_key_update.check_interval_seconds = args
+                    .get(index)
+                    .ok_or("--aap-key-check-interval-seconds requires N")?
+                    .parse()?;
+            }
+            "--aap-key-connect-debounce-seconds" => {
+                index += 1;
+                aap_key_update.connect_debounce_seconds = args
+                    .get(index)
+                    .ok_or("--aap-key-connect-debounce-seconds requires N")?
+                    .parse()?;
+            }
+            "--aap-key-retry-interval-seconds" => {
+                index += 1;
+                aap_key_update.retry_interval_seconds = args
+                    .get(index)
+                    .ok_or("--aap-key-retry-interval-seconds requires N")?
+                    .parse()?;
+            }
+            "--aap-key-download-timeout-seconds" => {
+                index += 1;
+                aap_key_update.download_timeout_seconds = args
+                    .get(index)
+                    .ok_or("--aap-key-download-timeout-seconds requires N")?
+                    .parse()?;
+            }
+            "--aap-key-max-manifest-bytes" => {
+                index += 1;
+                aap_key_update.max_manifest_bytes = args
+                    .get(index)
+                    .ok_or("--aap-key-max-manifest-bytes requires N")?
+                    .parse()?;
+            }
+            "--aap-key-max-archive-bytes" => {
+                index += 1;
+                aap_key_update.max_archive_bytes = args
+                    .get(index)
+                    .ok_or("--aap-key-max-archive-bytes requires N")?
+                    .parse()?;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -206,6 +277,24 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
         .into());
     }
 
+    if aap_key_update.enabled {
+        if !aap_key_update.control_url.starts_with("https://") {
+            return Err("AAP key update control URL must use https://".into());
+        }
+        if aap_key_update.check_interval_seconds == 0
+            || aap_key_update.retry_interval_seconds == 0
+            || aap_key_update.download_timeout_seconds == 0
+        {
+            return Err("AAP key update intervals/timeouts must be greater than zero".into());
+        }
+        if !(1024..=1024 * 1024).contains(&aap_key_update.max_manifest_bytes) {
+            return Err("AAP key manifest size limit must be 1024..1048576 bytes".into());
+        }
+        if !(4096..=64 * 1024 * 1024).contains(&aap_key_update.max_archive_bytes) {
+            return Err("AAP key archive size limit must be 4096..67108864 bytes".into());
+        }
+    }
+
     match transport {
         BridgeTransport::Tcp => {
             if !tcp_addr.ip().is_loopback() {
@@ -231,6 +320,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
         once,
         keep_bootstrap_rfcomm_open,
         keep_bluetooth_profiles_connected,
+        aap_key_update,
     })
 }
 
@@ -254,7 +344,10 @@ as the AAOS global HTTP proxy while RFCOMM remains connected as control/fallback
     );
 }
 
-fn run_tcp(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_tcp(
+    config: &Config,
+    key_updater: Option<crate::aap_key_update::Runtime>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(config.tcp_addr)?;
     println!("ARDA_RN3B_SENDERD_BRIDGE_LISTEN={}", listener.local_addr()?);
     println!("ARDA_RN3B_SENDERD_BRIDGE_LISTEN_GATE=PASS");
@@ -274,6 +367,7 @@ fn run_tcp(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                     &config.bridge_token,
                     config.keep_bootstrap_rfcomm_open,
                     config.keep_bluetooth_profiles_connected,
+                    key_updater.as_ref(),
                 ) {
                     eprintln!("ARDA_RN3B_SENDERD_SESSION_ERROR={err}");
                 }
@@ -287,7 +381,10 @@ fn run_tcp(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_unix(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_unix(
+    config: &Config,
+    key_updater: Option<crate::aap_key_update::Runtime>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (listener, origin) = open_unix_listener(&config.unix_socket)?;
     println!(
         "ARDA_RN3B_SENDERD_BRIDGE_LISTEN={} origin={origin}",
@@ -310,6 +407,7 @@ fn run_unix(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                     &config.bridge_token,
                     config.keep_bootstrap_rfcomm_open,
                     config.keep_bluetooth_profiles_connected,
+                    key_updater.as_ref(),
                 ) {
                     eprintln!("ARDA_RN3B_SENDERD_SESSION_ERROR={err}");
                 }
@@ -349,6 +447,7 @@ fn serve_bridge<S: Read + Write>(
     expected_token: &str,
     keep_bootstrap_rfcomm_open: bool,
     keep_bluetooth_profiles_connected: bool,
+    key_updater: Option<&crate::aap_key_update::Runtime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     authenticate_bridge(stream, expected_token)?;
     println!("ARDA_RN3B_SENDERD_BRIDGE_AUTH=PASS");
@@ -361,6 +460,9 @@ fn serve_bridge<S: Read + Write>(
         let Some(frame) = read_frame(stream)? else {
             if proxy_endpoint.is_some() {
                 clear_android_proxy();
+                if let Some(updater) = key_updater {
+                    updater.proxy_gone();
+                }
                 println!("ARDA_RN3B_REVERSE_PROXY_CLEARED_ON_EOF=PASS");
             }
             println!("ARDA_RN3B_SENDERD_BRIDGE_EOF=YES");
@@ -561,6 +663,9 @@ fn serve_bridge<S: Read + Write>(
                                     eprintln!("ARDA_RN3B_REVERSE_PROXY_GATE=FAIL error={error}");
                                 } else {
                                     proxy_endpoint = Some(endpoint.clone());
+                                    if let Some(updater) = key_updater {
+                                        updater.proxy_ready(endpoint.phone_ip, endpoint.port);
+                                    }
                                     let response = format!(
                                         "{{\"status\":\"ready\",\"proxy\":\"{}:{}\",\"test_url\":\"{}\",\"test_status\":\"{}\",\"connect_test_status\":\"{}\",\"global_proxy_applied\":true}}",
                                         endpoint.phone_ip,
@@ -613,6 +718,9 @@ fn serve_bridge<S: Read + Write>(
             OP_PROXY_STOP => {
                 clear_android_proxy();
                 proxy_endpoint = None;
+                if let Some(updater) = key_updater {
+                    updater.proxy_gone();
+                }
                 write_frame(
                     stream,
                     OP_PROXY_RESULT,
@@ -625,6 +733,9 @@ fn serve_bridge<S: Read + Write>(
                 if proxy_endpoint.is_some() {
                     clear_android_proxy();
                     proxy_endpoint = None;
+                    if let Some(updater) = key_updater {
+                        updater.proxy_gone();
+                    }
                     println!("ARDA_RN3B_REVERSE_PROXY_STOP=PASS");
                 }
                 println!("ARDA_RN3B_SENDERD_SESSION_STOP_RX=YES");

@@ -1,4 +1,5 @@
 mod aap;
+mod aap_key_update;
 mod bluetooth;
 mod capture;
 mod config;
@@ -70,6 +71,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         "aaos-aoa-gadget" | "usb-gadget-aoa" => aaos_aoa_gadget(args.collect()),
         "usb-accessory-status" | "accessory-status" => usb_accessory_status(args.collect()),
         "config-check" => config_check(args.collect()),
+        "aap-key-update" => aap_key_update::run_cli(args.collect()),
         "aap-run" | "run" => {
             let mut argv: Vec<String> = args.collect();
             let has_explicit_config = argv.iter().any(|arg| {
@@ -266,6 +268,10 @@ Commands:
   aap-run [--config PATH] [CLI overrides...]
       Loads /product/etc/arda/arda-aap.toml when present, otherwise falls back to /data/local/tmp/arda-config.toml. Later CLI flags override config values.
       Use --usb-reset-on-exit to return the USB data gadget to adb after a USB accessory session ends.
+      Use --host-liveness-timeout-ms N to close a started media session after N ms without any inbound HU frame; 0 disables the watchdog.
+
+  aap-key-update [--proxy IP:PORT] [--direct|--no-direct] [--control-url HTTPS_URL] [--force]
+      Checks the HTTPS manifest directly over the current AAOS network first, falls back to the phone HTTP/CONNECT proxy when supplied, verifies the archive SHA-256 and cert/key pairing, and atomically stages a new AAP key set.
 
   net-status
       Prints AAOS Wi-Fi, IP route, DNS and Android global proxy state.
@@ -2648,6 +2654,7 @@ struct AapTlsHandshakeProbeArgs {
     addr: String,
     dump: Option<PathBuf>,
     timeout_ms: u64,
+    host_liveness_timeout_ms: u64,
     max_bytes: usize,
     max_frames: usize,
     response_major: u16,
@@ -2809,6 +2816,7 @@ fn aap_tls_handshake_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::
         sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
+        host_liveness_timeout_ms: args.host_liveness_timeout_ms,
     })?;
     Ok(())
 }
@@ -3248,6 +3256,7 @@ fn aap_tls_plain_probe(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
         sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
+        host_liveness_timeout_ms: args.host_liveness_timeout_ms,
     })?;
     Ok(())
 }
@@ -3347,15 +3356,20 @@ fn aap_service_discovery_probe(argv: Vec<String>) -> Result<(), Box<dyn std::err
         sensor_wasm_max_commands: args.sensor_wasm_max_commands,
         quiet_ping_logs: args.quiet_ping_logs,
         log_level: args.log_level.clone(),
+        host_liveness_timeout_ms: args.host_liveness_timeout_ms,
     });
 
-    if usb_reset_on_exit {
+    let peer_session_started = aap::take_peer_session_started();
+
+    if usb_reset_on_exit && peer_session_started {
         if let Err(reset_err) = reset_usb_gadget_after_aap_session() {
             eprintln!("ARDA_AAP_USB_RESET_ON_EXIT=FAIL error={reset_err}");
             if session_result.is_ok() {
                 return Err(reset_err.into());
             }
         }
+    } else if usb_reset_on_exit {
+        println!("ARDA_AAP_USB_RESET_ON_EXIT=SKIP reason=no-valid-version-request");
     }
 
     session_result?;
@@ -3407,6 +3421,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut addr = String::from("0.0.0.0:5277");
     let mut dump = Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log"));
     let mut timeout_ms = 60_000u64;
+    let mut host_liveness_timeout_ms = 0u64;
     let mut max_bytes = 4usize * 1024usize * 1024usize;
     let mut max_frames = 64usize;
     let mut response_major = 1u16;
@@ -4073,6 +4088,16 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
                 i += 1;
                 timeout_ms = argv.get(i).ok_or("--timeout-ms requires value")?.parse::<u64>()?;
             }
+            "--host-liveness-timeout-ms" => {
+                i += 1;
+                host_liveness_timeout_ms = argv
+                    .get(i)
+                    .ok_or("--host-liveness-timeout-ms requires milliseconds; use 0 to disable")?
+                    .parse::<u64>()?;
+            }
+            "--no-host-liveness-timeout" => {
+                host_liveness_timeout_ms = 0;
+            }
             "--max-bytes" => {
                 i += 1;
                 max_bytes = argv.get(i).ok_or("--max-bytes requires value")?.parse::<usize>()?;
@@ -4122,6 +4147,9 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     }
     if timeout_ms == 0 {
         return Err("--timeout-ms must be positive".into());
+    }
+    if host_liveness_timeout_ms > 600_000 {
+        return Err("--host-liveness-timeout-ms must be 0..600000".into());
     }
     if max_bytes == 0 {
         return Err("--max-bytes must be positive".into());
@@ -4227,6 +4255,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
         addr,
         dump,
         timeout_ms,
+        host_liveness_timeout_ms,
         max_bytes,
         max_frames,
         response_major,

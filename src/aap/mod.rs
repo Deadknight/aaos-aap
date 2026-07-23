@@ -25,6 +25,15 @@ use crate::sensor::{ArdaSensorEvent, SensorPipeline, SensorPipelineConfig};
 
 static SESSION_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// True after this process receives a valid AAP MESSAGE_VERSION_REQUEST.
+/// Used by the outer USB cleanup path so an idle receiver timeout does not
+/// reset the USB gadget every minute while no HU is connected.
+static AAP_PEER_SESSION_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn take_peer_session_started() -> bool {
+    AAP_PEER_SESSION_STARTED.swap(false, Ordering::SeqCst)
+}
+
 static SESSION_LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_NORMAL);
 const LOG_QUIET: u8 = 0;
 const LOG_SUMMARY: u8 = 1;
@@ -1257,6 +1266,7 @@ pub struct TlsHandshakeProbeConfig {
     pub addr: String,
     pub dump_path: Option<PathBuf>,
     pub timeout_ms: u64,
+    pub host_liveness_timeout_ms: u64,
     pub max_bytes: usize,
     pub max_frames: usize,
     pub response_major: u16,
@@ -1342,6 +1352,7 @@ impl Default for TlsHandshakeProbeConfig {
             addr: "0.0.0.0:5277".to_string(),
             dump_path: Some(PathBuf::from("/data/local/tmp/arda-aap-tls-handshake.log")),
             timeout_ms: 60_000,
+            host_liveness_timeout_ms: 0,
             max_bytes: 4 * 1024 * 1024,
             max_frames: 64,
             response_major: 1,
@@ -2499,6 +2510,8 @@ fn log_decrypted_payload(
 /// ServiceDiscoveryRequest built through generated protobuf structs. The
 /// request is encrypted in TLS and transmitted as an AA frame with ENCRYPTED set.
 pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
+    AAP_PEER_SESSION_STARTED.store(false, Ordering::SeqCst);
+
     install_session_signal_handlers();
     set_session_log_level(&config.log_level);
     println!("arda aap service discovery probe");
@@ -2509,6 +2522,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         println!("addr={}", config.addr);
     }
     println!("timeout_ms={}", config.timeout_ms);
+    println!(
+        "host_liveness_timeout_ms={}",
+        config.host_liveness_timeout_ms
+    );
     println!("max_bytes={}", config.max_bytes);
     println!("max_frames={}", config.max_frames);
     println!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status);
@@ -2542,6 +2559,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     log_line(&mut dump, &format!("transport={}", config.transport))?;
     log_line(&mut dump, &format!("local={local_label}"))?;
     log_line(&mut dump, &format!("peer={peer}"))?;
+    log_line(
+        &mut dump,
+        &format!(
+            "host_liveness_timeout_ms={}",
+            config.host_liveness_timeout_ms
+        ),
+    )?;
     log_line(&mut dump, &format!("response={}.{} status=0x{:04x}", config.response_major, config.response_minor, config.response_status))?;
     log_line(&mut dump, &format!("keys={}", config.keys_path.display()))?;
     if let Some(path) = &config.video_file_path {
@@ -2633,6 +2657,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
     println!("version request: {}.{}", req_major, req_minor);
     log_line(&mut dump, &format!("version request: {}.{}", req_major, req_minor))?;
+
+    crate::aap_key_update::prepare_aap_attempt();
+    AAP_PEER_SESSION_STARTED.store(true, Ordering::SeqCst);
+    println!("AAP_PEER_SESSION_STARTED=YES version={}.{}", req_major, req_minor);
+    log_line(
+        &mut dump,
+        &format!("AAP_PEER_SESSION_STARTED=YES version={}.{}", req_major, req_minor),
+    )?;
 
     let response_payload = build_version_response(config.response_major, config.response_minor, config.response_status);
     let response_frame = AapFrame {
@@ -2764,9 +2796,12 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     // HU is quiet.  Otherwise live video only advances on incoming ping/focus
     // frames and appears frozen after the first IDR.
     let mut video_pump_timeout_enabled = false;
+    let mut last_hu_activity_at: Option<Instant> = None;
+    let mut cleanup_reason = "session-end";
 
     while frames < config.max_frames {
         if session_shutdown_requested() {
+            cleanup_reason = "signal";
             println!("shutdown requested; stopping AAP session");
             log_line(&mut dump, "shutdown requested; stopping AAP session")?;
             break;
@@ -2775,11 +2810,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         let frame = match reader.read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
+                cleanup_reason = "peer-disconnect";
                 println!("client disconnected after frames={frames} service_request_sent={service_request_sent} bytes={bytes}");
                 log_line(&mut dump, &format!("client disconnected after frames={frames} service_request_sent={service_request_sent} bytes={bytes}"))?;
                 break;
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted && session_shutdown_requested() => {
+                cleanup_reason = "signal";
                 println!("read interrupted by shutdown request; stopping AAP session");
                 log_line(&mut dump, "read interrupted by shutdown request; stopping AAP session")?;
                 break;
@@ -2791,6 +2828,26 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
+                if video_start_sent && config.host_liveness_timeout_ms > 0 {
+                    if let Some(last_activity) = last_hu_activity_at.as_ref() {
+                        let elapsed = last_activity.elapsed();
+                        if elapsed >= Duration::from_millis(config.host_liveness_timeout_ms) {
+                            cleanup_reason = "host-liveness-timeout";
+                            let line = format!(
+                                "AAP_HOST_LIVENESS_TIMEOUT elapsed_ms={} timeout_ms={} frames={} video_start_sent={} video_channel_opened={}",
+                                elapsed.as_millis(),
+                                config.host_liveness_timeout_ms,
+                                frames,
+                                video_start_sent,
+                                video_channel_opened
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+                            break;
+                        }
+                    }
+                }
+
                 let audio_pump_active = (config.audio_test_tone || config.audio_capture) && audio_output_channels.iter().any(|audio| audio.start_sent);
                 if video_start_sent || audio_pump_active {
                     let mut sent_any = 0usize;
@@ -2835,6 +2892,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
                     continue;
                 }
+                cleanup_reason = "read-timeout";
                 println!("read timeout after frames={frames} service_request_sent={service_request_sent} bytes={bytes}");
                 log_line(&mut dump, &format!("read timeout after frames={frames} service_request_sent={service_request_sent} bytes={bytes}"))?;
                 break;
@@ -2843,6 +2901,9 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         };
 
         frames += 1;
+        if video_start_sent {
+            last_hu_activity_at = Some(Instant::now());
+        }
         bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
         let likely_encrypted_ping = config.quiet_ping_logs
             && frame.channel == 0
@@ -2976,6 +3037,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
             }
 
             if !service_request_sent && is_control_message(&plaintext, 0x0004) {
+                crate::aap_key_update::confirm_aap_authenticated();
                 println!("AUTH_COMPLETE observed; sending encrypted ServiceDiscoveryRequest");
                 log_line(&mut dump, "AUTH_COMPLETE observed; sending encrypted ServiceDiscoveryRequest")?;
                 let control_payload = proto::build_service_discovery_request_control_payload(
@@ -4441,6 +4503,15 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     )?;
                     tx_ssl_frames += tx_count;
                     video_start_sent = true;
+                    if config.host_liveness_timeout_ms > 0 {
+                        last_hu_activity_at = Some(Instant::now());
+                        let line = format!(
+                            "AAP_HOST_LIVENESS_ARMED timeout_ms={} source=inbound-frame",
+                            config.host_liveness_timeout_ms
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
                     if let Some(sender) = video_sender.as_mut() {
                         sender.mark_media_start_sent();
                     }
@@ -4553,7 +4624,13 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         }
     }
 
-    let cleanup_reason = if session_shutdown_requested() { "signal" } else { "session-end" };
+    if session_shutdown_requested() {
+        cleanup_reason = "signal";
+    }
+    let notify_peer_during_cleanup = !matches!(
+        cleanup_reason,
+        "host-liveness-timeout" | "peer-disconnect" | "read-timeout"
+    );
     println!("SESSION_CLEANUP begin reason={} video_opened={} input_opened={} audio_channels={} mic_opened={} sensor_opened={}",
         cleanup_reason,
         video_channel_opened,
@@ -4571,6 +4648,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         sensor_channel.as_ref().map(|sensor| sensor.opened).unwrap_or(false)
     ));
 
+    if notify_peer_during_cleanup {
     if let Some(mic) = mic_source_channel.as_mut() {
         if mic.opened && mic.mic_request_sent {
             if let Ok((payload, summary)) = proto::build_microphone_request_payload(false, mic.max_unacked.max(1), false, false) {
@@ -4661,6 +4739,15 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
         }
+    }
+
+    } else {
+        let line = format!(
+            "SESSION_CLEANUP peer notifications skipped reason={}",
+            cleanup_reason
+        );
+        println!("{line}");
+        let _ = log_line(&mut dump, &line);
     }
 
     if let Some(injector) = input_touch_injector.as_mut() {

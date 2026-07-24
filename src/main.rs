@@ -198,7 +198,7 @@ fn print_help() {
 Commands:
   capture-test [--size 1280x720] [--bit-rate 6000000] [--seconds 10] [--codec-name NAME] [--out PATH|-] [--loop]
       Starts Android screenrecord in raw H264 mode and writes Annex-B H264 to PATH or stdout.
-      Default codec: c2.android.avc.encoder. Override with --codec-name or ARDA_SCREENRECORD_CODEC.
+      Default codec: c2.v4l2.avc.encoder. ARDA autostart selects c2.android.avc.encoder when the persistent mapper override is unavailable. Override with --codec-name or ARDA_SCREENRECORD_CODEC.
 
   nal-info FILE [--limit 80]
       Prints NAL types and summary for a raw Annex-B H264 stream.
@@ -321,7 +321,7 @@ Commands:
   native-capture-repeat-test [--runs 3] [--run-ms 1500] [--pause-ms 500] [--size 1280x720] [--bit-rate 6000000] [--fps 30]
       Runs native capture repeatedly, stops each run with SIGTERM, and verifies destroyDisplay / MediaCodec EOS / cleanup markers plus non-empty H264 output. Use this before AAP/DHU tests to catch stale virtual-display teardown.
 
-  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start] [--display-auto|--display-profile waveshare-79] [--wm-rotation none|auto|0|90|180|270] [--dhu-priority|--wm-size-orientation logical|natural]
+  aap-session-probe ... --video-native [--video-config-policy highest|balanced|lowest|resolution:WIDTHxHEIGHT|index:N] [--video-size WIDTHxHEIGHT --video-fps N --video-density DPI] [--apply-wm-config --wm-size-mode stream|content|safe --wm-density-mode density|real --wm-settle-ms 1200|--fast-start] [--display-auto|--display-profile waveshare-79] [--wm-rotation none|auto|0|90|180|270] [--dhu-priority|--wm-size-orientation logical|natural]
       Starts native-capture as an internal child after video START and sends live H264 to the opened video channel.
       Current AAP session: service discovery, video channel open, AV setup/start, ping responses. With --video-file, sends Annex-B H264 after START.
 
@@ -3552,7 +3552,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
             }
             "--video-config-policy" | "--video-policy" => {
                 i += 1;
-                let value = argv.get(i).ok_or("--video-config-policy requires highest|balanced|lowest|index:N")?;
+                let value = argv.get(i).ok_or("--video-config-policy requires highest|balanced|lowest|resolution:WIDTHxHEIGHT|index:N")?;
                 video_config_policy = aap::proto::normalize_video_config_policy(value);
             }
             "--video-config-index" | "--video-index" => {

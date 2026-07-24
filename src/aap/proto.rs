@@ -798,6 +798,7 @@ pub struct MediaSinkSelection {
     pub display_type: String,
     pub video_configs: usize,
     pub first_video_config: Option<String>,
+    pub video_config_selections: Vec<VideoConfigSelection>,
     pub selected_video_config: Option<VideoConfigSelection>,
 }
 
@@ -1044,20 +1045,42 @@ fn make_video_config_selection(index: usize, vc: &VideoConfiguration) -> Option<
 pub fn normalize_video_config_policy(policy: &str) -> String {
     let p = policy.trim();
     if p.is_empty() {
-        return "highest".to_string();
+        return "balanced".to_string();
     }
-    let lower = p.to_ascii_lowercase();
+    let lower = p
+        .to_ascii_lowercase()
+        .replace('×', "x")
+        .replace("video_", "");
     if let Some(rest) = lower.strip_prefix("index:") {
         if rest.parse::<usize>().is_ok() {
             return lower;
         }
     }
+    for prefix in ["resolution:", "size:"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if parse_video_size(rest).is_some() {
+                return format!("resolution:{rest}");
+            }
+        }
+    }
+    if parse_video_size(&lower).is_some() {
+        return format!("resolution:{lower}");
+    }
     match lower.as_str() {
         "highest" | "max" | "best" => "highest".to_string(),
-        "balanced" | "medium" | "mid" => "balanced".to_string(),
+        "balanced" | "medium" | "mid" | "auto" | "compatible" => {
+            "balanced".to_string()
+        }
         "lowest" | "min" | "safe" => "lowest".to_string(),
-        _ => "highest".to_string(),
+        _ => "balanced".to_string(),
     }
+}
+
+fn parse_video_size(value: &str) -> Option<(i32, i32)> {
+    let (width, height) = value.split_once('x')?;
+    let width = width.parse::<i32>().ok()?;
+    let height = height.parse::<i32>().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn select_video_config(configs: &[VideoConfiguration], policy: &str) -> Option<VideoConfigSelection> {
@@ -1077,6 +1100,22 @@ fn select_video_config(configs: &[VideoConfiguration], policy: &str) -> Option<V
                 return Some(found.clone());
             }
         }
+    }
+
+    if let Some(rest) = normalized.strip_prefix("resolution:") {
+        if let Some((width, height)) = parse_video_size(rest) {
+            if let Some(found) = selections
+                .iter()
+                .filter(|selection| selection.width == width && selection.height == height)
+                .max_by_key(|selection| selection.fps)
+            {
+                return Some(found.clone());
+            }
+        }
+        // A forced resolution missing from the HU response falls back to the
+        // highest locally compatible quality rather than accidentally taking
+        // an expensive 1080p/4K profile.
+        return select_video_config(configs, "balanced");
     }
 
     selections.sort_by_key(|s| ((s.width as i64) * (s.height as i64), s.fps as i64));
@@ -1167,7 +1206,14 @@ fn summarize_service_discovery_response_body(
                     .video_configs
                     .first()
                     .map(|vc| video_config_summary(0, vc));
-                let selected_video_config = select_video_config(&sink.video_configs, video_config_policy);
+                let video_config_selections = sink
+                    .video_configs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, vc)| make_video_config_selection(index, vc))
+                    .collect::<Vec<_>>();
+                let selected_video_config =
+                    select_video_config(&sink.video_configs, video_config_policy);
                 video_media_sink = Some(MediaSinkSelection {
                     service_id: svc.id(),
                     available_type: available_type.clone(),
@@ -1175,6 +1221,7 @@ fn summarize_service_discovery_response_body(
                     display_type: display_type.clone(),
                     video_configs: video_count,
                     first_video_config,
+                    video_config_selections,
                     selected_video_config,
                 });
             }

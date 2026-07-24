@@ -3,6 +3,13 @@ set -u
 
 BINARY="/system_ext/bin/arda-connectivityd"
 CONFIG="/product/etc/arda/arda-aap.toml"
+PLATFORM_PACKAGE="com.github.deadknight.ardaplatform.debug"
+VIDEO_OVERRIDE_CONFIG="/data/user_de/0/$PLATFORM_PACKAGE/files/arda-aap-video.toml"
+DEFAULT_VIDEO_POLICY="balanced"
+DEFAULT_VIDEO_CODEC="c2.v4l2.avc.encoder"
+FALLBACK_VIDEO_CODEC="c2.android.avc.encoder"
+CUSTOM_MAPPER="/vendor/lib64/arda/libminigbm_gralloc_gbm_mesa.so"
+ACTIVE_MAPPER="/apex/com.android.hardware.graphics.allocator.minigbm_gbm_mesa/lib64/libminigbm_gralloc_gbm_mesa.so"
 CERT_DIR="/data/local/tmp/arda-certs"
 USB_NODE="/dev/usb_accessory"
 LOG="/data/local/tmp/arda-aap-auto.log"
@@ -64,9 +71,45 @@ if [ ! -e "$USB_NODE" ]; then
     exit 2
 fi
 
-log_marker "ARDA_AAP_AUTOSTART_LAUNCH=YES config=$CONFIG usb_node=$USB_NODE wait_seconds=$wait_seconds"
+video_policy="$DEFAULT_VIDEO_POLICY"
+forced_resolution=""
+if [ -s "$VIDEO_OVERRIDE_CONFIG" ]; then
+    forced_resolution="$(
+        sed -n 's/^[[:space:]]*force_resolution[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+            "$VIDEO_OVERRIDE_CONFIG" | tail -n 1
+    )"
+    auto_policy="$(
+        sed -n 's/^[[:space:]]*auto_policy[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+            "$VIDEO_OVERRIDE_CONFIG" | tail -n 1
+    )"
+    if [ -n "$auto_policy" ]; then
+        video_policy="$auto_policy"
+    fi
+fi
+if [ -n "$forced_resolution" ]; then
+    video_policy="resolution:$forced_resolution"
+fi
 
-"$BINARY" aap-run >> "$LOG" 2>&1
+video_codec_reason="EXPLICIT_ENV"
+if [ -n "${ARDA_SCREENRECORD_CODEC:-}" ]; then
+    video_codec="$ARDA_SCREENRECORD_CODEC"
+else
+    video_codec="$FALLBACK_VIDEO_CODEC"
+    video_codec_reason="CUSTOM_MAPPER_NOT_ACTIVE"
+    if [ -s "$CUSTOM_MAPPER" ] && [ -s "$ACTIVE_MAPPER" ]; then
+        custom_mapper_hash="$(sha256sum "$CUSTOM_MAPPER" | awk '{print $1}')"
+        active_mapper_hash="$(sha256sum "$ACTIVE_MAPPER" | awk '{print $1}')"
+        if [ "$custom_mapper_hash" = "$active_mapper_hash" ]; then
+            video_codec="$DEFAULT_VIDEO_CODEC"
+            video_codec_reason="CUSTOM_MAPPER_ACTIVE"
+        fi
+    fi
+fi
+log_marker "ARDA_AAP_AUTOSTART_LAUNCH=YES config=$CONFIG video_override=$VIDEO_OVERRIDE_CONFIG video_policy=$video_policy video_codec=$video_codec video_codec_reason=$video_codec_reason usb_node=$USB_NODE wait_seconds=$wait_seconds"
+
+ARDA_PLATFORM_PACKAGE="$PLATFORM_PACKAGE" \
+ARDA_SCREENRECORD_CODEC="$video_codec" \
+"$BINARY" aap-run --video-config-policy "$video_policy" >> "$LOG" 2>&1
 rc=$?
 
 log_marker "ARDA_AAP_AUTOSTART_END session=$session_id rc=$rc usb_state=$(getprop sys.usb.state) usb_config=$(getprop sys.usb.config)"

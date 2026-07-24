@@ -16,3 +16,10 @@ PRODUCT_PACKAGES += \
     arda_aap_autostart \
     arda_aap_autostart_rc
 # ARDA_AAP_AUTOSTART_END
+
+# ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_BEGIN
+# The vendor minigbm source and modules are retained for controlled tests.
+# They are intentionally excluded from PRODUCT_PACKAGES because binding a
+# vendor_file-backed library into the allocator APEX during boot caused
+# SurfaceFlinger and mediaswcodec to abort with "gralloc-mapper is missing".
+# ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_END

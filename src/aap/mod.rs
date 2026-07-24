@@ -1363,7 +1363,7 @@ impl Default for TlsHandshakeProbeConfig {
             video_frame_limit: 30,
             video_native: false,
             video_auto_config: true,
-            video_config_policy: "highest".to_string(),
+            video_config_policy: "balanced".to_string(),
             video_apply_wm_config: false,
             video_wm_size_mode: "stream".to_string(),
             video_wm_density_mode: "density".to_string(),
@@ -2509,6 +2509,160 @@ fn log_decrypted_payload(
 /// Runs VERSION + TLS, waits for AUTH_COMPLETE, then sends a phone-like
 /// ServiceDiscoveryRequest built through generated protobuf structs. The
 /// request is encrypted in TLS and transmitted as an AA frame with ENCRYPTED set.
+
+const ARDA_VIDEO_SDR_REPORT_ACTION: &str =
+    "com.github.deadknight.ardaplatform.action.REPORT_VIDEO_SDR";
+const ARDA_VIDEO_SDR_REPORT_RECEIVER: &str =
+    "com.github.deadknight.ardaplatform.ArdaVideoConfigReceiver";
+const ARDA_DEFAULT_PLATFORM_PACKAGE: &str =
+    "com.github.deadknight.ardaplatform.debug";
+
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+fn video_sdr_report_json(
+    video: &proto::MediaSinkSelection,
+    selection_policy: &str,
+) -> String {
+    let selected = video.selected_video_config.as_ref();
+    let configs = video
+        .video_config_selections
+        .iter()
+        .map(|config| {
+            format!(
+                concat!(
+                    "{{\"config_index\":{},\"width\":{},\"height\":{},",
+                    "\"fps\":{},\"density\":{},\"real_density\":{},",
+                    "\"width_margin\":{},\"height_margin\":{},",
+                    "\"margin_left\":{},\"margin_right\":{},",
+                    "\"margin_top\":{},\"margin_bottom\":{},",
+                    "\"content_inset_left\":{},\"content_inset_right\":{},",
+                    "\"content_inset_top\":{},\"content_inset_bottom\":{},",
+                    "\"stable_inset_left\":{},\"stable_inset_right\":{},",
+                    "\"stable_inset_top\":{},\"stable_inset_bottom\":{},",
+                    "\"codec\":\"{}\",\"resolution\":\"{}\"}}"
+                ),
+                config.config_index,
+                config.width,
+                config.height,
+                config.fps,
+                config.density,
+                config.real_density,
+                config.width_margin,
+                config.height_margin,
+                config.margin_left,
+                config.margin_right,
+                config.margin_top,
+                config.margin_bottom,
+                config.content_inset_left,
+                config.content_inset_right,
+                config.content_inset_top,
+                config.content_inset_bottom,
+                config.stable_inset_left,
+                config.stable_inset_right,
+                config.stable_inset_top,
+                config.stable_inset_bottom,
+                json_escape(&config.codec),
+                json_escape(&config.resolution),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        concat!(
+            "{{\"schema\":1,\"service_id\":{},\"display_id\":{},",
+            "\"display_type\":\"{}\",\"selection_policy\":\"{}\",",
+            "\"selected_config_index\":{},\"selected_resolution\":\"{}\",",
+            "\"selected_fps\":{},\"configs\":[{}]}}"
+        ),
+        video.service_id,
+        video.display_id,
+        json_escape(&video.display_type),
+        json_escape(&proto::normalize_video_config_policy(selection_policy)),
+        selected.map(|value| value.config_index as i32).unwrap_or(-1),
+        selected
+            .map(|value| format!("{}x{}", value.width, value.height))
+            .unwrap_or_default(),
+        selected.map(|value| value.fps).unwrap_or(0),
+        configs,
+    )
+}
+
+fn report_video_sdr_to_platform(
+    video: &proto::MediaSinkSelection,
+    selection_policy: &str,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<()> {
+    let package = env::var("ARDA_PLATFORM_PACKAGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ARDA_DEFAULT_PLATFORM_PACKAGE.to_string());
+    let component = format!("{package}/{ARDA_VIDEO_SDR_REPORT_RECEIVER}");
+    let payload = video_sdr_report_json(video, selection_policy);
+    let output = Command::new("/system/bin/am")
+        .args([
+            "broadcast",
+            "--user",
+            "0",
+            "-a",
+            ARDA_VIDEO_SDR_REPORT_ACTION,
+            "-n",
+            &component,
+            "--es",
+            "payload",
+            &payload,
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    let line = if output.status.success() {
+        format!(
+            "VIDEO_PLATFORM_SDR_REPORT=PASS package={} configs={} selected={} output={}",
+            package,
+            video.video_config_selections.len(),
+            video
+                .selected_video_config
+                .as_ref()
+                .map(|value| format!("{}x{}@{}", value.width, value.height, value.fps))
+                .unwrap_or_else(|| "none".to_string()),
+            stdout,
+        )
+    } else {
+        format!(
+            "VIDEO_PLATFORM_SDR_REPORT=FAIL package={} status={} stderr={} stdout={}",
+            package,
+            output.status,
+            stderr,
+            stdout,
+        )
+    };
+    println!("{line}");
+    log_line(dump, &line)?;
+    Ok(())
+}
+
 pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Result<()> {
     AAP_PEER_SESSION_STARTED.store(false, Ordering::SeqCst);
 
@@ -3170,6 +3324,18 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                 video.first_video_config
                             ),
                         )?;
+
+                        if let Err(error) = report_video_sdr_to_platform(
+                            &video,
+                            &config.video_config_policy,
+                            &mut dump,
+                        ) {
+                            let line = format!(
+                                "VIDEO_PLATFORM_SDR_REPORT=FAIL error={error}",
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+                        }
 
                         if config.video_auto_config {
                             if let Some(vc) = video.selected_video_config.as_ref() {

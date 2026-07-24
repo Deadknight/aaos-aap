@@ -1,0 +1,12 @@
+# Manual-only experimental mapper bind.
+#
+# Automatic boot activation is intentionally disabled. The earlier boot bind
+# exposed a vendor_file-backed inode inside the allocator APEX, causing
+# SurfaceFlinger and mediaswcodec to abort with "gralloc-mapper is missing".
+service arda_hw_encoder_mapper_bind /system/bin/sh /vendor/bin/arda-hw-encoder-mapper-bind
+    class late_start
+    user root
+    group root system shell
+    disabled
+    oneshot
+    seclabel u:r:su:s0

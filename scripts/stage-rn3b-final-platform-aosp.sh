@@ -9,7 +9,9 @@ PRODUCT_MK="${PRODUCT_MK:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATE_DIR="$REPO_ROOT/packaging/rn3b-final/ardaplatform"
+HW_TEMPLATE_DIR="$REPO_ROOT/packaging/rn3b-final/hwencoder"
 DEST="$AOSP_ROOT/vendor/arda/ardaplatform"
+HW_DEST="$AOSP_ROOT/vendor/arda/hwencoder/minigbm"
 INHERIT_LINE='$(call inherit-product-if-exists, vendor/arda/ardaplatform/arda_connectivity_product.mk)'
 LEGACY_INHERIT_LINE='$(call inherit-product-if-exists, vendor/arda/ardaplatform/arda_rn3b_product.mk)'
 
@@ -41,8 +43,9 @@ cp "$TEMPLATE_DIR/arda-aap.toml" "$DEST/arda-aap.toml"
 chmod 0644 "$DEST/arda-aap.toml"
 
 # ARDA_AAP_AUTOSTART_STAGE_BEGIN
-cp "$TEMPLATE_DIR/arda-aap-autostart.sh" \
-  "$DEST/arda-aap-autostart.sh"
+sed "s|@PACKAGE@|$PLATFORM_PACKAGE|g" \
+  "$TEMPLATE_DIR/arda-aap-autostart.sh.in" \
+  > "$DEST/arda-aap-autostart.sh"
 chmod 0755 "$DEST/arda-aap-autostart.sh"
 cp "$TEMPLATE_DIR/arda-aap-autostart.rc" \
   "$DEST/arda-aap-autostart.rc"
@@ -74,6 +77,22 @@ sed "s|@PACKAGE@|$PLATFORM_PACKAGE|g" \
 cp "$TEMPLATE_DIR/arda_connectivity_product.mk.in" \
   "$DEST/arda_connectivity_product.mk"
 
+# ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_STAGE_BEGIN
+# Do not copy or activate the mapper-bind helper during normal staging.
+# The source remains under packaging/rn3b-final/hwencoder and
+# vendor/arda/hwencoder/minigbm for controlled, explicit experiments.
+if [[ "${ARDA_ENABLE_EXPERIMENTAL_HW_ENCODER:-0}" == "1" ]]; then
+  [[ -f "$HW_DEST/Android.bp" ]] ||     fail "HW_ENCODER_VENDOR_MODULE_MISSING:$HW_DEST/Android.bp_RUN_V13_FIRST"
+  cp "$HW_TEMPLATE_DIR/arda-hw-encoder-mapper-bind.sh"     "$HW_DEST/arda-hw-encoder-mapper-bind.sh"
+  chmod 0755 "$HW_DEST/arda-hw-encoder-mapper-bind.sh"
+  cp "$HW_TEMPLATE_DIR/arda-hw-encoder-mapper-bind.rc"     "$HW_DEST/arda-hw-encoder-mapper-bind.rc"
+  chmod 0644 "$HW_DEST/arda-hw-encoder-mapper-bind.rc"
+  echo "ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_STAGE=ENABLED_MANUALLY"
+else
+  echo "ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_STAGE=SKIPPED_DEFAULT"
+fi
+# ARDA_RPI4_HW_ENCODER_EXPERIMENTAL_STAGE_END
+
 # Remove files left by earlier RN-3B runtime naming. The protocol/test markers
 # remain RN-3B; only installed runtime names are migrated.
 rm -f \
@@ -84,20 +103,15 @@ rm -f \
   "$DEST/rn3b_wifi.conf"
 
 if grep -Fqx "$LEGACY_INHERIT_LINE" "$PRODUCT_MK"; then
-  tmp="$(mktemp)"
-  grep -Fvx "$LEGACY_INHERIT_LINE" "$PRODUCT_MK" | \
-    grep -Fvx '# ARDA RN-3B final transport core' > "$tmp" || true
-  cat "$tmp" > "$PRODUCT_MK"
-  rm -f "$tmp"
-  echo "ARDA_RN3B_FINAL_LEGACY_PRODUCT_INHERIT=REMOVED file=$PRODUCT_MK"
+  fail "LEGACY_PRODUCT_INHERIT_PRESENT_REFUSE_AOSP_OWNED_EDIT:$PRODUCT_MK"
 fi
 
 if ! grep -Fqx "$INHERIT_LINE" "$PRODUCT_MK"; then
-  printf '\n# ARDA connectivity transport core\n%s\n' "$INHERIT_LINE" >> "$PRODUCT_MK"
-  echo "ARDA_RN3B_FINAL_PRODUCT_INHERIT=ADDED file=$PRODUCT_MK"
-else
-  echo "ARDA_RN3B_FINAL_PRODUCT_INHERIT=ALREADY_PRESENT file=$PRODUCT_MK"
+  fail "VENDOR_PRODUCT_INHERIT_MISSING_REFUSE_AOSP_OWNED_EDIT:$PRODUCT_MK"
 fi
+
+echo "ARDA_RN3B_FINAL_PRODUCT_INHERIT=ALREADY_PRESENT file=$PRODUCT_MK"
+echo "ARDA_RN3B_FINAL_AOSP_OWNED_SOURCE_EDITED=NO"
 
 echo "ARDA_RN3B_FINAL_STAGE=PASS"
 echo "ARDA_RN3B_FINAL_AOSP_DEST=$DEST"
@@ -109,6 +123,8 @@ echo "ARDA_RN3B_FINAL_CONNECTIVITY_SERVICE=arda-connectivityd"
 echo "ARDA_RN3B_FINAL_CONNECTIVITY_BINARY=/system_ext/bin/arda-connectivityd"
 echo "ARDA_RN3B_FINAL_AAP_AUTOSTART=INIT_USB_ACCESSORY_PROPERTY_TRIGGER"
 echo "ARDA_RN3B_FINAL_AAP_CONFIG=/product/etc/arda/arda-aap.toml"
+echo "ARDA_RPI4_HW_ENCODER_PERSIST=DISABLED_APEX_LABEL_UNSAFE"
+echo "ARDA_RPI4_HW_ENCODER_CODEC=EXPERIMENTAL_MANUAL_ONLY"
 echo "ARDA_RN3B_FINAL_SENDERD_BOOT_MODE=INIT_SUPERVISED_TOML"
 echo "ARDA_RN3B_FINAL_SENDERD_CONFIG=/data/user_de/0/$PLATFORM_PACKAGE/files/arda-connectivity.toml"
 echo "ARDA_RN3B_FINAL_NEXT=lunch_aosp_rpi4_car-bp4a-userdebug_then_build_image"

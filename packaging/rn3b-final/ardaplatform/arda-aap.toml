@@ -28,7 +28,7 @@ usb_reset_on_exit = true
 [video]
 native = true
 auto_config = true
-config_policy = "highest"
+config_policy = "balanced"
 bit_rate = 2500000
 frames = 0
 apply_wm_config = true

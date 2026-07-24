@@ -19,7 +19,7 @@ pub fn preferred_codec_name() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "c2.android.avc.encoder".to_string())
+        .unwrap_or_else(|| "c2.v4l2.avc.encoder".to_string())
 }
 
 pub struct ScreenrecordSource {

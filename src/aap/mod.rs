@@ -2953,7 +2953,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut last_hu_activity_at: Option<Instant> = None;
     let mut cleanup_reason = "session-end";
 
-    while frames < config.max_frames {
+    while config.max_frames == 0 || frames < config.max_frames {
         if session_shutdown_requested() {
             cleanup_reason = "signal";
             println!("shutdown requested; stopping AAP session");
@@ -4790,6 +4790,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         }
     }
 
+    if cleanup_reason == "session-end"
+        && config.max_frames > 0
+        && frames >= config.max_frames
+    {
+        cleanup_reason = "max-frames";
+        println!("max_frames reached: {frames}");
+        let _ = log_line(&mut dump, &format!("max_frames reached: {frames}"));
+    }
     if session_shutdown_requested() {
         cleanup_reason = "signal";
     }

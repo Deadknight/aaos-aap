@@ -2,13 +2,18 @@ service arda_aap_session /system/bin/sh /product/bin/arda-aap-autostart
     class late_start
     user root
     group root system shell bluetooth wifi inet input graphics audio camera
-    seclabel u:r:shell:s0
+    seclabel u:r:su:s0
     disabled
-    oneshot
+    restart_period 2
 
-# Android USB Gadget HAL normally publishes one of these values when DHU has
-# completed the AOAP switch. Multiple start requests are harmless because init
-# keeps a named service singleton.
+# Prewarm senderd after Android boot without activating the experimental
+# allocator mapper bind. If its 60-second initial discovery wait expires,
+# init restarts it two seconds later so it remains ready for the first AOAP
+# attachment.
+on property:sys.boot_completed=1
+    start arda_aap_session
+
+# Redundant recovery triggers for later USB gadget transitions.
 on property:sys.usb.state=accessory
     start arda_aap_session
 

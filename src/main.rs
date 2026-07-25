@@ -269,6 +269,7 @@ Commands:
       Loads /product/etc/arda/arda-aap.toml when present, otherwise falls back to /data/local/tmp/arda-config.toml. Later CLI flags override config values.
       Use --usb-reset-on-exit to return the USB data gadget to adb after a USB accessory session ends.
       Use --host-liveness-timeout-ms N to close a started media session after N ms without any inbound HU frame; 0 disables the watchdog.
+      Use --max-frames 0 for an unlimited production session; positive values retain the diagnostic frame-count guard.
 
   aap-key-update [--proxy IP:PORT] [--direct|--no-direct] [--control-url HTTPS_URL] [--force]
       Checks the HTTPS manifest directly over the current AAOS network first, falls back to the phone HTTP/CONNECT proxy when supplied, verifies the archive SHA-256 and cert/key pairing, and atomically stages a new AAP key set.
@@ -4154,9 +4155,8 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     if max_bytes == 0 {
         return Err("--max-bytes must be positive".into());
     }
-    if max_frames == 0 {
-        return Err("--max-frames must be positive".into());
-    }
+    // Production AAP sessions may run indefinitely. A max_frames value of 0
+    // disables only this diagnostic/session frame-count guard.
     if video_native && video_file.is_some() {
         return Err("use either --video-native or --video-file, not both".into());
     }

@@ -5345,6 +5345,47 @@ struct WmSizeInfo {
     override_height: Option<i32>,
 }
 
+const AAP_DENSITY_SCALE_TENTHS_SETTING: &str =
+    "arda_aap_density_scale_tenths";
+const AAP_DENSITY_SCALE_DEFAULT_TENTHS: u32 = 10;
+const AAP_DENSITY_SCALE_MIN_TENTHS: u32 = 1;
+const AAP_DENSITY_SCALE_MAX_TENTHS: u32 = 20;
+const ANDROID_MINIMUM_WM_DENSITY: u32 = 72;
+
+fn read_aap_density_scale_tenths() -> u32 {
+    let output = Command::new("/system/bin/settings")
+        .args([
+            "get",
+            "global",
+            AAP_DENSITY_SCALE_TENTHS_SETTING,
+        ])
+        .output();
+
+    let parsed = output
+        .ok()
+        .filter(|result| result.status.success())
+        .and_then(|result| {
+            String::from_utf8(result.stdout)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .unwrap_or(AAP_DENSITY_SCALE_DEFAULT_TENTHS);
+
+    parsed.clamp(
+        AAP_DENSITY_SCALE_MIN_TENTHS,
+        AAP_DENSITY_SCALE_MAX_TENTHS,
+    )
+}
+
+fn scale_wm_density(base_density: u32, scale_tenths: u32) -> (u32, u32, bool) {
+    let unclamped = (
+        (base_density.max(1) as u64 * scale_tenths as u64 + 5) / 10
+    )
+        .min(u32::MAX as u64) as u32;
+    let effective = unclamped.max(ANDROID_MINIMUM_WM_DENSITY);
+    (unclamped, effective, effective != unclamped)
+}
+
 fn run_text_command(program: &str, args: &[&str]) -> io::Result<String> {
     let out = Command::new(program).args(args).output()?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -5659,11 +5700,24 @@ impl VideoLiveSender {
         Ok(())
     }
 
-    fn wm_density_for_selection(&self, selection: &proto::VideoConfigSelection) -> u32 {
+    fn wm_density_base_for_selection(
+        &self,
+        selection: &proto::VideoConfigSelection,
+    ) -> u32 {
         match self.config.wm_density_mode.as_str() {
             "real" | "real_density" => selection.real_density.max(1),
             _ => selection.density.max(1),
         }
+    }
+
+    fn wm_density_for_selection(
+        &self,
+        selection: &proto::VideoConfigSelection,
+    ) -> u32 {
+        let base_density = self.wm_density_base_for_selection(selection);
+        let scale_tenths = read_aap_density_scale_tenths();
+        let (_, effective, _) = scale_wm_density(base_density, scale_tenths);
+        effective
     }
 
     fn wm_size_for_selection(&self, selection: &proto::VideoConfigSelection) -> (i32, i32, &'static str) {
@@ -5719,19 +5773,33 @@ impl VideoLiveSender {
         }
 
         let (wm_width, wm_height, size_mode) = self.wm_size_for_selection(selection);
-        let wm_density = self.wm_density_for_selection(selection);
+        let wm_density_base = self.wm_density_base_for_selection(selection);
+        let wm_density_scale_tenths = read_aap_density_scale_tenths();
+        let (
+            wm_density_unclamped,
+            wm_density,
+            wm_density_min_clamped,
+        ) = scale_wm_density(
+            wm_density_base,
+            wm_density_scale_tenths,
+        );
         let initial_wm = self.log_display_probe("before", dump)?;
         self.apply_rotation_if_needed(wm_width, wm_height, initial_wm, dump)?;
         let (cmd_w, cmd_h, orientation_mode) = self.wm_command_size_for_target(wm_width, wm_height, initial_wm);
         let line = format!(
-            "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
+            "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density_base={} density_scale={}.{}x density_unclamped={} density={} density_min_clamped={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
             wm_width,
             wm_height,
             cmd_w,
             cmd_h,
             size_mode,
             orientation_mode,
+            wm_density_base,
+            wm_density_scale_tenths / 10,
+            wm_density_scale_tenths % 10,
+            wm_density_unclamped,
             wm_density,
+            wm_density_min_clamped,
             self.config.wm_density_mode,
             self.config.wm_force_geometry,
             selection.width,
@@ -5764,18 +5832,30 @@ impl VideoLiveSender {
             return Ok(());
         }
 
-        let density_arg = self.config.density.max(1).to_string();
+        let density_base = self.config.density.max(1);
+        let density_scale_tenths = read_aap_density_scale_tenths();
+        let (
+            density_unclamped,
+            density_effective,
+            density_min_clamped,
+        ) = scale_wm_density(density_base, density_scale_tenths);
+        let density_arg = density_effective.to_string();
         let initial_wm = self.log_display_probe("before", dump)?;
         self.apply_rotation_if_needed(self.config.width, self.config.height, initial_wm, dump)?;
         let (cmd_w, cmd_h, orientation_mode) = self.wm_command_size_for_target(self.config.width, self.config.height, initial_wm);
         let size_arg = format!("{}x{}", cmd_w, cmd_h);
         let line = format!(
-            "WM_CONFIG applying manual native config: logical_size={}x{} command_size={} size_orientation={} density={} size_mode={} density_mode={} force_geometry={} note=no SDR auto-config applied",
+            "WM_CONFIG applying manual native config: logical_size={}x{} command_size={} size_orientation={} density_base={} density_scale={}.{}x density_unclamped={} density={} density_min_clamped={} size_mode={} density_mode={} force_geometry={} note=no SDR auto-config applied",
             self.config.width,
             self.config.height,
             size_arg,
             orientation_mode,
+            density_base,
+            density_scale_tenths / 10,
+            density_scale_tenths % 10,
+            density_unclamped,
             density_arg,
+            density_min_clamped,
             self.config.wm_size_mode,
             self.config.wm_density_mode,
             self.config.wm_force_geometry

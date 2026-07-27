@@ -33,7 +33,7 @@ bit_rate = 2500000
 frames = 0
 apply_wm_config = true
 wm_size_mode = "content"
-wm_density_mode = "density"
+wm_density_mode = "real_density"
 fast_start = true
 display_profile = "waveshare-79"
 # Old Android-12 first-frame dirty/kick hack. Keep off with platform screenrecord.

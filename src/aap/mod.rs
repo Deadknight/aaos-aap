@@ -1365,7 +1365,7 @@ impl Default for TlsHandshakeProbeConfig {
             video_auto_config: true,
             video_config_policy: "balanced".to_string(),
             video_apply_wm_config: false,
-            video_wm_size_mode: "stream".to_string(),
+            video_wm_size_mode: "content".to_string(),
             video_wm_density_mode: "density".to_string(),
             video_wm_settle_ms: 1200,
             video_start_timing: false,
@@ -2855,6 +2855,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut selected_input_service_id: Option<i32> = None;
     let mut selected_input_source: Option<proto::InputSourceSelection> = None;
     let mut selected_video_config_for_input: Option<proto::VideoConfigSelection> = None;
+    let mut available_video_configs_for_start: Vec<proto::VideoConfigSelection> = Vec::new();
     let mut input_touch_map: Option<InputTouchMap> = None;
     let mut input_touch_injector: Option<TouchInjector> = None;
     let mut input_app_injector: Option<AppProcessInputInjector> = None;
@@ -3303,6 +3304,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if let Some(video) = summary.video_media_sink {
                         selected_video_service_id = Some(video.service_id);
                         selected_video_config_for_input = video.selected_video_config.clone();
+                        available_video_configs_for_start =
+                            video.video_config_selections.clone();
                         println!(
                             "selected video MediaSinkService id={} type={} display_id={} display_type={} video_configs={} first_config={:?}",
                             video.service_id,
@@ -4470,7 +4473,11 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
 
             if let Some(index) = audio_output_channels.iter().position(|audio| audio.opened && audio.setup_sent && !audio.start_sent && audio.channel == frame.channel && (frame.flags & FLAG_CONTROL) == 0) {
                 let session_id = audio_output_channels[index].session_id;
-                if let Some((media_payload, configuration_index, max_unacked, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, session_id)
+                if let Some((media_payload, configuration_index, max_unacked, summary)) = proto::maybe_build_media_start_from_config_payload(
+                    &plaintext,
+                    session_id,
+                    None,
+                )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                 {
                     audio_output_channels[index].max_unacked = max_unacked.max(1);
@@ -4641,9 +4648,89 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 && selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
                 && (frame.flags & FLAG_CONTROL) == 0
             {
-                if let Some((media_payload, configuration_index, max_unacked, summary)) = proto::maybe_build_media_start_from_config_payload(&plaintext, video_session_id)
+                let preferred_configuration_index = selected_video_config_for_input
+                    .as_ref()
+                    .map(|selection| selection.config_index as u32);
+                if let Some((media_payload, configuration_index, max_unacked, summary)) =
+                    proto::maybe_build_media_start_from_config_payload(
+                        &plaintext,
+                        video_session_id,
+                        preferred_configuration_index,
+                    )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                 {
+                    let negotiated_selection = available_video_configs_for_start
+                        .iter()
+                        .find(|selection| selection.config_index as u32 == configuration_index)
+                        .cloned();
+
+                    if !available_video_configs_for_start.is_empty()
+                        && negotiated_selection.is_none()
+                    {
+                        let line = format!(
+                            "VIDEO_CONFIG_NEGOTIATION=FAIL selected_index={} advertised_indices={:?} note=HU returned an index absent from SDR",
+                            configuration_index,
+                            available_video_configs_for_start
+                                .iter()
+                                .map(|selection| selection.config_index)
+                                .collect::<Vec<_>>()
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                        continue;
+                    }
+
+                    if let Some(selection) = negotiated_selection {
+                        let previous_index = selected_video_config_for_input
+                            .as_ref()
+                            .map(|current| current.config_index as u32);
+                        if previous_index != Some(configuration_index) {
+                            let line = format!(
+                                "VIDEO_CONFIG_NEGOTIATION fallback preferred_index={:?} negotiated_index={} stream={}x{} content={}x{} margins=L{} R{} T{} B{}",
+                                previous_index,
+                                configuration_index,
+                                selection.width,
+                                selection.height,
+                                selection.content_width,
+                                selection.content_height,
+                                selection.margin_left,
+                                selection.margin_right,
+                                selection.margin_top,
+                                selection.margin_bottom
+                            );
+                            println!("{line}");
+                            log_line(&mut dump, &line)?;
+
+                            if let Some(sender) = video_sender.as_mut() {
+                                sender.configure_from_sdr(&selection, &mut dump)?;
+                            }
+                            selected_video_config_for_input = Some(selection.clone());
+
+                            if let Some(input) = selected_input_source.as_ref() {
+                                let map = InputTouchMap::from_config(
+                                    &config,
+                                    Some(input),
+                                    selected_video_config_for_input.as_ref(),
+                                );
+                                let line = format!(
+                                    "INPUT_TOUCH_MAP renegotiated source={}x{} target={}x{} mode={} offset={}x{} stream={}x{}",
+                                    map.source_width,
+                                    map.source_height,
+                                    map.target_width,
+                                    map.target_height,
+                                    map.mode.as_str(),
+                                    map.x_offset,
+                                    map.y_offset,
+                                    map.stream_width,
+                                    map.stream_height
+                                );
+                                println!("{line}");
+                                log_line(&mut dump, &line)?;
+                                input_touch_map = Some(map);
+                            }
+                        }
+                    }
+
                     video_max_unacked = max_unacked.max(1);
                     println!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}");
                     log_line(&mut dump, &format!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}"))?;
@@ -5740,6 +5827,37 @@ impl VideoLiveSender {
         );
         println!("{line}");
         log_line(dump, &line)?;
+
+        let (logical_width, logical_height, logical_mode) =
+            self.wm_size_for_selection(selection);
+        let symmetric_horizontal =
+            selection.margin_left == selection.margin_right;
+        let symmetric_vertical =
+            selection.margin_top == selection.margin_bottom;
+        let one_axis_letterbox =
+            (selection.margin_left + selection.margin_right == 0)
+                || (selection.margin_top + selection.margin_bottom == 0);
+        let exact_screenrecord_letterbox =
+            logical_mode == "content"
+                && symmetric_horizontal
+                && symmetric_vertical
+                && one_axis_letterbox;
+        let line = format!(
+            "VIDEO_LETTERBOX_PLAN backend=platform-screenrecord encoder_canvas={}x{} logical_display={}x{} logical_mode={} black=L{} R{} T{} B{} exact_aspect_projection={}",
+            selection.width,
+            selection.height,
+            logical_width,
+            logical_height,
+            logical_mode,
+            selection.margin_left,
+            selection.margin_right,
+            selection.margin_top,
+            selection.margin_bottom,
+            exact_screenrecord_letterbox
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
         self.apply_wm_config_from_sdr(selection, dump)
     }
 
@@ -6322,6 +6440,7 @@ struct InputTouchMap {
     target_height: i32,
     x_offset: i32,
     y_offset: i32,
+    direct_to_target: bool,
     mode: String,
 }
 
@@ -6345,20 +6464,67 @@ impl InputTouchMap {
             _ => "stream",
         };
 
-        let (target_width, target_height, x_offset, y_offset) = match (normalized_mode, video) {
+        let (
+            target_width,
+            target_height,
+            x_offset,
+            y_offset,
+            direct_to_target,
+            mapping_mode,
+        ) = match (normalized_mode, video) {
+            // DHU advertises touchscreen dimensions equal to the encoded
+            // stream, but its emitted coordinates are already local to the
+            // post-margin visible content rectangle. Runtime evidence includes
+            // valid left-edge taps whose x coordinate is smaller than the
+            // advertised left video margin.
+            //
+            // Keep those coordinates unscaled and do not subtract margins.
+            // The normal non-direct map path is identity here because
+            // source==stream; it only clamps into the logical content bounds.
+            ("content", Some(v))
+                if source_width == stream_width
+                    && source_height == stream_height
+                    && (v.margin_left > 0
+                        || v.margin_right > 0
+                        || v.margin_top > 0
+                        || v.margin_bottom > 0) =>
+            {
+                (
+                    v.content_width.max(1),
+                    v.content_height.max(1),
+                    0,
+                    0,
+                    false,
+                    "content-local",
+                )
+            }
+            // Real HUs may expose a separate touchscreen grid whose aspect
+            // ratio already describes the visible content rectangle. Scale
+            // that grid directly into the logical content display.
             ("content", Some(v)) => (
                 v.content_width.max(1),
                 v.content_height.max(1),
-                v.margin_left as i32,
-                v.margin_top as i32,
+                0,
+                0,
+                true,
+                "content-direct",
             ),
             ("safe", Some(v)) => (
                 v.safe_width.max(1),
                 v.safe_height.max(1),
                 v.margin_left as i32 + v.content_inset_left as i32,
                 v.margin_top as i32 + v.content_inset_top as i32,
+                false,
+                "safe-from-stream",
             ),
-            _ => (stream_width, stream_height, 0, 0),
+            _ => (
+                stream_width,
+                stream_height,
+                0,
+                0,
+                true,
+                "stream-direct",
+            ),
         };
 
         Self {
@@ -6370,15 +6536,49 @@ impl InputTouchMap {
             target_height,
             x_offset,
             y_offset,
-            mode: normalized_mode.to_string(),
+            direct_to_target,
+            mode: mapping_mode.to_string(),
         }
     }
 
     fn map(&self, x: u32, y: u32) -> (i32, i32) {
-        let stream_x = scale_coord(x as i64, self.source_width as i64, self.stream_width as i64);
-        let stream_y = scale_coord(y as i64, self.source_height as i64, self.stream_height as i64);
-        let mapped_x = clamp_i32(stream_x - self.x_offset, 0, self.target_width.saturating_sub(1));
-        let mapped_y = clamp_i32(stream_y - self.y_offset, 0, self.target_height.saturating_sub(1));
+        if self.direct_to_target {
+            let mapped_x = scale_coord(
+                x as i64,
+                self.source_width as i64,
+                self.target_width as i64,
+            );
+            let mapped_y = scale_coord(
+                y as i64,
+                self.source_height as i64,
+                self.target_height as i64,
+            );
+            return (
+                clamp_i32(mapped_x, 0, self.target_width.saturating_sub(1)),
+                clamp_i32(mapped_y, 0, self.target_height.saturating_sub(1)),
+            );
+        }
+
+        let stream_x = scale_coord(
+            x as i64,
+            self.source_width as i64,
+            self.stream_width as i64,
+        );
+        let stream_y = scale_coord(
+            y as i64,
+            self.source_height as i64,
+            self.stream_height as i64,
+        );
+        let mapped_x = clamp_i32(
+            stream_x - self.x_offset,
+            0,
+            self.target_width.saturating_sub(1),
+        );
+        let mapped_y = clamp_i32(
+            stream_y - self.y_offset,
+            0,
+            self.target_height.saturating_sub(1),
+        );
         (mapped_x, mapped_y)
     }
 }

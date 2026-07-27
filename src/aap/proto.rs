@@ -591,6 +591,7 @@ pub fn build_audio_pcm_media_setup_payload() -> Result<(Vec<u8>, String), protob
 pub fn maybe_build_media_start_from_config_payload(
     payload: &[u8],
     session_id: i32,
+    preferred_configuration_index: Option<u32>,
 ) -> Result<Option<(Vec<u8>, u32, u32, String)>, protobuf::Error> {
     if payload.len() < 2 {
         return Ok(None);
@@ -605,7 +606,24 @@ pub fn maybe_build_media_start_from_config_payload(
         return Ok(None);
     }
 
-    let configuration_index = cfg.configuration_indices.first().copied().unwrap_or(0);
+    let offered_indices = cfg.configuration_indices.clone();
+    let (configuration_index, decision) = match preferred_configuration_index {
+        Some(preferred) if offered_indices.is_empty() => {
+            (preferred, "preferred-no-hu-index-list")
+        }
+        Some(preferred) if offered_indices.contains(&preferred) => {
+            (preferred, "preferred-accepted")
+        }
+        Some(_) => (
+            offered_indices.first().copied().unwrap_or(0),
+            "fallback-to-hu-first",
+        ),
+        None => (
+            offered_indices.first().copied().unwrap_or(0),
+            "hu-first",
+        ),
+    };
+
     let mut start = Start::new();
     start.set_session_id(session_id);
     start.set_configuration_index(configuration_index);
@@ -614,9 +632,12 @@ pub fn maybe_build_media_start_from_config_payload(
     out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_START.value() as u16).to_be_bytes());
     out.extend_from_slice(&start.write_to_bytes()?);
     let summary = format!(
-        "MEDIA_MESSAGE_START session_id={} configuration_index={} max_unacked={}",
+        "MEDIA_MESSAGE_START session_id={} configuration_index={} preferred_configuration_index={:?} offered_configuration_indices={:?} decision={} max_unacked={}",
         session_id,
         configuration_index,
+        preferred_configuration_index,
+        offered_indices,
+        decision,
         cfg.max_unacked()
     );
     Ok(Some((out, configuration_index, cfg.max_unacked(), summary)))

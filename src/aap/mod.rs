@@ -6520,6 +6520,7 @@ struct InputTouchMap {
     target_height: i32,
     x_offset: i32,
     y_offset: i32,
+    target_local_coordinates: bool,
     direct_to_target: bool,
     mode: String,
 }
@@ -6549,6 +6550,7 @@ impl InputTouchMap {
             target_height,
             x_offset,
             y_offset,
+            target_local_coordinates,
             direct_to_target,
             mapping_mode,
         ) = match (normalized_mode, video) {
@@ -6574,26 +6576,32 @@ impl InputTouchMap {
                     v.content_height.max(1),
                     0,
                     0,
+                    true,
                     false,
-                    "content-local",
+                    "content-local-stream-grid",
                 )
             }
-            // Real HUs may expose a separate touchscreen grid whose aspect
-            // ratio already describes the visible content rectangle. Scale
-            // that grid directly into the logical content display.
+            // Some real HUs advertise a separate nominal touchscreen grid,
+            // while the actual TouchEvent payload is already local to the
+            // logical visible content rectangle. Android Auto preserves the
+            // event coordinates and applies only window/decor offsets; do not
+            // scale the event again merely because the advertised touchscreen
+            // dimensions differ from the video content dimensions.
             ("content", Some(v)) => (
                 v.content_width.max(1),
                 v.content_height.max(1),
                 0,
                 0,
                 true,
-                "content-direct",
+                false,
+                "content-local-advertised-grid",
             ),
             ("safe", Some(v)) => (
                 v.safe_width.max(1),
                 v.safe_height.max(1),
                 v.margin_left as i32 + v.content_inset_left as i32,
                 v.margin_top as i32 + v.content_inset_top as i32,
+                false,
                 false,
                 "safe-from-stream",
             ),
@@ -6602,6 +6610,7 @@ impl InputTouchMap {
                 stream_height,
                 0,
                 0,
+                false,
                 true,
                 "stream-direct",
             ),
@@ -6616,12 +6625,28 @@ impl InputTouchMap {
             target_height,
             x_offset,
             y_offset,
+            target_local_coordinates,
             direct_to_target,
             mode: mapping_mode.to_string(),
         }
     }
 
     fn map(&self, x: u32, y: u32) -> (i32, i32) {
+        if self.target_local_coordinates {
+            return (
+                clamp_i32(
+                    x.min(i32::MAX as u32) as i32,
+                    0,
+                    self.target_width.saturating_sub(1),
+                ),
+                clamp_i32(
+                    y.min(i32::MAX as u32) as i32,
+                    0,
+                    self.target_height.saturating_sub(1),
+                ),
+            );
+        }
+
         if self.direct_to_target {
             let mapped_x = scale_coord(
                 x as i64,

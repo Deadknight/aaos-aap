@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 
 use crate::capture::screenrecord::preferred_codec_name;
 use crate::h264::annexb::{AnnexBStreamParser, NalType};
-use crate::input::{self, AppProcessAudioCapture, AppProcessInputInjector, PlatformInputBridgeInjector, TouchInjectAction, TouchInjector};
+use crate::input::{
+    self, AppProcessAudioCapture, AppProcessInputInjector, MultiTouchInjectAction,
+    MultiTouchPointer, PlatformInputBridgeInjector, TouchInjectAction, TouchInjector,
+};
 use crate::gnss_hal::{
     GnssHalPublishOutcome, PlatformGnssHalBridge, GNSS_HAL_SOCKET_NAME,
 };
@@ -2863,6 +2866,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut input_touch_inject_events = 0usize;
     let mut input_app_move_drop_events = 0usize;
     let mut last_app_move_inject_at: Option<std::time::Instant> = None;
+    let mut primary_touch_sanitizer = PrimaryPointerTouchSanitizer::default();
     let mut input_key_inject_events = 0usize;
     let mut input_channel_open_sent = false;
     let mut input_channel_opened = false;
@@ -2871,6 +2875,15 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let mut video_setup_sent = false;
     let mut video_start_sent = false;
     let mut video_max_unacked: u32 = 1;
+    let mut video_configuration_index: u32 = 0;
+    // Focus defaults to PROJECTED for compatibility with HUs that begin the
+    // AV setup/start flow before sending an explicit focus request.
+    let mut video_focus_mode: i32 = 1;
+    let mut video_output_enabled = true;
+    let mut video_input_enabled = true;
+    let mut video_focus_requests_seen: usize = 0;
+    let mut video_focus_resumes: usize = 0;
+    let mut video_focus_suspends: usize = 0;
     let video_session_id: i32 = 1;
     let mut audio_output_channels: Vec<AudioOutputChannelState> = Vec::new();
     let mut mic_source_channel: Option<MicSourceChannelState> = None;
@@ -2983,7 +2996,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
-                if video_start_sent && config.host_liveness_timeout_ms > 0 {
+                if video_start_sent && video_output_enabled && config.host_liveness_timeout_ms > 0 {
                     if let Some(last_activity) = last_hu_activity_at.as_ref() {
                         let elapsed = last_activity.elapsed();
                         if elapsed >= Duration::from_millis(config.host_liveness_timeout_ms) {
@@ -3006,7 +3019,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 let audio_pump_active = (config.audio_test_tone || config.audio_capture) && audio_output_channels.iter().any(|audio| audio.start_sent);
                 if video_start_sent || audio_pump_active {
                     let mut sent_any = 0usize;
-                    if video_start_sent {
+                    if video_start_sent && video_output_enabled {
                         if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
                             let sent = sender.send_available(
                                 &mut stream,
@@ -3056,7 +3069,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         };
 
         frames += 1;
-        if video_start_sent {
+        if video_start_sent && video_output_enabled {
             last_hu_activity_at = Some(Instant::now());
         }
         bytes += HEADER_LENGTH + frame.payload.len() + if frame.final_length.is_some() { 4 } else { 0 };
@@ -3849,7 +3862,127 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
 
+            // Video focus is display ownership, not connection ownership.
+            // The HU can hide projection while keeping the AAP/TLS session and
+            // every opened channel alive.  NATIVE pauses only the H.264 capture
+            // path; PROJECTED re-arms the same video channel and session.
+            if selected_video_service_id.map(|id| id as u8) == Some(frame.channel)
+                && (frame.flags & FLAG_CONTROL) == 0
+            {
+                if let Some((requested_mode, reason, summary)) =
+                    proto::parse_video_focus_request_payload(&plaintext)
+                {
+                    video_focus_requests_seen += 1;
+                    let previous_mode = video_focus_mode;
+                    let previous_output_enabled = video_output_enabled;
+
+                    // Newer AA documentation says mode 4 is rendered like
+                    // PROJECTED while input focus is tracked separately.
+                    video_output_enabled = matches!(requested_mode, 1 | 3 | 4);
+                    video_input_enabled = requested_mode == 1;
+                    video_focus_mode = requested_mode;
+
+                    let line = format!(
+                        "VIDEO_FOCUS_REQUEST observed count={} {} previous_mode={} output_enabled={} input_enabled={}",
+                        video_focus_requests_seen,
+                        summary,
+                        previous_mode,
+                        video_output_enabled,
+                        video_input_enabled
+                    );
+                    println!("{line}");
+                    log_line(&mut dump, &line)?;
+
+                    // Acknowledge the HU request on the video channel.  Keep the
+                    // requested mode except PROJECTED_NO_INPUT_FOCUS, which the
+                    // phone-side implementation reports as PROJECTED while
+                    // retaining the separate input-focus gate above.
+                    let indicated_mode = if requested_mode == 4 { 1 } else { requested_mode };
+                    let (focus_payload, focus_summary) =
+                        proto::build_video_focus_notification_payload(indicated_mode, false)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let tx_count = write_encrypted_plaintext_fragmented(
+                        &mut stream,
+                        &mut tls,
+                        frame.channel,
+                        &focus_payload,
+                        &mut dump,
+                        "VIDEO_FOCUS_NOTIFICATION",
+                    )?;
+                    tx_ssl_frames += tx_count;
+                    println!(
+                        "tx encrypted {} frame(s): count={} channel=0x{:02x}",
+                        focus_summary, tx_count, frame.channel
+                    );
+                    log_line(
+                        &mut dump,
+                        &format!(
+                            "tx encrypted {} frame(s): count={} channel=0x{:02x}",
+                            focus_summary, tx_count, frame.channel
+                        ),
+                    )?;
+
+                    if previous_output_enabled && !video_output_enabled {
+                        video_focus_suspends += 1;
+                        last_hu_activity_at = None;
+                        if let Some(sender) = video_sender.as_mut() {
+                            sender.suspend_for_video_focus(&mut dump)?;
+                        }
+                        let line = format!(
+                            "VIDEO_FOCUS_OUTPUT_SUSPEND count={} mode={} reason={} action=stop-h264-capture keep_aap_session=true keep_video_channel=true keep_tls=true host_liveness_suspended=true",
+                            video_focus_suspends, requested_mode, reason
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    } else if !previous_output_enabled && video_output_enabled {
+                        video_focus_resumes += 1;
+                        if let Some(sender) = video_sender.as_mut() {
+                            sender.resume_after_video_focus(&mut dump)?;
+                        }
+
+                        if video_start_sent {
+                            let (start_payload, start_summary) = proto::build_media_start_payload(
+                                video_session_id,
+                                video_configuration_index,
+                            )
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            let start_count = write_encrypted_plaintext_fragmented(
+                                &mut stream,
+                                &mut tls,
+                                frame.channel,
+                                &start_payload,
+                                &mut dump,
+                                "VIDEO_FOCUS_RESUME_MEDIA_START",
+                            )?;
+                            tx_ssl_frames += start_count;
+                            if let Some(sender) = video_sender.as_mut() {
+                                sender.mark_media_start_sent();
+                            }
+                            println!(
+                                "VIDEO_FOCUS_RESUME_MEDIA_START tx encrypted {} frame(s): count={} channel=0x{:02x}",
+                                start_summary, start_count, frame.channel
+                            );
+                            log_line(
+                                &mut dump,
+                                &format!(
+                                    "VIDEO_FOCUS_RESUME_MEDIA_START tx encrypted {} frame(s): count={} channel=0x{:02x}",
+                                    start_summary, start_count, frame.channel
+                                ),
+                            )?;
+                        }
+                        last_hu_activity_at = Some(Instant::now());
+                        let line = format!(
+                            "VIDEO_FOCUS_OUTPUT_RESUME count={} mode={} reason={} action=restart-h264-capture resend_media_start={} resend_codec_config=true request_fresh_idr=true keep_same_aap_session=true keep_same_video_channel=true",
+                            video_focus_resumes, requested_mode, reason, video_start_sent
+                        );
+                        println!("{line}");
+                        log_line(&mut dump, &line)?;
+                    }
+                }
+            }
+
             if input_channel_opened
+                && video_input_enabled
                 && selected_input_service_id.map(|id| id as u8) == Some(frame.channel)
                 && (frame.flags & FLAG_CONTROL) == 0
             {
@@ -3867,37 +4000,54 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     if let Some(report) = proto::decode_input_report_payload(&plaintext) {
                         if config.input_inject {
                             if let Some(touch) = report.touch.as_ref() {
-                                if let Some(pointer) = select_touch_pointer(touch) {
-                                    let map = input_touch_map.get_or_insert_with(|| {
-                                        InputTouchMap::from_config(
-                                            &config,
-                                            selected_input_source.as_ref(),
-                                            selected_video_config_for_input.as_ref(),
-                                        )
-                                    });
-                                    let (x, y) = map.map(pointer.x, pointer.y);
-                                    let action = match touch.action {
-                                        proto::DecodedPointerAction::Down | proto::DecodedPointerAction::PointerDown => Some(TouchInjectAction::Down),
-                                        proto::DecodedPointerAction::Moved => Some(TouchInjectAction::Move),
-                                        proto::DecodedPointerAction::Up | proto::DecodedPointerAction::PointerUp => Some(TouchInjectAction::Up),
-                                        proto::DecodedPointerAction::Unknown => None,
-                                    };
+                                if is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                    if let Some(action) =
+                                        multi_touch_action_from_decoded(touch.action)
+                                    {
+                                        let map = input_touch_map.get_or_insert_with(|| {
+                                            InputTouchMap::from_config(
+                                                &config,
+                                                selected_input_source.as_ref(),
+                                                selected_video_config_for_input.as_ref(),
+                                            )
+                                        });
+                                        let mapped_pointers = touch
+                                            .pointers
+                                            .iter()
+                                            .map(|pointer| {
+                                                let (x, y) = map.map(pointer.x, pointer.y);
+                                                MultiTouchPointer {
+                                                    pointer_id: pointer.pointer_id,
+                                                    x,
+                                                    y,
+                                                }
+                                            })
+                                            .collect::<Vec<_>>();
 
-                                    if let Some(action) = action {
-                                        if is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                        if mapped_pointers.is_empty() {
+                                            let line = "INPUT_PLATFORM_MULTITOUCH_DROP reason=no_pointer_data";
+                                            println!("{line}");
+                                            log_line(&mut dump, line)?;
+                                        } else {
                                             if input_bridge_injector.is_none() {
-                                                let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                                let display_id = selected_input_source
+                                                    .as_ref()
+                                                    .map(|input| input.display_id as i32)
+                                                    .unwrap_or(0);
                                                 match PlatformInputBridgeInjector::create(display_id) {
                                                     Ok((injector, report)) => {
                                                         for line in report.lines() {
-                                                            let line = format!("INPUT_PLATFORM_BRIDGE {line}");
+                                                            let line =
+                                                                format!("INPUT_PLATFORM_BRIDGE {line}");
                                                             println!("{line}");
                                                             log_line(&mut dump, &line)?;
                                                         }
                                                         input_bridge_injector = Some(injector);
                                                     }
                                                     Err(err) => {
-                                                        let line = format!("INPUT_PLATFORM_BRIDGE connect failed: {err}");
+                                                        let line = format!(
+                                                            "INPUT_PLATFORM_BRIDGE connect failed: {err}"
+                                                        );
                                                         println!("{line}");
                                                         log_line(&mut dump, &line)?;
                                                     }
@@ -3905,30 +4055,38 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                             }
 
                                             let mut drop_bridge_move = false;
-                                            if matches!(action, TouchInjectAction::Move) && config.input_app_move_min_ms > 0 {
+                                            if matches!(action, MultiTouchInjectAction::Move)
+                                                && config.input_app_move_min_ms > 0
+                                            {
                                                 let now = std::time::Instant::now();
                                                 if let Some(last) = last_app_move_inject_at {
-                                                    if now.duration_since(last).as_millis() < config.input_app_move_min_ms as u128 {
+                                                    if now.duration_since(last).as_millis()
+                                                        < config.input_app_move_min_ms as u128
+                                                    {
                                                         drop_bridge_move = true;
                                                     }
                                                 }
                                                 if !drop_bridge_move {
                                                     last_app_move_inject_at = Some(now);
                                                 }
-                                            } else if !matches!(action, TouchInjectAction::Move) {
+                                            } else {
                                                 last_app_move_inject_at = None;
                                             }
 
                                             if drop_bridge_move {
                                                 input_app_move_drop_events += 1;
-                                                if session_log_enabled(LOG_VERBOSE) && (input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0) {
+                                                if session_log_enabled(LOG_VERBOSE)
+                                                    && (input_app_move_drop_events <= 8
+                                                        || input_app_move_drop_events % 25 == 0)
+                                                {
                                                     let line = format!(
-                                                        "INPUT_PLATFORM_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
-                                                        pointer.x,
-                                                        pointer.y,
-                                                        x,
-                                                        y,
-                                                        pointer.pointer_id,
+                                                        "INPUT_PLATFORM_MULTITOUCH_DROP action=Move action_index={} pointers={} ids={:?} dropped={} min_ms={}",
+                                                        touch.action_index,
+                                                        mapped_pointers.len(),
+                                                        mapped_pointers
+                                                            .iter()
+                                                            .map(|pointer| pointer.pointer_id)
+                                                            .collect::<Vec<_>>(),
                                                         input_app_move_drop_events,
                                                         config.input_app_move_min_ms
                                                     );
@@ -3936,22 +4094,36 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                     log_line(&mut dump, &line)?;
                                                 }
                                             } else {
-                                                let inject_result = match input_bridge_injector.as_mut() {
-                                                    Some(injector) => injector.inject_touch(action, x, y, pointer.pointer_id),
-                                                    None => Err(io::Error::new(io::ErrorKind::NotConnected, "platform input bridge is not available")),
+                                                let result = match input_bridge_injector.as_mut() {
+                                                    Some(injector) => injector.inject_multi_touch(
+                                                        action,
+                                                        touch.action_index,
+                                                        &mapped_pointers,
+                                                    ),
+                                                    None => Err(io::Error::new(
+                                                        io::ErrorKind::NotConnected,
+                                                        "platform input bridge is not available",
+                                                    )),
                                                 };
-                                                match inject_result {
+
+                                                match result {
                                                     Ok(()) => {
                                                         input_touch_inject_events += 1;
-                                                        if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
-                                                            let line = format!(
-                                                                "INPUT_PLATFORM_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                        if session_log_enabled(LOG_VERBOSE)
+                                                            || (!matches!(
                                                                 action,
-                                                                pointer.x,
-                                                                pointer.y,
-                                                                x,
-                                                                y,
-                                                                pointer.pointer_id,
+                                                                MultiTouchInjectAction::Move
+                                                            ) && session_log_enabled(LOG_NORMAL))
+                                                        {
+                                                            let line = format!(
+                                                                "INPUT_PLATFORM_MULTITOUCH_INJECT action={:?} action_index={} pointers={} ids={:?} events={}",
+                                                                action,
+                                                                touch.action_index,
+                                                                mapped_pointers.len(),
+                                                                mapped_pointers
+                                                                    .iter()
+                                                                    .map(|pointer| pointer.pointer_id)
+                                                                    .collect::<Vec<_>>(),
                                                                 input_touch_inject_events
                                                             );
                                                             println!("{line}");
@@ -3960,53 +4132,104 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                     }
                                                     Err(err) => {
                                                         input_bridge_injector = None;
-                                                        let line = format!("INPUT_PLATFORM_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                        let line = format!(
+                                                            "INPUT_PLATFORM_MULTITOUCH_INJECT error action={:?} action_index={} pointers={} ids={:?}: {err}",
+                                                            action,
+                                                            touch.action_index,
+                                                            mapped_pointers.len(),
+                                                            mapped_pointers
+                                                                .iter()
+                                                                .map(|pointer| pointer.pointer_id)
+                                                                .collect::<Vec<_>>()
+                                                        );
                                                         println!("{line}");
                                                         log_line(&mut dump, &line)?;
                                                     }
                                                 }
                                             }
-                                        } else if is_app_process_input_inject_mode(&config.input_inject_mode) {
-                                            if input_app_injector.is_none() {
-                                                let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
-                                                match AppProcessInputInjector::create(display_id) {
-                                                    Ok((injector, report)) => {
-                                                        for line in report.lines() {
-                                                            let line = format!("INPUT_APP_INJECTOR {line}");
+                                        }
+                                    } else {
+                                        let line = format!(
+                                            "INPUT_PLATFORM_MULTITOUCH_DROP action={:?} action_index={} pointers={} reason=unknown_action",
+                                            touch.action,
+                                            touch.action_index,
+                                            touch.pointers.len()
+                                        );
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                    }
+                                } else {
+                                    let sanitized_touch = primary_touch_sanitizer.sanitize(touch);
+                                    if let Some(reason) = sanitized_touch.reason {
+                                        let decision = if sanitized_touch.action.is_some() {
+                                            "inject"
+                                        } else {
+                                            "drop"
+                                        };
+                                        let line = format!(
+                                            "INPUT_PRIMARY_POINTER_SANITIZER decision={} action={:?} action_index={} pointers={} active_primary={:?} reason={}",
+                                            decision,
+                                            touch.action,
+                                            touch.action_index,
+                                            touch.pointers.len(),
+                                            primary_touch_sanitizer.active_pointer_id(),
+                                            reason
+                                        );
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                    }
+                                    if let Some(pointer) = sanitized_touch.pointer.as_ref() {
+                                        let map = input_touch_map.get_or_insert_with(|| {
+                                            InputTouchMap::from_config(
+                                                &config,
+                                                selected_input_source.as_ref(),
+                                                selected_video_config_for_input.as_ref(),
+                                            )
+                                        });
+                                        let (x, y) = map.map(pointer.x, pointer.y);
+                                        let action = sanitized_touch.action;
+
+                                        if let Some(action) = action {
+                                            if is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                                if input_bridge_injector.is_none() {
+                                                    let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                                    match PlatformInputBridgeInjector::create(display_id) {
+                                                        Ok((injector, report)) => {
+                                                            for line in report.lines() {
+                                                                let line = format!("INPUT_PLATFORM_BRIDGE {line}");
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
+                                                            input_bridge_injector = Some(injector);
+                                                        }
+                                                        Err(err) => {
+                                                            let line = format!("INPUT_PLATFORM_BRIDGE connect failed: {err}");
                                                             println!("{line}");
                                                             log_line(&mut dump, &line)?;
                                                         }
-                                                        input_app_injector = Some(injector);
-                                                    }
-                                                    Err(err) => {
-                                                        let line = format!("INPUT_APP_INJECT disabled: failed to start app_process inputd: {err}");
-                                                        println!("{line}");
-                                                        log_line(&mut dump, &line)?;
                                                     }
                                                 }
-                                            }
 
-                                            if let Some(injector) = input_app_injector.as_mut() {
-                                                let mut drop_app_move = false;
+                                                let mut drop_bridge_move = false;
                                                 if matches!(action, TouchInjectAction::Move) && config.input_app_move_min_ms > 0 {
                                                     let now = std::time::Instant::now();
                                                     if let Some(last) = last_app_move_inject_at {
                                                         if now.duration_since(last).as_millis() < config.input_app_move_min_ms as u128 {
-                                                            drop_app_move = true;
+                                                            drop_bridge_move = true;
                                                         }
                                                     }
-                                                    if !drop_app_move {
+                                                    if !drop_bridge_move {
                                                         last_app_move_inject_at = Some(now);
                                                     }
                                                 } else if !matches!(action, TouchInjectAction::Move) {
                                                     last_app_move_inject_at = None;
                                                 }
 
-                                                if drop_app_move {
+                                                if drop_bridge_move {
                                                     input_app_move_drop_events += 1;
                                                     if session_log_enabled(LOG_VERBOSE) && (input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0) {
                                                         let line = format!(
-                                                            "INPUT_APP_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
+                                                            "INPUT_PLATFORM_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
                                                             pointer.x,
                                                             pointer.y,
                                                             x,
@@ -4019,12 +4242,16 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                         log_line(&mut dump, &line)?;
                                                     }
                                                 } else {
-                                                    match injector.inject_touch(action, x, y, pointer.pointer_id) {
+                                                    let inject_result = match input_bridge_injector.as_mut() {
+                                                        Some(injector) => injector.inject_touch(action, x, y, pointer.pointer_id),
+                                                        None => Err(io::Error::new(io::ErrorKind::NotConnected, "platform input bridge is not available")),
+                                                    };
+                                                    match inject_result {
                                                         Ok(()) => {
                                                             input_touch_inject_events += 1;
                                                             if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
                                                                 let line = format!(
-                                                                    "INPUT_APP_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                    "INPUT_PLATFORM_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
                                                                     action,
                                                                     pointer.x,
                                                                     pointer.y,
@@ -4038,64 +4265,99 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                             }
                                                         }
                                                         Err(err) => {
-                                                            let line = format!("INPUT_APP_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                            input_bridge_injector = None;
+                                                            let line = format!("INPUT_PLATFORM_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
                                                             println!("{line}");
                                                             log_line(&mut dump, &line)?;
                                                         }
                                                     }
                                                 }
-                                            }
-                                        } else if is_shell_touch_inject_mode(&config.input_inject_mode) {
-                                            match input::inject_touch_motionevent_shell(action, x, y) {
-                                                Ok(()) => {
-                                                    input_touch_inject_events += 1;
-                                                    if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
-                                                        let line = format!(
-                                                            "INPUT_TOUCH_SHELL_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
-                                                            action,
-                                                            pointer.x,
-                                                            pointer.y,
-                                                            x,
-                                                            y,
-                                                            pointer.pointer_id,
-                                                            input_touch_inject_events
-                                                        );
-                                                        println!("{line}");
-                                                        log_line(&mut dump, &line)?;
-                                                    }
-                                                }
-                                                Err(err) => {
-                                                    let line = format!("INPUT_TOUCH_SHELL_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
-                                                    println!("{line}");
-                                                    log_line(&mut dump, &line)?;
-                                                }
-                                            }
-                                        } else {
-                                            if input_touch_injector.is_none() {
-                                                match TouchInjector::create(map.target_width, map.target_height) {
-                                                    Ok((injector, report)) => {
-                                                        for line in report.lines() {
-                                                            let line = format!("INPUT_TOUCH_INJECTOR {line}");
+                                            } else if is_app_process_input_inject_mode(&config.input_inject_mode) {
+                                                if input_app_injector.is_none() {
+                                                    let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                                    match AppProcessInputInjector::create(display_id) {
+                                                        Ok((injector, report)) => {
+                                                            for line in report.lines() {
+                                                                let line = format!("INPUT_APP_INJECTOR {line}");
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
+                                                            input_app_injector = Some(injector);
+                                                        }
+                                                        Err(err) => {
+                                                            let line = format!("INPUT_APP_INJECT disabled: failed to start app_process inputd: {err}");
                                                             println!("{line}");
                                                             log_line(&mut dump, &line)?;
                                                         }
-                                                        input_touch_injector = Some(injector);
-                                                    }
-                                                    Err(err) => {
-                                                        let line = format!("INPUT_TOUCH_INJECT disabled: failed to create uinput touchscreen: {err}");
-                                                        println!("{line}");
-                                                        log_line(&mut dump, &line)?;
                                                     }
                                                 }
-                                            }
 
-                                            if let Some(injector) = input_touch_injector.as_mut() {
-                                                match injector.inject(action, x, y) {
+                                                if let Some(injector) = input_app_injector.as_mut() {
+                                                    let mut drop_app_move = false;
+                                                    if matches!(action, TouchInjectAction::Move) && config.input_app_move_min_ms > 0 {
+                                                        let now = std::time::Instant::now();
+                                                        if let Some(last) = last_app_move_inject_at {
+                                                            if now.duration_since(last).as_millis() < config.input_app_move_min_ms as u128 {
+                                                                drop_app_move = true;
+                                                            }
+                                                        }
+                                                        if !drop_app_move {
+                                                            last_app_move_inject_at = Some(now);
+                                                        }
+                                                    } else if !matches!(action, TouchInjectAction::Move) {
+                                                        last_app_move_inject_at = None;
+                                                    }
+
+                                                    if drop_app_move {
+                                                        input_app_move_drop_events += 1;
+                                                        if session_log_enabled(LOG_VERBOSE) && (input_app_move_drop_events <= 8 || input_app_move_drop_events % 25 == 0) {
+                                                            let line = format!(
+                                                                "INPUT_APP_TOUCH_DROP action=Move src={},{} mapped={},{} pointer_id={} dropped={} min_ms={}",
+                                                                pointer.x,
+                                                                pointer.y,
+                                                                x,
+                                                                y,
+                                                                pointer.pointer_id,
+                                                                input_app_move_drop_events,
+                                                                config.input_app_move_min_ms
+                                                            );
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                    } else {
+                                                        match injector.inject_touch(action, x, y, pointer.pointer_id) {
+                                                            Ok(()) => {
+                                                                input_touch_inject_events += 1;
+                                                                if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                                    let line = format!(
+                                                                        "INPUT_APP_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                        action,
+                                                                        pointer.x,
+                                                                        pointer.y,
+                                                                        x,
+                                                                        y,
+                                                                        pointer.pointer_id,
+                                                                        input_touch_inject_events
+                                                                    );
+                                                                    println!("{line}");
+                                                                    log_line(&mut dump, &line)?;
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                let line = format!("INPUT_APP_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else if is_shell_touch_inject_mode(&config.input_inject_mode) {
+                                                match input::inject_touch_motionevent_shell(action, x, y) {
                                                     Ok(()) => {
                                                         input_touch_inject_events += 1;
                                                         if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
                                                             let line = format!(
-                                                                "INPUT_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                "INPUT_TOUCH_SHELL_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
                                                                 action,
                                                                 pointer.x,
                                                                 pointer.y,
@@ -4109,18 +4371,63 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                                         }
                                                     }
                                                     Err(err) => {
-                                                        let line = format!("INPUT_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                        let line = format!("INPUT_TOUCH_SHELL_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
                                                         println!("{line}");
                                                         log_line(&mut dump, &line)?;
                                                     }
                                                 }
+                                            } else {
+                                                if input_touch_injector.is_none() {
+                                                    match TouchInjector::create(map.target_width, map.target_height) {
+                                                        Ok((injector, report)) => {
+                                                            for line in report.lines() {
+                                                                let line = format!("INPUT_TOUCH_INJECTOR {line}");
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
+                                                            input_touch_injector = Some(injector);
+                                                        }
+                                                        Err(err) => {
+                                                            let line = format!("INPUT_TOUCH_INJECT disabled: failed to create uinput touchscreen: {err}");
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some(injector) = input_touch_injector.as_mut() {
+                                                    match injector.inject(action, x, y) {
+                                                        Ok(()) => {
+                                                            input_touch_inject_events += 1;
+                                                            if session_log_enabled(LOG_VERBOSE) || (!matches!(action, TouchInjectAction::Move) && session_log_enabled(LOG_NORMAL)) {
+                                                                let line = format!(
+                                                                    "INPUT_TOUCH_INJECT action={:?} src={},{} mapped={},{} pointer_id={} events={}",
+                                                                    action,
+                                                                    pointer.x,
+                                                                    pointer.y,
+                                                                    x,
+                                                                    y,
+                                                                    pointer.pointer_id,
+                                                                    input_touch_inject_events
+                                                                );
+                                                                println!("{line}");
+                                                                log_line(&mut dump, &line)?;
+                                                            }
+                                                        }
+                                                        Err(err) => {
+                                                            let line = format!("INPUT_TOUCH_INJECT error action={:?} mapped={},{}: {err}", action, x, y);
+                                                            println!("{line}");
+                                                            log_line(&mut dump, &line)?;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
+                                    } else if sanitized_touch.reason.is_none() {
+                                        let line = "INPUT_TOUCH_INJECT skipped: touch report has no pointer_data";
+                                        println!("{line}");
+                                        log_line(&mut dump, line)?;
                                     }
-                                } else {
-                                    let line = "INPUT_TOUCH_INJECT skipped: touch report has no pointer_data";
-                                    println!("{line}");
-                                    log_line(&mut dump, line)?;
                                 }
                             }
                         }
@@ -4732,6 +5039,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     }
 
                     video_max_unacked = max_unacked.max(1);
+                    video_configuration_index = configuration_index;
                     println!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}");
                     log_line(&mut dump, &format!("MEDIA_MESSAGE_CONFIG READY observed; sending encrypted {summary}"))?;
                     log_line(&mut dump, &format!("tx MediaStart plaintext bytes={} session_id={} configuration_index={}", media_payload.len(), video_session_id, configuration_index))?;
@@ -4756,7 +5064,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                     )?;
                     tx_ssl_frames += tx_count;
                     video_start_sent = true;
-                    if config.host_liveness_timeout_ms > 0 {
+                    if video_output_enabled && config.host_liveness_timeout_ms > 0 {
                         last_hu_activity_at = Some(Instant::now());
                         let line = format!(
                             "AAP_HOST_LIVENESS_ARMED timeout_ms={} source=inbound-frame",
@@ -4784,16 +5092,18 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                         log_line(&mut dump, line)?;
                     }
 
-                    if let Some(sender) = video_sender.as_mut() {
-                        let sent = sender.send_available(
-                            &mut stream,
-                            &mut tls,
-                            frame.channel,
-                            video_session_id,
-                            video_max_unacked,
-                            &mut dump,
-                        )?;
-                        tx_ssl_frames += sent;
+                    if video_output_enabled {
+                        if let Some(sender) = video_sender.as_mut() {
+                            let sent = sender.send_available(
+                                &mut stream,
+                                &mut tls,
+                                frame.channel,
+                                video_session_id,
+                                video_max_unacked,
+                                &mut dump,
+                            )?;
+                            tx_ssl_frames += sent;
+                        }
                     }
                 }
             }
@@ -4861,7 +5171,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                 }
             }
 
-            if video_start_sent {
+            if video_start_sent && video_output_enabled {
                 if let (Some(sender), Some(video_channel)) = (video_sender.as_mut(), selected_video_service_id.map(|id| id as u8)) {
                     let sent = sender.send_available(
                         &mut stream,
@@ -5042,8 +5352,8 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
     let elapsed = started.elapsed();
     let audio_tx_packets: u64 = audio_output_channels.iter().map(|audio| audio.tx_packets).sum();
     let audio_tx_bytes: u64 = audio_output_channels.iter().map(|audio| audio.tx_bytes).sum();
-    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis());
-    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis()))?;
+    println!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} video_focus_mode={video_focus_mode} video_output_enabled={video_output_enabled} video_input_enabled={video_input_enabled} video_focus_requests_seen={video_focus_requests_seen} video_focus_suspends={video_focus_suspends} video_focus_resumes={video_focus_resumes} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis());
+    log_line(&mut dump, &format!("summary: frames={frames} rx_ssl_frames={rx_ssl_frames} tx_ssl_frames={tx_ssl_frames} encrypted_frames={encrypted_frames} decrypted_frames={decrypted_frames} service_request_sent={service_request_sent} channel_open_sent={channel_open_sent} input_channel_open_sent={input_channel_open_sent} input_channel_opened={input_channel_opened} input_key_binding_sent={input_key_binding_sent} video_channel_opened={video_channel_opened} video_setup_sent={video_setup_sent} video_start_sent={video_start_sent} video_focus_mode={video_focus_mode} video_output_enabled={video_output_enabled} video_input_enabled={video_input_enabled} video_focus_requests_seen={video_focus_requests_seen} video_focus_suspends={video_focus_suspends} video_focus_resumes={video_focus_resumes} selected_video_service_id={selected_video_service_id:?} selected_input_service_id={selected_input_service_id:?} audio_channel_open_requests_sent={audio_channel_open_requests_sent} audio_channels={} audio_data_packets={audio_data_packets} audio_data_bytes={audio_data_bytes} audio_tx_packets={audio_tx_packets} audio_tx_bytes={audio_tx_bytes} mic_channel_open_requests_sent={mic_channel_open_requests_sent} mic_opened={} mic_data_packets={mic_data_packets} mic_data_bytes={mic_data_bytes} sensor_channel_open_requests_sent={sensor_channel_open_requests_sent} sensor_opened={} sensor_requests_sent={sensor_requests_sent} sensor_batches_seen={sensor_batches_seen} sensor_errors_seen={sensor_errors_seen} input_touch_inject_events={input_touch_inject_events} input_key_inject_events={input_key_inject_events} decrypted_bytes={decrypted_bytes} bytes={bytes} elapsed_ms={}", audio_output_channels.len(), mic_source_channel.as_ref().map(|m| m.opened).unwrap_or(false), sensor_channel.as_ref().map(|s| s.opened).unwrap_or(false), elapsed.as_millis()))?;
     Ok(())
 }
 
@@ -5069,6 +5379,37 @@ impl VideoSender {
                 None
             }
             Self::Live(sender) => sender.on_ack(ack_value),
+        }
+    }
+
+    fn suspend_for_video_focus(
+        &mut self,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        match self {
+            Self::File(sender) => {
+                sender.unacked = 0;
+                let line = "VIDEO_FILE focus suspend: clearing stale flow-control window";
+                println!("{line}");
+                log_line(dump, line)
+            }
+            Self::Live(sender) => sender.suspend_for_video_focus(dump),
+        }
+    }
+
+    fn resume_after_video_focus(
+        &mut self,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        match self {
+            Self::File(sender) => {
+                sender.unacked = 0;
+                sender.codec_config_sent = false;
+                let line = "VIDEO_FILE focus resume: codec config re-armed and stale ACK window cleared";
+                println!("{line}");
+                log_line(dump, line)
+            }
+            Self::Live(sender) => sender.resume_after_video_focus(dump),
         }
     }
 
@@ -6153,6 +6494,56 @@ fi
         Ok(())
     }
 
+    fn suspend_for_video_focus(
+        &mut self,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            Self::terminate_screenrecord_capture_child(child, Duration::from_millis(2500));
+        }
+        self.child = None;
+        self.rx = None;
+        self.codec_config.clear();
+        self.codec_config_sent = false;
+        self.no_codec_config_warned = false;
+        self.unacked = 0;
+        self.highest_ack = 0;
+        self.ended = true;
+        self.child_spawned_at = None;
+        self.first_stdout_at = None;
+        self.first_video_data_sent_at = None;
+        self.first_ack_at = None;
+        let line = "VIDEO_NATIVE focus suspend: screenrecord stopped; AAP/TLS/video channel retained";
+        println!("{line}");
+        log_line(dump, line)
+    }
+
+    fn resume_after_video_focus(
+        &mut self,
+        dump: &mut Option<Box<dyn Write>>,
+    ) -> io::Result<()> {
+        // Dropping the receiver makes the old capture-reader thread exit once
+        // it observes the closed channel.  The next send_available call starts
+        // a fresh screenrecord encoder, which emits a fresh SPS/PPS + IDR.
+        self.child = None;
+        self.rx = None;
+        self.codec_config.clear();
+        self.codec_config_sent = false;
+        self.no_codec_config_warned = false;
+        self.unacked = 0;
+        self.highest_ack = 0;
+        self.ended = false;
+        self.media_start_at = Some(Instant::now());
+        self.child_spawned_at = None;
+        self.first_stdout_at = None;
+        self.first_video_data_sent_at = None;
+        self.first_ack_at = None;
+        self.first_frame_restart_count = 0;
+        let line = "VIDEO_NATIVE focus resume: capture re-armed; stale ACK window cleared; SPS/PPS/IDR required";
+        println!("{line}");
+        log_line(dump, line)
+    }
+
     fn ensure_started(&mut self, dump: &mut Option<Box<dyn Write>>) -> io::Result<()> {
         if self.child.is_some() || self.ended {
             return Ok(());
@@ -6688,15 +7079,272 @@ impl InputTouchMap {
     }
 }
 
-fn select_touch_pointer(touch: &proto::DecodedTouchEvent) -> Option<&proto::DecodedPointer> {
-    if touch.pointers.is_empty() {
-        return None;
+#[derive(Debug, Clone, Copy)]
+struct PrimaryPointerState {
+    pointer_id: u32,
+    x: u32,
+    y: u32,
+}
+
+#[derive(Debug, Default)]
+struct PrimaryPointerTouchSanitizer {
+    primary: Option<PrimaryPointerState>,
+}
+
+#[derive(Debug)]
+struct SanitizedTouchSelection {
+    action: Option<TouchInjectAction>,
+    pointer: Option<proto::DecodedPointer>,
+    reason: Option<&'static str>,
+}
+
+impl SanitizedTouchSelection {
+    fn inject(action: TouchInjectAction, pointer: proto::DecodedPointer, reason: Option<&'static str>) -> Self {
+        Self {
+            action: Some(action),
+            pointer: Some(pointer),
+            reason,
+        }
     }
-    touch
-        .pointers
-        .get(touch.action_index as usize)
-        .or_else(|| touch.pointers.iter().find(|p| p.pointer_id == 0))
-        .or_else(|| touch.pointers.first())
+
+    fn drop(reason: &'static str) -> Self {
+        Self {
+            action: None,
+            pointer: None,
+            reason: Some(reason),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            action: None,
+            pointer: None,
+            reason: None,
+        }
+    }
+}
+
+impl PrimaryPointerTouchSanitizer {
+    fn active_pointer_id(&self) -> Option<u32> {
+        self.primary.map(|state| state.pointer_id)
+    }
+
+    fn sanitize(&mut self, touch: &proto::DecodedTouchEvent) -> SanitizedTouchSelection {
+        use proto::DecodedPointerAction;
+
+        match touch.action {
+            DecodedPointerAction::Down => {
+                let Some(pointer) = action_pointer(touch).or_else(|| touch.pointers.first()).cloned() else {
+                    self.primary = None;
+                    return SanitizedTouchSelection::empty();
+                };
+                let reason = self.primary.map(|_| "new_down_replaced_active_primary");
+                self.primary = Some(PrimaryPointerState {
+                    pointer_id: pointer.pointer_id,
+                    x: pointer.x,
+                    y: pointer.y,
+                });
+                SanitizedTouchSelection::inject(TouchInjectAction::Down, pointer, reason)
+            }
+            DecodedPointerAction::PointerDown => {
+                if self.primary.is_some() {
+                    SanitizedTouchSelection::drop("secondary_pointer_down_ignored")
+                } else {
+                    SanitizedTouchSelection::drop("pointer_down_without_primary_ignored")
+                }
+            }
+            DecodedPointerAction::Moved => {
+                let Some(mut primary) = self.primary else {
+                    return SanitizedTouchSelection::drop("move_without_primary_ignored");
+                };
+                if let Some(pointer) = touch
+                    .pointers
+                    .iter()
+                    .find(|pointer| pointer.pointer_id == primary.pointer_id)
+                    .cloned()
+                {
+                    primary.x = pointer.x;
+                    primary.y = pointer.y;
+                    self.primary = Some(primary);
+                    SanitizedTouchSelection::inject(TouchInjectAction::Move, pointer, None)
+                } else {
+                    self.primary = None;
+                    SanitizedTouchSelection::inject(
+                        TouchInjectAction::Up,
+                        proto::DecodedPointer {
+                            x: primary.x,
+                            y: primary.y,
+                            pointer_id: primary.pointer_id,
+                        },
+                        Some("primary_missing_from_move_forced_up"),
+                    )
+                }
+            }
+            DecodedPointerAction::PointerUp => {
+                let Some(primary) = self.primary else {
+                    return SanitizedTouchSelection::drop("pointer_up_without_primary_ignored");
+                };
+                let Some(pointer) = action_pointer(touch).cloned() else {
+                    self.primary = None;
+                    return SanitizedTouchSelection::inject(
+                        TouchInjectAction::Up,
+                        proto::DecodedPointer {
+                            x: primary.x,
+                            y: primary.y,
+                            pointer_id: primary.pointer_id,
+                        },
+                        Some("pointer_up_missing_action_pointer_forced_primary_up"),
+                    );
+                };
+                if pointer.pointer_id == primary.pointer_id {
+                    self.primary = None;
+                    SanitizedTouchSelection::inject(TouchInjectAction::Up, pointer, None)
+                } else {
+                    SanitizedTouchSelection::drop("secondary_pointer_up_ignored")
+                }
+            }
+            DecodedPointerAction::Up => {
+                let Some(primary) = self.primary else {
+                    return SanitizedTouchSelection::drop("up_without_primary_ignored");
+                };
+                let pointer = touch
+                    .pointers
+                    .iter()
+                    .find(|pointer| pointer.pointer_id == primary.pointer_id)
+                    .cloned()
+                    .unwrap_or(proto::DecodedPointer {
+                        x: primary.x,
+                        y: primary.y,
+                        pointer_id: primary.pointer_id,
+                    });
+                self.primary = None;
+                SanitizedTouchSelection::inject(TouchInjectAction::Up, pointer, None)
+            }
+            DecodedPointerAction::Unknown => {
+                SanitizedTouchSelection::drop("unknown_pointer_action_ignored")
+            }
+        }
+    }
+}
+
+fn action_pointer(touch: &proto::DecodedTouchEvent) -> Option<&proto::DecodedPointer> {
+    touch.pointers.get(touch.action_index as usize)
+}
+
+
+#[cfg(test)]
+mod primary_pointer_sanitizer_tests {
+    use super::*;
+
+    fn pointer(pointer_id: u32, x: u32, y: u32) -> proto::DecodedPointer {
+        proto::DecodedPointer { x, y, pointer_id }
+    }
+
+    fn touch(
+        action: proto::DecodedPointerAction,
+        action_index: u32,
+        pointers: Vec<proto::DecodedPointer>,
+    ) -> proto::DecodedTouchEvent {
+        proto::DecodedTouchEvent {
+            action,
+            action_index,
+            pointers,
+        }
+    }
+
+    #[test]
+    fn secondary_pointer_is_ignored_while_primary_continues() {
+        let mut sanitizer = PrimaryPointerTouchSanitizer::default();
+
+        let down = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Down,
+            0,
+            vec![pointer(7, 10, 20)],
+        ));
+        assert!(matches!(down.action, Some(TouchInjectAction::Down)));
+        assert_eq!(down.pointer.as_ref().map(|p| p.pointer_id), Some(7));
+
+        let second_down = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::PointerDown,
+            1,
+            vec![pointer(7, 11, 21), pointer(9, 30, 40)],
+        ));
+        assert!(second_down.action.is_none());
+        assert_eq!(second_down.reason, Some("secondary_pointer_down_ignored"));
+        assert_eq!(sanitizer.active_pointer_id(), Some(7));
+
+        let moved = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Moved,
+            0,
+            vec![pointer(9, 31, 41), pointer(7, 15, 25)],
+        ));
+        assert!(matches!(moved.action, Some(TouchInjectAction::Move)));
+        assert_eq!(moved.pointer.as_ref().map(|p| p.pointer_id), Some(7));
+
+        let second_up = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::PointerUp,
+            0,
+            vec![pointer(9, 31, 41), pointer(7, 15, 25)],
+        ));
+        assert!(second_up.action.is_none());
+        assert_eq!(second_up.reason, Some("secondary_pointer_up_ignored"));
+        assert_eq!(sanitizer.active_pointer_id(), Some(7));
+
+        let up = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Up,
+            0,
+            vec![pointer(7, 16, 26)],
+        ));
+        assert!(matches!(up.action, Some(TouchInjectAction::Up)));
+        assert_eq!(sanitizer.active_pointer_id(), None);
+    }
+
+    #[test]
+    fn lifting_primary_ends_single_pointer_gesture_cleanly() {
+        let mut sanitizer = PrimaryPointerTouchSanitizer::default();
+        let _ = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Down,
+            0,
+            vec![pointer(3, 100, 200)],
+        ));
+
+        let primary_up = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::PointerUp,
+            0,
+            vec![pointer(3, 105, 205), pointer(4, 300, 400)],
+        ));
+        assert!(matches!(primary_up.action, Some(TouchInjectAction::Up)));
+        assert_eq!(primary_up.pointer.as_ref().map(|p| p.pointer_id), Some(3));
+        assert_eq!(sanitizer.active_pointer_id(), None);
+
+        let remaining_move = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Moved,
+            0,
+            vec![pointer(4, 301, 401)],
+        ));
+        assert!(remaining_move.action.is_none());
+        assert_eq!(remaining_move.reason, Some("move_without_primary_ignored"));
+    }
+
+    #[test]
+    fn missing_primary_in_move_forces_up_at_last_known_position() {
+        let mut sanitizer = PrimaryPointerTouchSanitizer::default();
+        let _ = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Down,
+            0,
+            vec![pointer(2, 50, 60)],
+        ));
+
+        let forced_up = sanitizer.sanitize(&touch(
+            proto::DecodedPointerAction::Moved,
+            0,
+            vec![pointer(8, 500, 600)],
+        ));
+        assert!(matches!(forced_up.action, Some(TouchInjectAction::Up)));
+        assert_eq!(forced_up.pointer.as_ref().map(|p| (p.pointer_id, p.x, p.y)), Some((2, 50, 60)));
+        assert_eq!(forced_up.reason, Some("primary_missing_from_move_forced_up"));
+        assert_eq!(sanitizer.active_pointer_id(), None);
+    }
 }
 
 fn scale_coord(value: i64, source_size: i64, target_size: i64) -> i32 {
@@ -6874,6 +7522,19 @@ fn build_ssl_frame(tls_bytes: &[u8]) -> AapFrame {
         flags: FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
         final_length: None,
         payload,
+    }
+}
+
+fn multi_touch_action_from_decoded(
+    action: proto::DecodedPointerAction,
+) -> Option<MultiTouchInjectAction> {
+    match action {
+        proto::DecodedPointerAction::Down => Some(MultiTouchInjectAction::Down),
+        proto::DecodedPointerAction::Moved => Some(MultiTouchInjectAction::Move),
+        proto::DecodedPointerAction::Up => Some(MultiTouchInjectAction::Up),
+        proto::DecodedPointerAction::PointerDown => Some(MultiTouchInjectAction::PointerDown),
+        proto::DecodedPointerAction::PointerUp => Some(MultiTouchInjectAction::PointerUp),
+        proto::DecodedPointerAction::Unknown => None,
     }
 }
 

@@ -12,12 +12,19 @@ import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public final class InputServer {
     private static final int INJECT_INPUT_EVENT_MODE_ASYNC = 0;
     private static final int SOURCE_TOUCHSCREEN = InputDevice.SOURCE_TOUCHSCREEN;
     private static final int SOURCE_KEYBOARD = InputDevice.SOURCE_KEYBOARD;
+    private static final int MAX_POINTERS = 16;
+    private static final float ACTIVE_PRESSURE = 0.8f;
+    private static final float POINTER_SIZE = 0.05f;
 
     private final Object inputManager;
     private final Method injectInputEventMethod;
@@ -25,28 +32,20 @@ public final class InputServer {
     private final int displayId;
 
     private boolean touchActive;
-    private long lastTouchDown;
-    private int lastPointerId;
-    private float lastX;
-    private float lastY;
-
-    // Match Gearhead-style projected touch parameters as closely as possible.
-    // This process still uses framework injection, so keep it conservative:
-    // no synthetic DOWN for stray MOVE, no UP on stale active touch, and no
-    // setDisplayId() call for display 0.
-    private static final float ACTIVE_PRESSURE = 0.8f;
-    private static final float POINTER_SIZE = 0.05f;
+    private long touchDownTime;
+    private List<TouchPoint> lastPointers = new ArrayList<>();
+    private final Set<Integer> activePointerIds = new HashSet<>();
 
     private InputServer(int displayId) throws Exception {
         this.displayId = displayId;
         this.inputManager = createInputManager();
-        Class<?> inputManagerClass = Class.forName("android.hardware.input.InputManager");
-        this.injectInputEventMethod = inputManagerClass.getMethod("injectInputEvent", InputEvent.class, int.class);
+        Class<?> inputManagerClass = inputManager.getClass();
+        this.injectInputEventMethod = inputManagerClass.getMethod(
+                "injectInputEvent", InputEvent.class, int.class);
         Method setDisplayId = null;
         try {
             setDisplayId = InputEvent.class.getMethod("setDisplayId", int.class);
         } catch (NoSuchMethodException ignored) {
-            // Android < 10 or hidden on a vendor build. Display 0 still works.
         }
         this.setDisplayIdMethod = setDisplayId;
     }
@@ -60,7 +59,8 @@ public final class InputServer {
         }
 
         InputServer server = new InputServer(displayId);
-        System.err.println("ARDA_INPUTD ready display=" + displayId);
+        System.err.println("ARDA_INPUTD ready display=" + displayId
+                + " protocol=line-v2-multipointer max_pointers=" + MAX_POINTERS);
         server.loop();
         System.err.println("ARDA_INPUTD stopped");
     }
@@ -70,11 +70,11 @@ public final class InputServer {
         String line;
         while ((line = reader.readLine()) != null) {
             line = line.trim();
-            if (line.length() == 0) {
+            if (line.isEmpty()) {
                 continue;
             }
             if ("STOP".equals(line) || "BYE".equals(line)) {
-                cancelActiveTouch();
+                cancelActiveTouch("client-stop");
                 return;
             }
             if ("PING".equals(line)) {
@@ -83,8 +83,14 @@ public final class InputServer {
 
             String[] p = line.split("\\s+");
             try {
-                if (p.length >= 5 && "T".equals(p[0])) {
-                    injectTouch(p[1], Integer.parseInt(p[2]), Integer.parseInt(p[3]), Integer.parseInt(p[4]));
+                if (p.length >= 4 && "TM".equals(p[0])) {
+                    injectMultiTouchLine(p);
+                } else if (p.length >= 5 && "T".equals(p[0])) {
+                    injectLegacyTouch(
+                            p[1],
+                            Integer.parseInt(p[2]),
+                            Integer.parseInt(p[3]),
+                            Integer.parseInt(p[4]));
                 } else if (p.length >= 2 && "K".equals(p[0])) {
                     injectKeyPress(Integer.parseInt(p[1]));
                 } else {
@@ -92,8 +98,10 @@ public final class InputServer {
                 }
             } catch (Throwable t) {
                 System.err.println("ARDA_INPUTD line failed: " + line + " err=" + t);
+                cancelActiveTouch("malformed-line");
             }
         }
+        cancelActiveTouch("stdin-eof");
     }
 
     private static Object createInputManager() throws Exception {
@@ -106,7 +114,6 @@ public final class InputServer {
                 return manager;
             }
         } catch (Throwable ignored) {
-            // Some builds do not expose getInstance(). Try a system Context.
         }
 
         Context context = createSystemContext();
@@ -151,11 +158,11 @@ public final class InputServer {
                 try {
                     setDisplayIdMethod.invoke(event, displayId);
                 } catch (Throwable t) {
-                    // Do not fail injection on old/vendor builds where displayId is not supported.
                     System.err.println("ARDA_INPUTD setDisplayId failed: " + t);
                 }
             }
-            Object result = injectInputEventMethod.invoke(inputManager, event, INJECT_INPUT_EVENT_MODE_ASYNC);
+            Object result = injectInputEventMethod.invoke(
+                    inputManager, event, INJECT_INPUT_EVENT_MODE_ASYNC);
             return Boolean.TRUE.equals(result);
         } catch (Throwable t) {
             System.err.println("ARDA_INPUTD inject failed: " + t);
@@ -167,75 +174,209 @@ public final class InputServer {
         }
     }
 
-    private void injectTouch(String actionWord, int x, int y, int pointerId) {
-        String action = actionWord.toUpperCase(Locale.US);
+    private void injectMultiTouchLine(String[] p) {
+        MultiAction action = MultiAction.parse(p[1]);
+        int actionIndex = Integer.parseInt(p[2]);
+        int pointerCount = Integer.parseInt(p[3]);
+        if (pointerCount < 1 || pointerCount > MAX_POINTERS) {
+            throw new IllegalArgumentException("pointerCount=" + pointerCount);
+        }
+        if (p.length != 4 + pointerCount * 3) {
+            throw new IllegalArgumentException(
+                    "token count=" + p.length + " expected=" + (4 + pointerCount * 3));
+        }
+
+        List<TouchPoint> pointers = new ArrayList<>(pointerCount);
+        Set<Integer> ids = new HashSet<>();
+        int offset = 4;
+        for (int i = 0; i < pointerCount; i++) {
+            int pointerId = Integer.parseInt(p[offset++]);
+            float x = Integer.parseInt(p[offset++]);
+            float y = Integer.parseInt(p[offset++]);
+            if (pointerId < 0 || pointerId > 31) {
+                throw new IllegalArgumentException("pointerId=" + pointerId);
+            }
+            if (!ids.add(pointerId)) {
+                throw new IllegalArgumentException("duplicate pointerId=" + pointerId);
+            }
+            pointers.add(new TouchPoint(pointerId, x, y));
+        }
+
+        injectMultiTouch(action, actionIndex, pointers);
+    }
+
+    private void injectMultiTouch(
+            MultiAction action,
+            int actionIndex,
+            List<TouchPoint> pointers) {
         long now = SystemClock.uptimeMillis();
-        int motionAction;
-        float pressure;
+        validateTransition(action, actionIndex, pointers);
 
-        if ("DOWN".equals(action) || "D".equals(action)) {
-            // Do not turn an old active touch into a real click. If the previous
-            // gesture was interrupted, cancel it and start clean.
-            cancelActiveTouch();
+        if (action == MultiAction.DOWN) {
+            cancelActiveTouch("new-down");
             touchActive = true;
-            lastTouchDown = now;
-            lastPointerId = pointerId;
-            motionAction = MotionEvent.ACTION_DOWN;
-            pressure = ACTIVE_PRESSURE;
-        } else if ("MOVE".equals(action) || "M".equals(action)) {
-            // Gearhead receives a well-formed AAP gesture stream. If we receive
-            // a stray MOVE after reconnect/crash, do not synthesize DOWN; that
-            // was one source of stale focus/input corruption.
-            if (!touchActive) {
-                System.err.println("ARDA_INPUTD ignored MOVE without active DOWN x=" + x + " y=" + y);
-                return;
-            }
-            motionAction = MotionEvent.ACTION_MOVE;
-            pressure = ACTIVE_PRESSURE;
-        } else if ("UP".equals(action) || "U".equals(action)) {
-            if (!touchActive) {
-                return;
-            }
-            motionAction = MotionEvent.ACTION_UP;
-            pressure = 0.0f;
-        } else {
-            System.err.println("ARDA_INPUTD unknown touch action: " + actionWord);
-            return;
+            touchDownTime = now;
         }
 
-        lastX = x;
-        lastY = y;
-
-        boolean ok = injectMotion(motionAction, lastTouchDown, now, pointerId, x, y, pressure);
+        int motionAction = action.toMotionAction(actionIndex);
+        boolean ok = injectMotion(motionAction, touchDownTime, now, pointers, action, actionIndex);
         if (!ok) {
-            System.err.println("ARDA_INPUTD touch failed action=" + action + " x=" + x + " y=" + y + " pointer=" + pointerId);
+            System.err.println("ARDA_INPUTD MULTITOUCH inject failed action=" + action
+                    + " index=" + actionIndex + " count=" + pointers.size());
         }
 
-        if (motionAction == MotionEvent.ACTION_UP) {
-            touchActive = false;
+        updateActivePointersAfter(action, actionIndex, pointers);
+        System.err.println("ARDA_INPUTD MULTITOUCH action=" + action
+                + " index=" + actionIndex
+                + " count=" + pointers.size()
+                + " active_after=" + activePointerIds.size()
+                + " ok=" + ok);
+    }
+
+    private void validateTransition(
+            MultiAction action,
+            int actionIndex,
+            List<TouchPoint> pointers) {
+        int count = pointers.size();
+        if (action.requiresActionIndex()
+                && (actionIndex < 0 || actionIndex >= count)) {
+            throw new IllegalArgumentException(
+                    "actionIndex=" + actionIndex + " count=" + count);
+        }
+
+        Set<Integer> eventIds = pointerIdSet(pointers);
+        switch (action) {
+            case DOWN:
+                if (count != 1 || actionIndex != 0) {
+                    throw new IllegalArgumentException("DOWN requires one pointer at index 0");
+                }
+                break;
+            case POINTER_DOWN:
+                if (!touchActive) {
+                    throw new IllegalStateException("POINTER_DOWN without active gesture");
+                }
+                if (count != activePointerIds.size() + 1) {
+                    throw new IllegalArgumentException(
+                            "POINTER_DOWN count=" + count
+                                    + " active=" + activePointerIds.size());
+                }
+                Set<Integer> expectedDownBase = new HashSet<>(eventIds);
+                expectedDownBase.remove(pointers.get(actionIndex).id);
+                if (!expectedDownBase.equals(activePointerIds)) {
+                    throw new IllegalArgumentException(
+                            "POINTER_DOWN active id mismatch event=" + eventIds
+                                    + " active=" + activePointerIds);
+                }
+                break;
+            case MOVE:
+                if (!touchActive) {
+                    throw new IllegalStateException("MOVE without active gesture");
+                }
+                if (!eventIds.equals(activePointerIds)) {
+                    throw new IllegalArgumentException(
+                            "MOVE active id mismatch event=" + eventIds
+                                    + " active=" + activePointerIds);
+                }
+                break;
+            case POINTER_UP:
+                if (!touchActive) {
+                    throw new IllegalStateException("POINTER_UP without active gesture");
+                }
+                if (count < 2 || !eventIds.equals(activePointerIds)) {
+                    throw new IllegalArgumentException(
+                            "POINTER_UP id mismatch event=" + eventIds
+                                    + " active=" + activePointerIds);
+                }
+                break;
+            case UP:
+                if (!touchActive) {
+                    throw new IllegalStateException("UP without active gesture");
+                }
+                if (count != 1 || actionIndex != 0
+                        || !eventIds.equals(activePointerIds)) {
+                    throw new IllegalArgumentException(
+                            "UP id mismatch event=" + eventIds
+                                    + " active=" + activePointerIds);
+                }
+                break;
+            case CANCEL:
+                if (!touchActive) {
+                    throw new IllegalStateException("CANCEL without active gesture");
+                }
+                break;
         }
     }
 
-    private boolean injectMotion(int motionAction, long downTime, long eventTime, int pointerId, float x, float y, float pressure) {
-        MotionEvent.PointerProperties[] properties = new MotionEvent.PointerProperties[1];
-        MotionEvent.PointerProperties property = new MotionEvent.PointerProperties();
-        property.id = pointerId;
-        property.toolType = MotionEvent.TOOL_TYPE_FINGER;
-        properties[0] = property;
+    private void updateActivePointersAfter(
+            MultiAction action,
+            int actionIndex,
+            List<TouchPoint> pointers) {
+        switch (action) {
+            case DOWN:
+            case POINTER_DOWN:
+            case MOVE:
+                activePointerIds.clear();
+                activePointerIds.addAll(pointerIdSet(pointers));
+                lastPointers = copyPointers(pointers);
+                break;
+            case POINTER_UP:
+                int liftedId = pointers.get(actionIndex).id;
+                activePointerIds.clear();
+                lastPointers = new ArrayList<>();
+                for (TouchPoint pointer : pointers) {
+                    if (pointer.id != liftedId) {
+                        activePointerIds.add(pointer.id);
+                        lastPointers.add(pointer);
+                    }
+                }
+                touchActive = !activePointerIds.isEmpty();
+                break;
+            case UP:
+            case CANCEL:
+                touchActive = false;
+                activePointerIds.clear();
+                lastPointers.clear();
+                break;
+        }
+    }
 
-        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
-        MotionEvent.PointerCoords coord = new MotionEvent.PointerCoords();
-        coord.x = x;
-        coord.y = y;
-        coord.pressure = pressure;
-        coord.size = POINTER_SIZE;
-        coords[0] = coord;
+    private boolean injectMotion(
+            int motionAction,
+            long downTime,
+            long eventTime,
+            List<TouchPoint> pointers,
+            MultiAction action,
+            int actionIndex) {
+        int count = pointers.size();
+        MotionEvent.PointerProperties[] properties =
+                new MotionEvent.PointerProperties[count];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[count];
+
+        for (int i = 0; i < count; i++) {
+            TouchPoint point = pointers.get(i);
+
+            MotionEvent.PointerProperties property =
+                    new MotionEvent.PointerProperties();
+            property.id = point.id;
+            property.toolType = MotionEvent.TOOL_TYPE_FINGER;
+            properties[i] = property;
+
+            MotionEvent.PointerCoords coord = new MotionEvent.PointerCoords();
+            coord.x = point.x;
+            coord.y = point.y;
+            boolean lifted = (action == MultiAction.UP)
+                    || (action == MultiAction.POINTER_UP && i == actionIndex)
+                    || action == MultiAction.CANCEL;
+            coord.pressure = lifted ? 0.0f : ACTIVE_PRESSURE;
+            coord.size = POINTER_SIZE;
+            coords[i] = coord;
+        }
 
         MotionEvent event = MotionEvent.obtain(
                 downTime,
                 eventTime,
                 motionAction,
-                1,
+                count,
                 properties,
                 coords,
                 0,
@@ -249,23 +390,130 @@ public final class InputServer {
         return inject(event);
     }
 
-    private void cancelActiveTouch() {
-        if (!touchActive) {
+    private void injectLegacyTouch(String actionWord, int x, int y, int pointerId) {
+        String action = actionWord.toUpperCase(Locale.US);
+        if ("DOWN".equals(action) || "D".equals(action)) {
+            injectMultiTouch(
+                    MultiAction.DOWN,
+                    0,
+                    onePointer(pointerId, x, y));
+        } else if ("MOVE".equals(action) || "M".equals(action)) {
+            injectMultiTouch(
+                    MultiAction.MOVE,
+                    0,
+                    onePointer(pointerId, x, y));
+        } else if ("UP".equals(action) || "U".equals(action)) {
+            injectMultiTouch(
+                    MultiAction.UP,
+                    0,
+                    onePointer(pointerId, x, y));
+        } else {
+            throw new IllegalArgumentException("unknown legacy touch action=" + actionWord);
+        }
+    }
+
+    private void cancelActiveTouch(String reason) {
+        if (!touchActive || lastPointers.isEmpty()) {
+            touchActive = false;
+            activePointerIds.clear();
+            lastPointers.clear();
             return;
         }
         long now = SystemClock.uptimeMillis();
-        injectMotion(MotionEvent.ACTION_CANCEL, lastTouchDown, now, lastPointerId, lastX, lastY, 0.0f);
+        boolean ok = injectMotion(
+                MotionEvent.ACTION_CANCEL,
+                touchDownTime,
+                now,
+                lastPointers,
+                MultiAction.CANCEL,
+                0);
+        System.err.println("ARDA_INPUTD MULTITOUCH action=CANCEL reason=" + reason
+                + " count=" + lastPointers.size() + " ok=" + ok);
         touchActive = false;
+        activePointerIds.clear();
+        lastPointers.clear();
+    }
+
+    private static List<TouchPoint> onePointer(int id, int x, int y) {
+        List<TouchPoint> result = new ArrayList<>(1);
+        result.add(new TouchPoint(id, x, y));
+        return result;
+    }
+
+    private static List<TouchPoint> copyPointers(List<TouchPoint> pointers) {
+        return new ArrayList<>(pointers);
+    }
+
+    private static Set<Integer> pointerIdSet(List<TouchPoint> pointers) {
+        Set<Integer> result = new HashSet<>();
+        for (TouchPoint pointer : pointers) {
+            result.add(pointer.id);
+        }
+        return result;
     }
 
     private void injectKeyPress(int keyCode) {
         long now = SystemClock.uptimeMillis();
-        KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, 0, -1, 0, 0, SOURCE_KEYBOARD);
-        KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, 0, -1, 0, 0, SOURCE_KEYBOARD);
+        KeyEvent down = new KeyEvent(
+                now, now, KeyEvent.ACTION_DOWN, keyCode, 0, 0,
+                -1, 0, 0, SOURCE_KEYBOARD);
+        KeyEvent up = new KeyEvent(
+                now, now, KeyEvent.ACTION_UP, keyCode, 0, 0,
+                -1, 0, 0, SOURCE_KEYBOARD);
         boolean okDown = inject(down);
         boolean okUp = inject(up);
         if (!(okDown && okUp)) {
             System.err.println("ARDA_INPUTD key failed keycode=" + keyCode);
+        }
+    }
+
+    private enum MultiAction {
+        DOWN,
+        MOVE,
+        UP,
+        POINTER_DOWN,
+        POINTER_UP,
+        CANCEL;
+
+        static MultiAction parse(String value) {
+            return MultiAction.valueOf(value.toUpperCase(Locale.US));
+        }
+
+        boolean requiresActionIndex() {
+            return this != MOVE && this != CANCEL;
+        }
+
+        int toMotionAction(int actionIndex) {
+            switch (this) {
+                case DOWN:
+                    return MotionEvent.ACTION_DOWN;
+                case MOVE:
+                    return MotionEvent.ACTION_MOVE;
+                case UP:
+                    return MotionEvent.ACTION_UP;
+                case POINTER_DOWN:
+                    return MotionEvent.ACTION_POINTER_DOWN
+                            | (actionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                case POINTER_UP:
+                    return MotionEvent.ACTION_POINTER_UP
+                            | (actionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                case CANCEL:
+                    return MotionEvent.ACTION_CANCEL;
+                default:
+                    throw new AssertionError(this);
+            }
+        }
+    }
+
+    private static final class TouchPoint {
+        final int id;
+        final float x;
+        final float y;
+
+        TouchPoint(int id, float x, float y) {
+            this.id = id;
+            this.x = x;
+            this.y = y;
         }
     }
 }

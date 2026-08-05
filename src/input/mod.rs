@@ -141,6 +141,123 @@ impl TouchInjectAction {
     }
 }
 
+/// Full Android MotionEvent action for the framework/platform bridge.
+///
+/// This is deliberately separate from `TouchInjectAction`, which remains the
+/// compatibility action set for shell/uinput/single-pointer fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiTouchInjectAction {
+    Down,
+    Move,
+    Up,
+    PointerDown,
+    PointerUp,
+    Cancel,
+}
+
+impl MultiTouchInjectAction {
+    fn bridge_word(self) -> &'static str {
+        match self {
+            MultiTouchInjectAction::Down => "DOWN",
+            MultiTouchInjectAction::Move => "MOVE",
+            MultiTouchInjectAction::Up => "UP",
+            MultiTouchInjectAction::PointerDown => "POINTER_DOWN",
+            MultiTouchInjectAction::PointerUp => "POINTER_UP",
+            MultiTouchInjectAction::Cancel => "CANCEL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiTouchPointer {
+    pub pointer_id: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+const MAX_FRAMEWORK_TOUCH_POINTERS: usize = 16;
+
+fn validate_multi_touch_event(
+    action: MultiTouchInjectAction,
+    action_index: u32,
+    pointers: &[MultiTouchPointer],
+) -> io::Result<()> {
+    if pointers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "multi-touch event has no pointers",
+        ));
+    }
+    if pointers.len() > MAX_FRAMEWORK_TOUCH_POINTERS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "multi-touch pointer count {} exceeds limit {}",
+                pointers.len(),
+                MAX_FRAMEWORK_TOUCH_POINTERS
+            ),
+        ));
+    }
+    if action_index as usize >= pointers.len()
+        && !matches!(action, MultiTouchInjectAction::Move | MultiTouchInjectAction::Cancel)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "multi-touch action index {} is outside pointer count {}",
+                action_index,
+                pointers.len()
+            ),
+        ));
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    for pointer in pointers {
+        if pointer.pointer_id > 31 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Android MotionEvent pointer id {} exceeds 31",
+                    pointer.pointer_id
+                ),
+            ));
+        }
+        if !ids.insert(pointer.pointer_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate multi-touch pointer id {}", pointer.pointer_id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_multi_touch_line(
+    action: MultiTouchInjectAction,
+    action_index: u32,
+    pointers: &[MultiTouchPointer],
+) -> io::Result<String> {
+    validate_multi_touch_event(action, action_index, pointers)?;
+    let mut line = format!(
+        "TM {} {} {}",
+        action.bridge_word(),
+        action_index,
+        pointers.len()
+    );
+    for pointer in pointers {
+        use std::fmt::Write as _;
+        write!(
+            &mut line,
+            " {} {} {}",
+            pointer.pointer_id,
+            pointer.x,
+            pointer.y
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to format multi-touch line"))?;
+    }
+    Ok(line)
+}
+
 const INPUTD_JAR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arda_inputd.jar"));
 const INPUTD_JAR_PATH: &str = "/data/local/tmp/arda-inputd.jar";
 const PLATFORM_INPUT_BRIDGE_SOCKET_NAME: &str = "arda_input_bridge";
@@ -153,7 +270,8 @@ const PLATFORM_INPUT_BRIDGE_SOCKET_NAME: &str = "arda_input_bridge";
 /// mapped AAP input reports over a root-authenticated abstract UNIX-domain socket line protocol:
 ///
 ///   DISPLAY <id>
-///   T DOWN|MOVE|UP <x> <y> <pointer_id>
+///   TM <action> <action_index> <count> <pointer_id> <x> <y> ...
+///   T DOWN|MOVE|UP <x> <y> <pointer_id>   (legacy compatibility)
 ///   K <android_keycode>
 ///   STOP
 pub struct PlatformInputBridgeInjector {
@@ -249,7 +367,7 @@ impl PlatformInputBridgeInjector {
         report.push_str("transport=unix-abstract\n");
         report.push_str("peer_auth=SO_PEERCRED/root-uid\n");
         report.push_str(&format!("display_id={}\n", display_id));
-        report.push_str("protocol=line-v1\n");
+        report.push_str("protocol=line-v2-multipointer\n");
 
         Ok((injector, report))
     }
@@ -297,6 +415,16 @@ impl PlatformInputBridgeInjector {
             y,
             pointer_id
         ))
+    }
+
+    pub fn inject_multi_touch(
+        &mut self,
+        action: MultiTouchInjectAction,
+        action_index: u32,
+        pointers: &[MultiTouchPointer],
+    ) -> io::Result<()> {
+        let line = build_multi_touch_line(action, action_index, pointers)?;
+        self.send_line(&line)
     }
 
     pub fn inject_key_press(&mut self, keycode: u32) -> io::Result<()> {
@@ -405,6 +533,20 @@ impl AppProcessInputInjector {
             io::Error::new(io::ErrorKind::BrokenPipe, "app_process inputd stdin is closed")
         })?;
         writeln!(stdin, "T {} {} {} {}", action.shell_word(), x, y, pointer_id)?;
+        stdin.flush()
+    }
+
+    pub fn inject_multi_touch(
+        &mut self,
+        action: MultiTouchInjectAction,
+        action_index: u32,
+        pointers: &[MultiTouchPointer],
+    ) -> io::Result<()> {
+        let line = build_multi_touch_line(action, action_index, pointers)?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "app_process inputd stdin is closed")
+        })?;
+        writeln!(stdin, "{line}")?;
         stdin.flush()
     }
 
@@ -1096,3 +1238,119 @@ fn write_struct<T>(file: &mut File, value: &T) -> io::Result<()> {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     file.write_all(bytes)
 }
+
+#[cfg(test)]
+mod multi_touch_protocol_tests {
+    use super::{
+        build_multi_touch_line, MultiTouchInjectAction, MultiTouchPointer,
+        MAX_FRAMEWORK_TOUCH_POINTERS,
+    };
+
+    #[test]
+    fn encodes_three_pointer_move_without_collapsing_ids() {
+        let pointers = [
+            MultiTouchPointer {
+                pointer_id: 2,
+                x: 100,
+                y: 200,
+            },
+            MultiTouchPointer {
+                pointer_id: 7,
+                x: 300,
+                y: 400,
+            },
+            MultiTouchPointer {
+                pointer_id: 11,
+                x: 500,
+                y: 600,
+            },
+        ];
+        let line = build_multi_touch_line(
+            MultiTouchInjectAction::Move,
+            0,
+            &pointers,
+        )
+        .expect("three-pointer MOVE should encode");
+        assert_eq!(
+            line,
+            "TM MOVE 0 3 2 100 200 7 300 400 11 500 600"
+        );
+    }
+
+    #[test]
+    fn preserves_pointer_down_action_index_for_fourth_pointer() {
+        let pointers = [
+            MultiTouchPointer {
+                pointer_id: 0,
+                x: 10,
+                y: 20,
+            },
+            MultiTouchPointer {
+                pointer_id: 3,
+                x: 30,
+                y: 40,
+            },
+            MultiTouchPointer {
+                pointer_id: 5,
+                x: 50,
+                y: 60,
+            },
+            MultiTouchPointer {
+                pointer_id: 9,
+                x: 70,
+                y: 80,
+            },
+        ];
+        let line = build_multi_touch_line(
+            MultiTouchInjectAction::PointerDown,
+            3,
+            &pointers,
+        )
+        .expect("four-pointer POINTER_DOWN should encode");
+        assert!(line.starts_with("TM POINTER_DOWN 3 4 "));
+    }
+
+    #[test]
+    fn rejects_duplicate_pointer_ids() {
+        let pointers = [
+            MultiTouchPointer {
+                pointer_id: 1,
+                x: 10,
+                y: 20,
+            },
+            MultiTouchPointer {
+                pointer_id: 1,
+                x: 30,
+                y: 40,
+            },
+        ];
+        assert!(
+            build_multi_touch_line(
+                MultiTouchInjectAction::PointerDown,
+                1,
+                &pointers,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_framework_pointer_limit() {
+        let pointers = (0..=MAX_FRAMEWORK_TOUCH_POINTERS)
+            .map(|index| MultiTouchPointer {
+                pointer_id: index as u32,
+                x: index as i32,
+                y: index as i32,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            build_multi_touch_line(
+                MultiTouchInjectAction::Move,
+                0,
+                &pointers,
+            )
+            .is_err()
+        );
+    }
+}
+

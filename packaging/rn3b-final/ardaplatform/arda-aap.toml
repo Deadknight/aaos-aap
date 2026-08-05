@@ -54,11 +54,18 @@ open = false
 stream = "media"
 
 [sensor]
-open = false
+# Persistent DHU/AAP location-only profile. The phone/DHU advertises the
+# SensorSourceService; ARDA requests only SENSOR_LOCATION (type 1) and forwards
+# fixes to the arda_gps GNSS bridge. VHAL forwarding remains disabled.
+open = true
 request_all = true
-max_type = 23
-jsonl = "/data/local/tmp/arda-sensors.jsonl"
+max_type = 1
+period_ms = 200
+jsonl = "none"
+forward_os = true
 forward_vhal = false
+location_provider = "arda_gps"
+location_min_ms = 200
 vhal_min_ms = 500
 # Embedded Wasmtime policy by default. External OEM/vehicle policy modules can
 # be selected with a filesystem path while keeping AAP/TLS/SDR in Rust.

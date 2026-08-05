@@ -363,8 +363,12 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
         "sensor.open",
         "sensor.request_all",
         "sensor.max_type",
+        "sensor.period_ms",
         "sensor.jsonl",
+        "sensor.forward_os",
         "sensor.forward_vhal",
+        "sensor.location_provider",
+        "sensor.location_min_ms",
         "sensor.vhal_min_ms",
         "sensor.wasm",
         "sensor.wasm_fuel",
@@ -440,6 +444,7 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
     push_bool(&values, "sensor.open", "--sensor-open", "--no-sensor-open", &mut out)?;
     push_bool(&values, "sensor.request_all", "--sensor-request-all", "--no-sensor-request-all", &mut out)?;
     push_value(&values, "sensor.max_type", "--sensor-max-type", &mut out)?;
+    push_value(&values, "sensor.period_ms", "--sensor-period-ms", &mut out)?;
     if let Some(value) = values.get("sensor.jsonl") {
         let value = value.as_string("sensor.jsonl")?;
         if matches!(value.as_str(), "none" | "-" | "off") {
@@ -449,7 +454,18 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
             out.push(value);
         }
     }
+    // The current OS forwarding path is LOCATION-only. Use the dedicated
+    // location flags so enabling it never implicitly enables VHAL forwarding.
+    push_bool(
+        &values,
+        "sensor.forward_os",
+        "--sensor-forward-location",
+        "--no-sensor-forward-location",
+        &mut out,
+    )?;
     push_bool(&values, "sensor.forward_vhal", "--sensor-forward-vhal", "--no-sensor-forward-vhal", &mut out)?;
+    push_value(&values, "sensor.location_provider", "--sensor-location-provider", &mut out)?;
+    push_value(&values, "sensor.location_min_ms", "--sensor-location-min-ms", &mut out)?;
     push_value(&values, "sensor.vhal_min_ms", "--sensor-vhal-min-ms", &mut out)?;
     push_value(&values, "sensor.wasm", "--sensor-wasm", &mut out)?;
     push_value(&values, "sensor.wasm_fuel", "--sensor-wasm-fuel", &mut out)?;

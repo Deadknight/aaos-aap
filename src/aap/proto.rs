@@ -581,6 +581,80 @@ pub fn build_video_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::
     build_media_setup_payload(MediaCodecType::MEDIA_CODEC_VIDEO_H264_BP)
 }
 
+/// Parse HU -> phone MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST. Returned values are
+/// numeric enum values so the session loop does not need to depend on the
+/// generated protobuf module's concrete Rust type names.
+pub fn parse_video_focus_request_payload(payload: &[u8]) -> Option<(i32, i32, String)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    if id != MediaMessageId::MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST.value() as u16 {
+        return None;
+    }
+
+    let msg = VideoFocusRequestNotification::parse_from_bytes(&payload[2..]).ok()?;
+    let mode = msg.mode().value();
+    let reason = msg.reason().value();
+    Some((
+        mode,
+        reason,
+        format!(
+            "MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST mode={:?}({}) reason={:?}({})",
+            msg.mode(), mode, msg.reason(), reason
+        ),
+    ))
+}
+
+/// Build phone -> HU MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION (called
+/// VideoFocusIndication in newer documentation). Returned bytes include the
+/// two-byte media message id followed by the protobuf body.
+pub fn build_video_focus_notification_payload(
+    focus_mode: i32,
+    unsolicited: bool,
+) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let focus = VideoFocusMode::from_i32(focus_mode)
+        .unwrap_or(VideoFocusMode::VIDEO_FOCUS_PROJECTED);
+    let mut msg = VideoFocusNotification::new();
+    msg.set_focus(focus);
+    msg.set_unsolicited(unsolicited);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        &(MediaMessageId::MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION.value() as u16).to_be_bytes(),
+    );
+    out.extend_from_slice(&msg.write_to_bytes()?);
+    Ok((
+        out,
+        format!(
+            "MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION focus={:?}({}) unsolicited={}",
+            focus, focus.value(), unsolicited
+        ),
+    ))
+}
+
+/// Build MEDIA_MESSAGE_START directly. This is used when video focus returns
+/// to PROJECTED without renegotiating the already-open video channel.
+pub fn build_media_start_payload(
+    session_id: i32,
+    configuration_index: u32,
+) -> Result<(Vec<u8>, String), protobuf::Error> {
+    let mut start = Start::new();
+    start.set_session_id(session_id);
+    start.set_configuration_index(configuration_index);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(MediaMessageId::MEDIA_MESSAGE_START.value() as u16).to_be_bytes());
+    out.extend_from_slice(&start.write_to_bytes()?);
+    Ok((
+        out,
+        format!(
+            "MEDIA_MESSAGE_START session_id={} configuration_index={} reason=video-focus-resume",
+            session_id, configuration_index
+        ),
+    ))
+}
+
 pub fn build_audio_pcm_media_setup_payload() -> Result<(Vec<u8>, String), protobuf::Error> {
     build_media_setup_payload(MediaCodecType::MEDIA_CODEC_AUDIO_PCM)
 }

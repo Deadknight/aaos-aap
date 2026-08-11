@@ -4432,19 +4432,127 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                             }
                         }
 
+                        // ARDA_PHYSICAL_KEYS_V1
                         if config.input_key_inject {
                             for key in &report.keys {
-                                if !key.down {
+                                let state_name = if key.down { "DOWN" } else { "UP" };
+
+                                let semantic_action = match key.keycode {
+                                    65537 => Some("MEDIA"),
+                                    65538 => Some("NAVIGATION"),
+                                    65540 => Some("TEL"),
+                                    _ => None,
+                                };
+
+                                if let Some(action) = semantic_action {
+                                    let observed = format!(
+                                        "INPUT_SEMANTIC_KEY observed action={} state={} longpress={} meta={} keycode={}({})",
+                                        action,
+                                        state_name,
+                                        key.longpress,
+                                        key.metastate,
+                                        key.keycode,
+                                        proto::keycode_name(key.keycode),
+                                    );
+                                    println!("{observed}");
+                                    log_line(&mut dump, &observed)?;
+
+                                    // Launch once on the initial physical DOWN.
+                                    if !key.down || key.longpress {
+                                        continue;
+                                    }
+                                    if !is_platform_input_bridge_mode(&config.input_inject_mode) {
+                                        let line = format!(
+                                            "INPUT_SEMANTIC_KEY skipped action={} reason=requires-platform-bridge mode={}",
+                                            action,
+                                            config.input_inject_mode,
+                                        );
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                        continue;
+                                    }
+
+                                    if input_bridge_injector.is_none() {
+                                        let display_id = selected_input_source
+                                            .as_ref()
+                                            .map(|input| input.display_id as i32)
+                                            .unwrap_or(0);
+                                        match PlatformInputBridgeInjector::create(display_id) {
+                                            Ok((injector, report)) => {
+                                                for report_line in report.lines() {
+                                                    let line = format!("INPUT_PLATFORM_BRIDGE_PREPARE {report_line}");
+                                                    println!("{line}");
+                                                    log_line(&mut dump, &line)?;
+                                                }
+                                                input_bridge_injector = Some(injector);
+                                            }
+                                            Err(err) => {
+                                                let line = format!("INPUT_PLATFORM_KEY_INJECT connect failed: {err}");
+                                                println!("{line}");
+                                                log_line(&mut dump, &line)?;
+                                            }
+                                        }
+                                    }
+
+                                    let result = match input_bridge_injector.as_mut() {
+                                        Some(injector) => injector.inject_semantic_action(action),
+                                        None => Err(io::Error::new(
+                                            io::ErrorKind::NotConnected,
+                                            "platform input bridge is not available",
+                                        )),
+                                    };
+                                    if result.is_err() {
+                                        input_bridge_injector = None;
+                                    }
+                                    match result {
+                                        Ok(()) => {
+                                            input_key_inject_events += 1;
+                                            let line = format!(
+                                                "INPUT_SEMANTIC_KEY dispatch=PASS action={} events={}",
+                                                action,
+                                                input_key_inject_events,
+                                            );
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                        Err(err) => {
+                                            let line = format!(
+                                                "INPUT_SEMANTIC_KEY dispatch=FAIL action={} err={err}",
+                                                action,
+                                            );
+                                            println!("{line}");
+                                            log_line(&mut dump, &line)?;
+                                        }
+                                    }
                                     continue;
                                 }
+
                                 if let Some(android_code) = input::android_passthrough_keycode(key.keycode) {
+                                    // Old app/shell fallbacks are still press-based. Only the
+                                    // platform bridge preserves a physical release transition.
+                                    if !is_platform_input_bridge_mode(&config.input_inject_mode) && !key.down {
+                                        let line = format!(
+                                            "INPUT_KEY_INJECT fallback_release_ignored mode={} keycode={}({}) android_keyevent={}",
+                                            config.input_inject_mode,
+                                            key.keycode,
+                                            proto::keycode_name(key.keycode),
+                                            android_code,
+                                        );
+                                        println!("{line}");
+                                        log_line(&mut dump, &line)?;
+                                        continue;
+                                    }
+
                                     let key_result = if is_platform_input_bridge_mode(&config.input_inject_mode) {
                                         if input_bridge_injector.is_none() {
-                                            let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                            let display_id = selected_input_source
+                                                .as_ref()
+                                                .map(|input| input.display_id as i32)
+                                                .unwrap_or(0);
                                             match PlatformInputBridgeInjector::create(display_id) {
                                                 Ok((injector, report)) => {
-                                                    for line in report.lines() {
-                                                        let line = format!("INPUT_PLATFORM_BRIDGE {line}");
+                                                    for report_line in report.lines() {
+                                                        let line = format!("INPUT_PLATFORM_BRIDGE_PREPARE {report_line}");
                                                         println!("{line}");
                                                         log_line(&mut dump, &line)?;
                                                     }
@@ -4458,8 +4566,16 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                             }
                                         }
                                         let result = match input_bridge_injector.as_mut() {
-                                            Some(injector) => injector.inject_key_press(android_code),
-                                            None => Err(io::Error::new(io::ErrorKind::NotConnected, "platform input bridge is not available")),
+                                            Some(injector) => injector.inject_key_event(
+                                                android_code,
+                                                key.down,
+                                                key.metastate,
+                                                key.longpress,
+                                            ),
+                                            None => Err(io::Error::new(
+                                                io::ErrorKind::NotConnected,
+                                                "platform input bridge is not available",
+                                            )),
                                         };
                                         if result.is_err() {
                                             input_bridge_injector = None;
@@ -4467,11 +4583,14 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                         result
                                     } else if is_app_process_input_inject_mode(&config.input_inject_mode) {
                                         if input_app_injector.is_none() {
-                                            let display_id = selected_input_source.as_ref().map(|input| input.display_id as i32).unwrap_or(0);
+                                            let display_id = selected_input_source
+                                                .as_ref()
+                                                .map(|input| input.display_id as i32)
+                                                .unwrap_or(0);
                                             match AppProcessInputInjector::create(display_id) {
                                                 Ok((injector, report)) => {
-                                                    for line in report.lines() {
-                                                        let line = format!("INPUT_APP_INJECTOR {line}");
+                                                    for report_line in report.lines() {
+                                                        let line = format!("INPUT_APP_INJECTOR_PREPARE {report_line}");
                                                         println!("{line}");
                                                         log_line(&mut dump, &line)?;
                                                     }
@@ -4486,7 +4605,10 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                         }
                                         match input_app_injector.as_mut() {
                                             Some(injector) => injector.inject_key_press(android_code),
-                                            None => Err(io::Error::new(io::ErrorKind::NotConnected, "app_process inputd is not available")),
+                                            None => Err(io::Error::new(
+                                                io::ErrorKind::NotConnected,
+                                                "app_process inputd is not available",
+                                            )),
                                         }
                                     } else {
                                         input::inject_android_keyevent_shell(android_code)
@@ -4496,27 +4618,39 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
                                         Ok(()) => {
                                             input_key_inject_events += 1;
                                             let line = format!(
-                                                "INPUT_KEY_INJECT mode={} keycode={}({}) android_keyevent={} events={}",
+                                                "INPUT_KEY_INJECT mode={} state={} keycode={}({}) android_keyevent={} meta={} longpress={} events={}",
                                                 config.input_inject_mode,
+                                                state_name,
                                                 key.keycode,
                                                 proto::keycode_name(key.keycode),
                                                 android_code,
-                                                input_key_inject_events
+                                                key.metastate,
+                                                key.longpress,
+                                                input_key_inject_events,
                                             );
                                             println!("{line}");
                                             log_line(&mut dump, &line)?;
                                         }
                                         Err(err) => {
-                                            let line = format!("INPUT_KEY_INJECT error mode={} keycode={}({}): {err}", config.input_inject_mode, key.keycode, proto::keycode_name(key.keycode));
+                                            let line = format!(
+                                                "INPUT_KEY_INJECT error mode={} state={} keycode={}({}): {err}",
+                                                config.input_inject_mode,
+                                                state_name,
+                                                key.keycode,
+                                                proto::keycode_name(key.keycode),
+                                            );
                                             println!("{line}");
                                             log_line(&mut dump, &line)?;
                                         }
                                     }
                                 } else {
                                     let line = format!(
-                                        "INPUT_KEY_INJECT skipped unmapped keycode={}({})",
+                                        "INPUT_KEY_INJECT skipped unmapped keycode={}({}) state={} meta={} longpress={}",
                                         key.keycode,
-                                        proto::keycode_name(key.keycode)
+                                        proto::keycode_name(key.keycode),
+                                        state_name,
+                                        key.metastate,
+                                        key.longpress,
                                     );
                                     println!("{line}");
                                     log_line(&mut dump, &line)?;

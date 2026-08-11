@@ -272,7 +272,9 @@ const PLATFORM_INPUT_BRIDGE_SOCKET_NAME: &str = "arda_input_bridge";
 ///   DISPLAY <id>
 ///   TM <action> <action_index> <count> <pointer_id> <x> <y> ...
 ///   T DOWN|MOVE|UP <x> <y> <pointer_id>   (legacy compatibility)
-///   K <android_keycode>
+///   K <android_keycode>  (legacy synthesized press)
+///   K2 DOWN|UP <android_keycode> <metastate> <longpress>
+///   S MEDIA|NAVIGATION|TEL
 ///   STOP
 pub struct PlatformInputBridgeInjector {
     stream: Option<UnixStream>,
@@ -429,6 +431,30 @@ impl PlatformInputBridgeInjector {
 
     pub fn inject_key_press(&mut self, keycode: u32) -> io::Result<()> {
         self.send_line(&format!("K {}", keycode))
+    }
+
+    /// Forward one physical AAP key transition without synthesizing the opposite
+    /// transition. This preserves DOWN/UP, meta state and long-press.
+    pub fn inject_key_event(
+        &mut self,
+        keycode: u32,
+        down: bool,
+        metastate: u32,
+        longpress: bool,
+    ) -> io::Result<()> {
+        self.send_line(&format!(
+            "K2 {} {} {} {}",
+            if down { "DOWN" } else { "UP" },
+            keycode,
+            metastate,
+            if longpress { 1 } else { 0 },
+        ))
+    }
+
+    /// AAP 0x10001+ codes are projection semantic buttons, not Android KeyEvent
+    /// keycodes. Keep them on a separate bridge command.
+    pub fn inject_semantic_action(&mut self, action: &str) -> io::Result<()> {
+        self.send_line(&format!("S {}", action))
     }
 
     pub fn stop(&mut self) {
@@ -941,6 +967,12 @@ pub fn inject_android_keyevent_shell(keycode: u32) -> io::Result<()> {
 }
 
 pub fn android_passthrough_keycode(aa_keycode: u32) -> Option<u32> {
+    // ARDA_PHYSICAL_KEYS_V1_STANDARD_PASS
+    // Current HU + historical DHU Android-compatible physical keycodes.
+    if matches!(aa_keycode, 3 | 4 | 5 | 6 | 23 | 84 | 85 | 87 | 88 | 89 | 90 | 126 | 127) {
+        return Some(aa_keycode);
+    }
+
     match aa_keycode {
         // Standard Android keycodes that are safe to forward as-is.
         3 | 4 | 5 | 6 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 79 | 82 | 84 | 85 | 86 | 87 | 88

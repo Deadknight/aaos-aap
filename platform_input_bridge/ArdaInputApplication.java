@@ -1,13 +1,16 @@
 package com.arda.inputbridge;
 
 import android.app.Application;
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.Intent;
 import android.hardware.input.InputManager;
 import android.net.Credentials;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.os.Process;
 import android.os.SystemClock;
+import android.os.UserHandle;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.InputEvent;
@@ -21,7 +24,9 @@ import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
 
@@ -118,6 +123,14 @@ public final class ArdaInputApplication extends Application {
                                 Integer.parseInt(parts[2]),
                                 Integer.parseInt(parts[3]),
                                 Integer.parseInt(parts[4]));
+                    } else if (parts.length >= 5 && "K2".equals(parts[0])) {
+                        injector.injectKeyEvent(
+                                Integer.parseInt(parts[2]),
+                                "DOWN".equals(parts[1]),
+                                Integer.parseInt(parts[3]),
+                                !"0".equals(parts[4]));
+                    } else if (parts.length >= 2 && "S".equals(parts[0])) {
+                        injector.injectSemanticAction(parts[1]);
                     } else if (parts.length >= 2 && "K".equals(parts[0])) {
                         injector.injectKeyPress(Integer.parseInt(parts[1]));
                     } else {
@@ -144,7 +157,9 @@ public final class ArdaInputApplication extends Application {
         private static final int SOURCE_TOUCHSCREEN = InputDevice.SOURCE_TOUCHSCREEN;
         private static final int SOURCE_KEYBOARD = InputDevice.SOURCE_KEYBOARD;
 
+        private final Context context;
         private final Object inputManager;
+        private final Map<Integer, Long> keyDownTimes = new HashMap<>();
         private final Method injectInputEventMethod;
         private final Method setDisplayIdMethod;
 
@@ -156,6 +171,7 @@ public final class ArdaInputApplication extends Application {
         private long moveLogCounter;
 
         FrameworkInjector(Context context) throws Exception {
+            this.context = context;
             Object manager = null;
             Method injectMethod = null;
 
@@ -711,6 +727,65 @@ public final class ArdaInputApplication extends Application {
                     ((MotionEvent) event).recycle();
                 }
             }
+        }
+
+        void injectKeyEvent(int keyCode, boolean down, int metaState, boolean longPress) {
+            long now = SystemClock.uptimeMillis();
+            long downTime;
+            if (down) {
+                Long existing = keyDownTimes.get(keyCode);
+                if (existing == null) {
+                    existing = now;
+                    keyDownTimes.put(keyCode, existing);
+                }
+                downTime = existing;
+            } else {
+                Long existing = keyDownTimes.remove(keyCode);
+                downTime = existing != null ? existing : now;
+            }
+
+            int action = down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP;
+            int repeatCount = longPress && down ? 1 : 0;
+            int flags = longPress && down ? KeyEvent.FLAG_LONG_PRESS : 0;
+            KeyEvent event = new KeyEvent(
+                    downTime, now, action, keyCode, repeatCount, metaState,
+                    -1, 0, flags, SOURCE_KEYBOARD);
+            boolean ok = inject(event);
+            Log.i(TAG, "KEY action=" + (down ? "DOWN" : "UP")
+                    + " keycode=" + keyCode
+                    + " meta=" + metaState
+                    + " longpress=" + longPress
+                    + " display=" + displayId
+                    + " ok=" + ok);
+            if (!ok) {
+                throw new IllegalStateException(
+                        "injectInputEvent returned false keycode=" + keyCode);
+            }
+        }
+
+        void injectSemanticAction(String actionWord) {
+            String action = actionWord.toUpperCase(Locale.US);
+            Intent intent;
+            if ("MEDIA".equals(action)) {
+                intent = Intent.makeMainSelectorActivity(
+                        Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC);
+            } else if ("NAVIGATION".equals(action)) {
+                intent = Intent.makeMainSelectorActivity(
+                        Intent.ACTION_MAIN, Intent.CATEGORY_APP_MAPS);
+            } else if ("TEL".equals(action)) {
+                intent = new Intent(Intent.ACTION_DIAL);
+            } else {
+                throw new IllegalArgumentException(
+                        "unknown semantic action=" + actionWord);
+            }
+
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            int userId = ActivityManager.getCurrentUser();
+            context.startActivityAsUser(intent, UserHandle.of(userId));
+            Log.i(TAG, "SEMANTIC action=" + action
+                    + " user=" + userId
+                    + " dispatch=PASS");
         }
 
         void cancelActiveTouch(String reason) {

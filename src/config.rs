@@ -358,6 +358,7 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
         "input.inject",
         "input.inject_mode",
         "input.app_move_min_ms",
+        "input.key_inject",
         "audio.open",
         "audio.stream",
         "sensor.open",
@@ -437,6 +438,7 @@ fn load_aap_session_config(path: &Path) -> Result<Vec<String>, Box<dyn std::erro
     push_bool(&values, "input.inject", "--input-inject", "--no-input-inject", &mut out)?;
     push_value(&values, "input.inject_mode", "--input-inject-mode", &mut out)?;
     push_value(&values, "input.app_move_min_ms", "--input-app-move-min-ms", &mut out)?;
+    push_bool(&values, "input.key_inject", "--input-key-inject", "--no-input-key-inject", &mut out)?;
 
     push_bool(&values, "audio.open", "--audio-open", "--no-audio-open", &mut out)?;
     push_value(&values, "audio.stream", "--audio-stream", &mut out)?;

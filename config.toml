@@ -48,6 +48,8 @@ inject = true
 # app/uinput/shell remain available for isolated A/B tests.
 inject_mode = "bridge"
 app_move_min_ms = 16
+# Forward physical AAP key reports through the privileged input bridge.
+key_inject = true
 
 [audio]
 open = false

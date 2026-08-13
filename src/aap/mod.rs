@@ -5480,6 +5480,7 @@ pub fn tls_service_discovery_probe(config: TlsHandshakeProbeConfig) -> io::Resul
         println!("SESSION_CLEANUP video sender stopped");
         let _ = log_line(&mut dump, "SESSION_CLEANUP video sender stopped");
     }
+    let _ = reset_projection_content_insets(&mut dump, cleanup_reason);
     println!("SESSION_CLEANUP end reason={}", cleanup_reason);
     let _ = log_line(&mut dump, &format!("SESSION_CLEANUP end reason={}", cleanup_reason));
 
@@ -5827,6 +5828,20 @@ const AAP_DENSITY_SCALE_MIN_TENTHS: u32 = 1;
 const AAP_DENSITY_SCALE_MAX_TENTHS: u32 = 20;
 const ANDROID_MINIMUM_WM_DENSITY: u32 = 72;
 
+const ARDA_PROJECTION_CONTENT_INSETS_SETTING: &str =
+    "arda_projection_content_insets";
+const ARDA_DISPLAY_PROFILE_APPLIED_PATH: &str =
+    "/data/local/tmp/arda-display-profile-applied-v1";
+const ARDA_DISPLAY_PROFILE_PENDING_PATH: &str =
+    "/data/local/tmp/arda-display-profile-pending-v1";
+const ARDA_DISPLAY_RECONCILE_TIMEOUT_SECS: u64 = 45;
+
+#[derive(Debug, Clone, Copy)]
+struct WmDensityInfo {
+    physical_density: u32,
+    override_density: Option<u32>,
+}
+
 fn read_aap_density_scale_tenths() -> u32 {
     let output = Command::new("/system/bin/settings")
         .args([
@@ -5859,6 +5874,196 @@ fn scale_wm_density(base_density: u32, scale_tenths: u32) -> (u32, u32, bool) {
         .min(u32::MAX as u64) as u32;
     let effective = unclamped.max(ANDROID_MINIMUM_WM_DENSITY);
     (unclamped, effective, effective != unclamped)
+}
+
+fn parse_wm_density_line(line: &str) -> Option<u32> {
+    let (_, rhs) = line.split_once(':')?;
+    rhs.trim().parse::<u32>().ok()
+}
+
+fn probe_wm_density() -> Option<(WmDensityInfo, String)> {
+    let text = run_text_command("wm", &["density"]).ok()?;
+    let mut physical = None;
+    let mut override_density = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Physical density:") {
+            physical = parse_wm_density_line(trimmed);
+        } else if trimmed.starts_with("Override density:") {
+            override_density = parse_wm_density_line(trimmed);
+        }
+    }
+    Some((
+        WmDensityInfo {
+            physical_density: physical?,
+            override_density,
+        },
+        text.trim().replace('\n', " | "),
+    ))
+}
+
+fn read_text_file_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn write_text_file_atomic(path: &str, value: &str) -> io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    fs::write(&tmp, format!("{value}\n"))?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn remove_file_if_present(path: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+}
+
+fn run_settings_put_global(key: &str, value: &str) -> io::Result<bool> {
+    Ok(Command::new("/system/bin/settings")
+        .args(["put", "global", key, value])
+        .status()?
+        .success())
+}
+
+fn apply_projection_content_insets(
+    selection: &proto::VideoConfigSelection,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<()> {
+    let value = format!(
+        "{},{},{},{}",
+        selection.content_inset_left,
+        selection.content_inset_top,
+        selection.content_inset_right,
+        selection.content_inset_bottom
+    );
+    let ok = run_settings_put_global(ARDA_PROJECTION_CONTENT_INSETS_SETTING, &value)?;
+    let line = format!(
+        "PROJECTION_INSETS_ATOMIC_APPLY value={} source=SDR stable=L{},T{},R{},B{} stable_policy=log-only settings_ok={}",
+        value,
+        selection.stable_inset_left,
+        selection.stable_inset_top,
+        selection.stable_inset_right,
+        selection.stable_inset_bottom,
+        ok
+    );
+    println!("{line}");
+    log_line(dump, &line)
+}
+
+fn reset_projection_content_insets(
+    dump: &mut Option<Box<dyn Write>>,
+    reason: &str,
+) -> io::Result<()> {
+    let ok = run_settings_put_global(
+        ARDA_PROJECTION_CONTENT_INSETS_SETTING,
+        "0,0,0,0",
+    )?;
+    let line = format!(
+        "PROJECTION_INSETS_ATOMIC_RESET value=0,0,0,0 reason={} settings_ok={}",
+        reason, ok
+    );
+    println!("{line}");
+    log_line(dump, &line)
+}
+
+fn pidof_process(name: &str) -> Option<String> {
+    run_text_command("/system/bin/pidof", &[name])
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn current_foreground_user() -> Option<i32> {
+    run_text_command("/system/bin/am", &["get-current-user"])
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+}
+
+fn ui_runtime_ready(
+    expected_width: i32,
+    expected_height: i32,
+    expected_density: u32,
+    old_system_server_pid: Option<&str>,
+) -> bool {
+    let system_server = pidof_process("system_server");
+    let system_server_ok = match (old_system_server_pid, system_server.as_deref()) {
+        (Some(old), Some(now)) => old != now,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let user_ok = current_foreground_user().map(|u| u > 0).unwrap_or(false);
+    let size_ok = probe_wm_size()
+        .map(|(wm, _)| {
+            wm.override_width == Some(expected_width)
+                && wm.override_height == Some(expected_height)
+        })
+        .unwrap_or(false);
+    let density_ok = probe_wm_density()
+        .map(|(wm, _)| wm.override_density == Some(expected_density))
+        .unwrap_or(false);
+    let systemui_ok = pidof_process("com.android.systemui").is_some();
+    let launcher_ok = pidof_process("com.android.car.carlauncher").is_some();
+    system_server_ok && user_ok && size_ok && density_ok && systemui_ok && launcher_ok
+}
+
+fn wait_for_ui_runtime(
+    expected_width: i32,
+    expected_height: i32,
+    expected_density: u32,
+    old_system_server_pid: Option<&str>,
+    timeout: Duration,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<bool> {
+    let started = Instant::now();
+    let mut last_log_sec = u64::MAX;
+    while started.elapsed() < timeout {
+        if ui_runtime_ready(
+            expected_width,
+            expected_height,
+            expected_density,
+            old_system_server_pid,
+        ) {
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE_READY elapsed_ms={} expected={}x{}@{} user={:?} system_server={:?} systemui={:?} carlauncher={:?}",
+                started.elapsed().as_millis(),
+                expected_width,
+                expected_height,
+                expected_density,
+                current_foreground_user(),
+                pidof_process("system_server"),
+                pidof_process("com.android.systemui"),
+                pidof_process("com.android.car.carlauncher")
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            return Ok(true);
+        }
+        let sec = started.elapsed().as_secs();
+        if sec != last_log_sec && (sec == 0 || sec % 5 == 0) {
+            last_log_sec = sec;
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE_WAIT elapsed_s={} expected={}x{}@{} user={:?} system_server={:?} wm_size={:?} wm_density={:?}",
+                sec,
+                expected_width,
+                expected_height,
+                expected_density,
+                current_foreground_user(),
+                pidof_process("system_server"),
+                probe_wm_size().map(|(_, t)| t),
+                probe_wm_density().map(|(_, t)| t)
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Ok(false)
 }
 
 fn run_text_command(program: &str, args: &[&str]) -> io::Result<String> {
@@ -6227,6 +6432,8 @@ impl VideoLiveSender {
         selection: &proto::VideoConfigSelection,
         dump: &mut Option<Box<dyn Write>>,
     ) -> io::Result<()> {
+        apply_projection_content_insets(selection, dump)?;
+
         if !self.config.apply_wm_config {
             let line = format!(
                 "WM_CONFIG not applied: stream={}x{} density={} real_density={} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
@@ -6254,13 +6461,58 @@ impl VideoLiveSender {
             wm_density_unclamped,
             wm_density,
             wm_density_min_clamped,
-        ) = scale_wm_density(
-            wm_density_base,
-            wm_density_scale_tenths,
-        );
+        ) = scale_wm_density(wm_density_base, wm_density_scale_tenths);
+
         let initial_wm = self.log_display_probe("before", dump)?;
+        let initial_density = probe_wm_density();
         self.apply_rotation_if_needed(wm_width, wm_height, initial_wm, dump)?;
-        let (cmd_w, cmd_h, orientation_mode) = self.wm_command_size_for_target(wm_width, wm_height, initial_wm);
+        let (cmd_w, cmd_h, orientation_mode) =
+            self.wm_command_size_for_target(wm_width, wm_height, initial_wm);
+
+        let hard_profile = format!(
+            "v=1;stream={}x{};logical={}x{};command={}x{};density={};rotation={};size_mode={};orientation={};margins={},{},{},{}",
+            selection.width,
+            selection.height,
+            wm_width,
+            wm_height,
+            cmd_w,
+            cmd_h,
+            wm_density,
+            self.config.wm_rotation,
+            size_mode,
+            orientation_mode,
+            selection.margin_left,
+            selection.margin_top,
+            selection.margin_right,
+            selection.margin_bottom
+        );
+        let applied_profile = read_text_file_trimmed(ARDA_DISPLAY_PROFILE_APPLIED_PATH);
+        let pending_profile = read_text_file_trimmed(ARDA_DISPLAY_PROFILE_PENDING_PATH);
+
+        let size_mismatch_before = initial_wm
+            .map(|wm| {
+                wm.override_width != Some(cmd_w)
+                    || wm.override_height != Some(cmd_h)
+            })
+            .unwrap_or(true);
+        let density_mismatch_before = initial_density
+            .as_ref()
+            .map(|(wm, _)| wm.override_density != Some(wm_density))
+            .unwrap_or(true);
+        let profile_changed = applied_profile.as_deref() != Some(hard_profile.as_str());
+
+        let line = format!(
+            "DISPLAY_PROFILE_COMPARE profile_changed={} size_mismatch_before={} density_mismatch_before={} pending_match={} applied={:?} target='{}'",
+            profile_changed,
+            size_mismatch_before,
+            density_mismatch_before,
+            pending_profile.as_deref() == Some(hard_profile.as_str()),
+            applied_profile,
+            hard_profile
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
         let line = format!(
             "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density_base={} density_scale={}.{}x density_unclamped={} density={} density_min_clamped={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
             wm_width,
@@ -6296,6 +6548,94 @@ impl VideoLiveSender {
         self.apply_wm_size_and_density(&size_arg, &density_arg, dump)?;
         let _ = self.log_display_probe("after", dump)?;
         self.wm_applied = true;
+
+        let reset_needed = profile_changed || size_mismatch_before || density_mismatch_before;
+        if !reset_needed {
+            if pending_profile.is_some() {
+                remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
+            }
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE=SKIP reason=profile-and-runtime-match target='{}'",
+                hard_profile
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            return Ok(());
+        }
+
+        if pending_profile.as_deref() == Some(hard_profile.as_str()) {
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE_RECOVERY pending_match=true target='{}'",
+                hard_profile
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            if wait_for_ui_runtime(
+                cmd_w,
+                cmd_h,
+                wm_density,
+                None,
+                Duration::from_secs(15),
+                dump,
+            )? {
+                write_text_file_atomic(ARDA_DISPLAY_PROFILE_APPLIED_PATH, &hard_profile)?;
+                remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
+                let line = "DISPLAY_PROFILE_RECONCILE=PASS mode=pending-recovery restart=NO";
+                println!("{line}");
+                log_line(dump, line)?;
+                self.wm_settled = true;
+                return Ok(());
+            }
+        }
+
+        write_text_file_atomic(ARDA_DISPLAY_PROFILE_PENDING_PATH, &hard_profile)?;
+        let old_system_server = pidof_process("system_server");
+        let restart_status = Command::new("/system/bin/setprop")
+            .args(["ctl.restart", "zygote"])
+            .status();
+
+        let restart_ok = restart_status
+            .as_ref()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let line = format!(
+            "DISPLAY_PROFILE_RECONCILE_RESTART requested={} old_system_server={:?} target='{}'",
+            restart_ok,
+            old_system_server,
+            hard_profile
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        if restart_ok
+            && wait_for_ui_runtime(
+                cmd_w,
+                cmd_h,
+                wm_density,
+                old_system_server.as_deref(),
+                Duration::from_secs(ARDA_DISPLAY_RECONCILE_TIMEOUT_SECS),
+                dump,
+            )?
+        {
+            write_text_file_atomic(ARDA_DISPLAY_PROFILE_APPLIED_PATH, &hard_profile)?;
+            remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE=PASS mode=zygote target='{}'",
+                hard_profile
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            self.wm_settled = true;
+        } else {
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE=FAIL_OPEN restart_ok={} target='{}' note=AAP session continues; pending profile retained",
+                restart_ok,
+                hard_profile
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
+
         Ok(())
     }
 

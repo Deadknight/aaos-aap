@@ -1,429 +1,715 @@
-# ARDA v57 WIP — Phase 1.1 handoff
-
-Date: 2026-07-07
-Baseline/source-of-truth used: `070620261158.zip`
-Previous checkpoint: v57 Phase 1
-
-## This is real persisted code
-
-This tree contains the current v57 Phase 1.1 implementation. It is not a design-only snapshot.
-
-## Why Phase 1.1 exists
-
-The first Phase 1 Docker compile exposed one repeated rust-protobuf v3 API-shape mistake: the router
-used generated accessor methods but code generation did not explicitly enable them. The same mistake
-expanded into the large `E0599` cascade.
-
-The first Phase 1 builtin WAT policy also duplicated standard VHAL semantics as a long property switch.
-Phase 1.1 simplifies that architecture before the first successful router checkpoint.
-
-## Implemented in Phase 1.1
-
-- Explicitly enable rust-protobuf field accessors in `build.rs`.
-- Use Android `VehicleProperty` IDs directly in the new router model.
-- Rename router protobuf `VehicleSignal.signal_id` and `VehicleCommand.signal_id` to `property_id`.
-  Field numbers are unchanged.
-- Remove the second ARDA generic signal-ID namespace.
-- Hardcode only known AAP/HU SensorSource -> VehicleProperty mappings in Rust.
-- Keep AAP location outside VHAL/Wasmtime.
-- Keep AAP FuelData unmapped until its source units are established.
-- Replace the builtin WAT property switch with a generic typed pass-through guest.
-- Keep custom Wasm as optional remap/filter/stateful/OEM policy.
-- Add declarative `SUPPORTED_PROPERTY_RULES` validation/authorization metadata for the current Phase 1
-  subset. It is not a signal mapping table.
-- Preserve source arbitration, command ACK/timeout, VHAL set error routing and the central router.
-- Rewrite policy/router smokes for property-ID-preserving behavior.
-
-## Current default semantics
-
-```text
-AAP/HU
-  -> Rust known-sensor mapping
-  -> VehicleProperty ID + area + typed value
-                                      \
-third-party/CAN property source -------> vehicle-routerd
-                                         -> arbitration
-                                         -> Wasmtime typed pass-through
-                                         -> same VehicleProperty VHAL event
-
-VHAL set
-  -> vehicle-routerd
-  -> Wasmtime typed pass-through
-  -> same VehicleProperty command
-  -> adapter
-```
-
-The adapter is responsible for OEM/CAN encoding when it receives a standard property command.
-
-## Actually implemented components
-
-- `proto/arda_vehicle_router.proto`
-- `src/vehicle/model.rs`
-- `src/vehicle/policy.rs`
-- `src/vehicle/router.rs`
-- `src/vehicle/client.rs`
-- `src/vehicle/wire.rs`
-- `src/vehicle/smoke.rs`
-- AAP sensor publisher into the router
-- `vehicle-routerd`
-- `vehicle-policy-smoke`
-- `vehicle-router-smoke`
-
-## Phase 2 implementation status
-
-Implemented and runtime-proven in Phase 2.0:
-
-- Arda Vehicle Manager Android system app
-- third-party adapter AIDL SDK
-- PackageManager adapter discovery
-- per-user device-protected grant database
-- signing-lineage grant validation
-- explicit publish/command capability grants
-- demo smoke adapter APK
-- grant -> bind -> descriptor -> publish Binder runtime flow
-
-Implemented and real-build proven in Phase 2.1:
-
-- per-source Manager `ROLE_MANAGER` LocalSocket bridge
-- protocol-v2 Hello/RegisterSource
-- adapter `VehicleSignals` forwarding with manager-owned source ID
-- router `VehicleCommands` delivery over one-way AIDL
-- adapter `CommandAck` forwarding as router `CommandAcks`
-- bounded latest-state retention while the router is unavailable
-- end-to-end `vehicle-manager-bridge-smoke` command and Android runner
-- Android `LocalSocket` connect-before-timeout ordering fix
-
-The first real enforcing runtime connect reached the platform boundary and failed exactly on:
-
-```text
-scontext=u:r:system_app:s0
-tcontext=u:object_r:socket_device:s0
-tclass=sock_file
-denied { write }
-permissive=0
-```
-
-Phase 2.2 source therefore platformizes the router instead of granting broad generic socket access:
-
-- init-managed `arda_vehicle_router` service in `system_ext`
-- init-created `stream+listen` `/dev/socket/arda_vehicle_router`
-- Rust consumption of `ANDROID_SOCKET_arda_vehicle_router` with listener validation
-- manual `UnixListener::bind()` fallback for existing custom-socket/router smokes
-- dedicated `arda_vehicle_router` core domain
-- dedicated `arda_vehicle_router_socket` type
-- package-specific `arda_vehicle_manager` app domain
-- narrow `sock_file write` and `unix_stream_socket connectto` from `arda_vehicle_manager` to `arda_vehicle_router_socket`
-- userdebug/eng-only `su` socket client allowance for the existing root VHAL smoke client
-
-Still not implemented/closed:
-
-- real AIDL `IVehicleHardware` backend
-- `VehiclePropConfig`-driven runtime property registry
-- dedicated ARDA GPS provider / Android fused-location integration
-- production capability approval UI
-
-Phase 2.2 is now runtime-complete under enforcing SELinux. The broad `allow system_app socket_device:sock_file write` rule remains forbidden.
-
-## Compile and runtime validation status
-
-The user's real Android Docker cross-build passed after forcing fresh package-specific protobuf codegen.
-The old rust-protobuf accessor `E0599` cascade is closed.
-
-User-side smoke results on 2026-07-07:
-- `sensor-gate-smoke`: PASS.
-- `vehicle-policy-smoke`: PASS, including generic VehicleProperty pass-through.
-- `sensor-wasm-smoke`: PASS after the source-ID correction. All built-in AAP events now carry
-  `source=1`, no `SENSOR_WASM_TRAP` remains, and `SENSOR_WASM_SMOKE_OK=YES` passes.
-- the first router smoke wrapper did not actually reach daemon startup because its `pkill -f` pattern
-  could match and terminate the remote `sh -c` test shell itself. The PID-scoped runner fixed that.
-- the PID-scoped runner then exposed a privilege mismatch: the router reached Wasmtime initialization
-  but exited before `VEHICLE_ROUTER_READY` with `EPERM`. The router intentionally chowns its socket to
-  `root:system` (`0:1000`), while the runner had launched it as normal ADB shell UID 2000.
-- the current runner now requests `adb root`, verifies remote UID 0 before daemon startup, and preserves
-  the strict root:system socket ownership boundary. Router startup errors also include stage/path/EUID/EGID.
-
-Phase 1.1 is therefore compile-green and sensor-policy runtime-green, but remains runtime-open until the
-root-aware PID-scoped router smoke passes.
-
-## Validation order
-
-1. Run `./scripts/docker-build.sh`.
-2. Push the rebuilt Android binary.
-3. `sensor-wasm-smoke` is already PASS with `source=1`, no traps, and `SENSOR_WASM_SMOKE_OK=YES`.
-4. Run `DEVICE=<network-adb-device> ./scripts/run-vehicle-router-smoke-android.sh`; the script must
-   print `ROUTER_ADB_ROOT_OK ... uid=0` before router startup.
-5. Require:
-   - `VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES`
-   - `VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES`
-   - `VEHICLE_ROUTER_SMOKE_OK=YES`
-6. Only after those two remaining runtime checks pass, continue with Vehicle Manager / adapter AIDL.
-
-## Preserved proven paths
-
-Phase 1/1.1 does not intentionally rewrite:
-
-- `src/input/mod.rs`
-- `src/capture/mod.rs`
-- `src/capture/screenrecord.rs`
-- `src/aap/mod.rs`
-- `src/aap/proto.rs`
-- `src/aap/tls.rs`
-- `src/aap/fragment.rs`
-
-The proven AAP/TLS/SDR, capture and secure input paths remain the baseline.
-
-## Phase 1.1 build follow-up — stale generated protobuf guard
-
-The first Phase 1.1 Android build still showed the same 204 accessor-shaped `E0599` errors even though
-`build.rs` requested `Customize::generate_accessors(true)`.
-
-The failure shape is consistent with the Phase 1 generated `OUT_DIR/protos/arda_vehicle_router.rs`
-being reused after a timestamp-preserving patch restore. The Phase 1.1 patch was applied with
-`rsync -av`; source mtimes from the archive can therefore be older than Cargo's existing target
-fingerprints even when file contents changed.
-
-The Android Docker build is now hardened in two places:
-
-- `scripts/docker-build-android.sh` runs `cargo clean -p arda-senderd --target "$TARGET"` before the
-  package build. This removes only ARDA's selected-target artifacts and keeps dependency artifacts
-  cached, forcing the current `build.rs` and protobuf generation to run.
-- `build.rs` verifies the generated `arda_vehicle_router.rs` immediately after codegen. Required
-  router accessors such as `set_protocol_version`, `has_hello`, `source_id`, `property_id` and
-  `has_vhal_events` must be present. If not, the build stops in codegen with one explicit error instead
-  of reaching the 204-error Rust accessor cascade.
-
-The router/proto/property architecture is unchanged by this build fix. AAP/TLS/SDR, capture and the
-secure platform input path remain untouched.
-
-Next authoritative validation remains:
-
-1. `./scripts/docker-build.sh`
-2. Require `ARDA_PROTO_ACCESSORS_OK=.../arda_vehicle_router.rs` during `arda-senderd` build.
-3. Require the old 204 `E0599` accessor cascade to be absent.
-4. Continue with `sensor-gate-smoke`, `sensor-wasm-smoke`, `vehicle-policy-smoke`, then
-   `vehicle-router-smoke` in the existing Phase 1.1 order.
-
-## 2026-07-07 Phase 1.1 runtime closure
-
-Verified on Raspberry Pi:
-
-```text
-SENSOR_WASM_TRAP=NONE
-SENSOR_WASM_SMOKE_OK=YES
-VEHICLE_POLICY_SMOKE_OK=YES
-VEHICLE_ROUTER_SMOKE_ARBITRATION_OK=YES
-VEHICLE_ROUTER_SMOKE_PROPERTY_ID_COMMAND_OK=YES
-VEHICLE_ROUTER_SMOKE_OK=YES
-```
-
-The router smoke also verified:
-
-```text
-lower-priority ENERGY source shadowing
-higher-priority ENERGY takeover
-source release on disconnect
-VHAL set -> VehicleCommand dispatch by Android VehicleProperty ID
-CommandAck handling
-adapter-confirmed state publish as a separate VHAL event
-```
-
-Phase 1.1 status: CLOSED.
-
-Phase 2.0+ platform source now lives in `Deadknight/android_vendor_arda` under `vehicle/` and is copied into AOSP as `vendor/arda/vehicle/`. See
-`docs/ARDA_VEHICLE_MANAGER_PHASE2.md`.
-
-### Phase 2.0 security review
-
-- Adapter discovery now requires the exported service to be protected by `com.arda.vehicle.permission.BIND_ADAPTER` (`signature`).
-- Manager validates manifest/Binder descriptor priority and capability identity before readiness.
-- Closed/revoked adapter connections reject delayed service-connect and stale host callbacks.
-- Grant/revoke/source-id persistence is synchronous and fail-closed.
-
-## 2026-07-08 Phase 2.0 runtime closure and Phase 2.1 source state
-
-Phase 2.0 is now runtime-closed on Raspberry Pi/user 10:
-
-```text
-ARDA_VM_GRANT_OK ... source=10000 priority=100 publish=[2, 3] commands=[16]
-ARDA_VM_STATUS ... grants=1 ... granted=true signer_ok=true connected=true ready=true
-ARDA_VM_RESCAN user=10
-ARDA_VM_BIND_REQUEST ... source=10000
-ARDA_VM_ADAPTER_READY ... source=10000
-SMOKE_ADAPTER_HOST_CONNECTED
-ARDA_VM_SIGNAL_ACCEPT ... property=291504903 area=0 type=4
-ARDA_VM_SIGNAL_ACCEPT ... property=358614274 area=1 type=4
-ARDA_PHASE2_0_RUNTIME_GATE=PASS
-```
-
-The previously listed Vehicle Manager/AIDL/grant/signing/demo-adapter items are implemented and must
-no longer be described as future code. Remaining major platform gaps are the real AIDL
-`IVehicleHardware` backend, `VehiclePropConfig`-driven runtime property registry,
-vehicle-routerd init/SELinux/product daemon packaging, and the dedicated GPS/fused-location path.
-
-Phase 2.1 source now adds:
-
-```text
-vendor/arda/vehicle/router-proto
-vendor/arda/vehicle/manager/.../RouterBridge.java
-scripts/run-vehicle-manager-bridge-smoke-android.sh
-vehicle-manager-bridge-smoke
-```
-
-Bridge architecture is one `ROLE_MANAGER` LocalSocket per granted adapter/source. This is intentional:
-protocol v2 has no `UnregisterSource`, while router source cleanup is connection-scoped. Closing one
-source link therefore releases only that source and its pending commands through existing router
-cleanup semantics.
-
-The Manager now frames accepted adapter properties as protocol-v2 `VehicleSignals`, injects the
-manager-owned source ID, receives `VehicleCommands`, delivers them over one-way AIDL, and forwards
-adapter `CommandAck` values as `CommandAcks`. Router remains authoritative for property/type/area and
-capability validation.
-
-The bridge keeps at most the latest value for 512 distinct `(propertyId, areaId)` keys while the
-router is unavailable, flushes in batches of 128 after reconnect, and intentionally does not replay
-ACKs across router reconnects.
-
-Validation completed in the artifact-preparation environment:
-
-```text
-SHELL_OK=YES
-ROUTER_PROTO_SYNC=YES
-JAVA_BRACE_OK=YES
-AIDL_BRACE_OK=YES
-JAVA_STUB_COMPILE_OK=YES classes=94 total_sources=56 actual_arda_java=16 fake_stubs=40
-```
-
-The four javac warnings are only serialVersionUID warnings in fake Android validation stubs, not ARDA
-source compile errors.
-
-Not yet claimed:
-- real AOSP/Soong Phase 2.1 build;
-- real Rust/Cargo Android build, because Cargo is unavailable in the artifact-preparation container;
-- Raspberry Pi enforcing-SELinux Manager <-> router registration;
-- end-to-end Phase 2.1 VHAL set -> AIDL adapter -> ACK + confirmed-state smoke.
-
-The new Android smoke runner never calls `setenforce 0`. On registration failure it captures socket
-and process contexts plus recent SELinux AVCs. If enforcing policy blocks the manual ADB-launched
-router, the next implementation step is init-managed `vehicle-routerd` plus a dedicated narrow
-SELinux domain/socket policy.
-
-## 2026-07-08 Phase 2.1 enforcing boundary and Phase 2.2 platformization
-
-The real Phase 2.1 Android Docker Rust build and canonical `vendor/arda/vehicle` Soong builds passed.
-Phase 2.0 grant state survived APK replacement and reboot with source `10000` and the smoke adapter
-remained `granted=true signer_ok=true connected=true ready=true`.
-
-A local Android `LocalSocket` ordering bug was found before the first real SELinux gate. Calling
-`setSoTimeout()` on a fresh `LocalSocket` failed with `IOException: socket not created` before
-`connect()`. The Manager now connects first and sets the 5-second handshake timeout afterward.
-Runtime behavior changed from the local pre-connect error to the expected OS results:
-
-```text
-router absent  -> No such file or directory
-router present -> Permission denied
-```
-
-With SELinux explicitly `Enforcing`, the manually ADB-root-launched router created:
-
-```text
-/dev/socket/arda_vehicle_router
-u:object_r:socket_device:s0
-```
-
-and the Manager reached `LocalSocket.connect()`. The exact current denial is:
-
-```text
-avc: denied { write }
-scontext=u:r:system_app:s0
-tcontext=u:object_r:socket_device:s0
-tclass=sock_file
-permissive=0
-```
-
-This is the first real Phase 2.1 enforcing platform boundary. The bridge/protobuf/AIDL path must not be
-bypassed with permissive mode or a broad `system_app -> socket_device` allow rule.
-
-Phase 2.2 source now introduces the production-shaped boundary:
-
-```text
-init
-  -> creates + binds + listens /dev/socket/arda_vehicle_router
-  -> socket type arda_vehicle_router_socket
-  -> starts /system_ext/bin/arda-senderd vehicle-routerd
-  -> domain transition to arda_vehicle_router
-  -> exports ANDROID_SOCKET_arda_vehicle_router
-
-arda-senderd vehicle-routerd
-  -> validates inherited fd is open, SOCK_STREAM and SO_ACCEPTCONN=1
-  -> validates local pathname is /dev/socket/arda_vehicle_router
-  -> consumes the inherited listener
-
-com.arda.vehicle.manager
-  -> package-specific arda_vehicle_manager domain
-  -> narrow unix_socket_connect to arda_vehicle_router
-```
-
-The old manual listener path remains available when no init control-socket environment variable is
-present, preserving existing custom socket and router smoke workflows.
-
-New product integration source:
-
-```text
-vendor/arda/vehicle/router-service
-vendor/arda/vehicle/sepolicy/private
-scripts/stage-arda-vehicle-router-prebuilt.sh
-```
-
-`arda_vehicle.mk` now includes both `ArdaVehicleManager` and `arda-vehicle-routerd`; the smoke adapter
-remains opt-in.
-
-Phase 2.2 completed the real Android Docker Rust rebuild, AOSP Soong/system_ext policy build,
-coherent precompiled-policy/hash deployment, init-managed router startup, dedicated socket/router/Manager
-domain validation, and full Manager command/ACK/confirmed-state smoke under Enforcing.
-
-The exact runtime-proven additions were the socket-type `connectto` rule for the Manager and
-`self:process execmem` only for the dedicated Wasmtime router domain. No broad generic app/socket rule
-was added.
-
-## 2026-07-08 Phase 2.1 / Phase 2.2 final closure
-
-Final Enforcing gate:
-
-```text
-MANAGER_BRIDGE_MANAGER_DOMAIN=PASS
-MANAGER_BRIDGE_ROUTER_REGISTRATION=PASS
-VEHICLE_MANAGER_BRIDGE_SMOKE_SET_HANDLED=YES
-VEHICLE_MANAGER_BRIDGE_SMOKE_CONFIRMED_STATE=YES
-VEHICLE_MANAGER_BRIDGE_SMOKE_ACK_ROUND_TRIP=YES
-VEHICLE_MANAGER_BRIDGE_SMOKE_OK=YES
-MANAGER_BRIDGE_ENFORCING_RUNTIME_GATE=PASS selinux=Enforcing
-```
-
-Router startup is production-shaped:
-
-```text
-init-created /dev/socket/arda_vehicle_router
-  -> u:object_r:arda_vehicle_router_socket:s0
-
-/system_ext/bin/arda-senderd
-  -> u:object_r:arda_vehicle_router_exec:s0
-  -> u:r:arda_vehicle_router:s0
-  -> VEHICLE_ROUTER_SOCKET_MODE=init_inherited
-  -> VEHICLE_WASM_ENGINE ready
-
-com.arda.vehicle.manager
-  -> u:r:arda_vehicle_manager:s0
-```
-
-Phase 2.1: CLOSED.
-Phase 2.2: CLOSED.
-
-Git checkpoints:
-
-```text
-android_vendor_arda      b53e5473d31de98573cb426c6618bdc9cc699e07
-android_device_brcm_rpi4 0b13b2a565056f0b32a23abe9acc362401524b1a
-```
-
-Canonical Android platform source is `android_vendor_arda/vehicle`; `aaos-aap` does not keep a
-duplicate in-repo Vehicle platform tree.
+# ARDA AAOS / RPi4 H.264 1080p30 HANDOVER
+Current checkpoint: 2026-08-19 ~22:20 TRT
+
+## PRIMARY GOAL
+
+Raspberry Pi 4 üzerindeki AAOS 16 sisteminde gerçek ScreenRecorder / virtual-display capture yolunu:
+
+1920x1080
+>=30 fps sustainable
+H.264 hardware encode
+no artificial frame cap
+no GPU/CPU format conversion bottleneck
+no SWIOTLB/scatterlist failures
+
+seviyesine çıkarmak.
+
+Durable image build ancak gerçek runtime >=30fps + stability PASS sonrasında yapılacak.
+
+
+============================================================
+HARD WORKFLOW CONSTRAINTS
+============================================================
+
+- NEVER run `repo sync`.
+- Git commit/push ancak kullanıcı açıkça isterse.
+- Generated helper scripts için SHA-256 yazma.
+- ADB transport order:
+    1. USB serial 1000000028c0b59c
+    2. 192.168.1.185:5555
+    3. 192.168.1.15:5555
+
+  Bir transaction transport seçince root/remount/push/reboot/verify boyunca pinned kalmalı.
+
+- Build host:
+    edo@192.168.1.55
+
+- SSH key:
+    ~/.ssh/id_ed25519_arda_build
+
+- AOSP:
+    /home/edo/aosp-rpi-aaos16
+
+- Lunch:
+    aosp_rpi4_car-bp4a-userdebug
+
+- Studio screen mirroring / Studio screenrecord test sırasında kapalı.
+  HWC virtual display slotunu tüketebiliyor.
+
+- Do not manipulate Mac terminal state with stty/tput/escape hacks.
+
+- No durable image yet.
+
+- Unrelated dirty files resetlenmemeli.
+
+- Failed source experiment only restores its own touched files from its own backup.
+
+
+============================================================
+CLOSED ROOT CAUSES / DO NOT REOPEN RANDOMLY
+============================================================
+
+1. Original CPU FormatConverter
+   ABGR → NV12 CPU conversion çok yavaştı.
+   Bu primary production direction değil artık.
+
+2. Direct HWC/ISP path works.
+
+3. `/dev/video12` hardware ISP has ample isolated capacity.
+   Native staging proof ~49 fps.
+
+4. GPU/system DMA-BUF direct video12 import:
+   fails due scatterlist/SWIOTLB.
+   This route closed.
+
+5. Reserved/CMA allocator path:
+   GPU RGBA surface için contiguous reserved heap allocation proven.
+
+6. Stock HWC virtual display buffer:
+   HAL IMPLEMENTATION_DEFINED / XB24
+   direct video12 DMABUF import PROVEN.
+   No reserved-minigbm extension required for HWC.
+
+7. HWC colors:
+   XB24/BGR4 direct test visually correct after startup;
+   no obvious red/blue swap.
+
+8. C2 output NV12 block:
+   directly importable to video12 capture DMABUF.
+   Full-DMABUF path proven.
+
+9. C2 buffer count:
+   not bottleneck.
+   8 blocks observed, no waits.
+   Do NOT change kInputBufferCount 2→4.
+
+10. FrameDropper / max-fps:
+    explicit 60 vs omitted --frame-rate produced same ~58ms input cadence.
+    Not primary bottleneck.
+
+11. AIDL InputSurface files:
+    instrumented implementation was not runtime owner.
+    Dead path. Do not return there.
+
+12. GraphicBufferSource:
+    runtime implementation is DEPRECATED path.
+    Original measurements:
+      onFrame ~61ms
+      free buffers 14–16
+      blocked=0
+      submit ~0.28ms
+    GBS itself wasn't original bottleneck.
+
+13. video11:
+    typically mostly idle at original cadence.
+    Not original 15–20fps cause.
+
+14. SWIOTLB:
+    Current HWC full-DMABUF runs have:
+      SWIOTLB_RUNTIME_COUNT=0
+
+15. CMA:
+    no current runtime pressure/leak explaining FPS.
+
+
+============================================================
+CURRENT PRODUCTION-DIRECTION PIPELINE
+============================================================
+
+Screen / SurfaceFlinger
+    ↓
+HWC virtual display
+    buffer:
+      HAL format = IMPLEMENTATION_DEFINED
+      DRM fourcc = XB24
+      1920x1080
+      stride=1920
+    ↓ DMABUF
+FormatConverter direct candidate
+    accepts:
+      RGBA_8888
+      OR IMPLEMENTATION_DEFINED
+    ↓
+ArdaIspFullDmabufConverter
+    video12 OUTPUT:
+      BGR4 DMABUF
+    ISP
+    video12 CAPTURE:
+      NV12 directly into existing C2 output DMABUF
+    ↓
+video11
+    hardware H264
+    ↓
+ScreenRecorder H264
+
+No CPU input copy.
+No CPU output copy in full-DMABUF path.
+
+
+============================================================
+IMPORTANT HWC FACT
+============================================================
+
+HWC Virtual Display is structurally active when:
+
+vendor.hwc.drm.enable_virtual_display=1
+
+then:
+
+service call SurfaceFlinger 1021 i32 1
+
+dumpsys SurfaceFlinger should show:
+
+name="ScreenRecorder"
+isGpu=false
+
+Current pacesetter:
+
+renderRate=30.00 Hz
+
+physical active mode:
+
+vsyncRate=60.00 Hz
+
+
+============================================================
+LOW-LOG HWC VS GPU RESULT
+============================================================
+
+HWC:
+  frames=470 / 24 s
+  requested-window=19.583 fps
+  wall=18.800
+
+GPU:
+  frames=382
+  requested-window=15.917
+  wall=15.134
+
+HWC ~23% faster.
+
+Therefore HWC is current production direction.
+
+
+============================================================
+SURFACEFLINGER PIPELINE COUNTER RESULT
+============================================================
+
+Initial low-overhead SF counter test showed approximately:
+
+Scheduler signals:
+  ~21.74/s
+
+commit true:
+  ~18.7/s
+
+VDS queue:
+  ~19.6/s
+
+HWC present:
+  ~0.945 ms average
+
+VDS refresh:
+  ~1.93 ms
+
+VDS queueBuffer call:
+  ~1.75 ms
+
+Conclusion:
+HWC present / VDS queue call itself was not blocking for tens of ms.
+
+
+============================================================
+MESSAGEQUEUE / REQUEST CADENCE TEST
+============================================================
+
+MessageQueue exact source established:
+
+SurfaceFlinger is event-driven.
+
+`scheduleFrame()` does NOT mean:
+"run continuously at renderRate=30".
+
+Instead it arms a next VSync callback.
+
+MessageQueue also coalesces callbacks if mFramePending is already true.
+
+Baseline counter result:
+
+MQ scheduleFrame rate ≈ 21.019/s
+MQ callback rate      ≈ 20.695/s
+MQ accepted           ≈ 20.695/s
+MQ handle             ≈ 20.695/s
+coalesced             = 0
+
+Scheduler signal      ≈ 20.690/s
+
+Thus baseline:
+frame request itself was only ~21Hz.
+VSyncDispatch and main Looper were not dropping a 30Hz request stream.
+
+
+============================================================
+INTERNAL FORCE-COMPOSITE CONTROL
+============================================================
+
+Diagnostic patch in SurfaceFlinger.cpp:
+
+property:
+  debug.arda.force_composite_loop
+
+When true, composite() schedules another:
+
+  scheduleComposite(FrameHint::kNone);
+
+This maintains an internal request stream instead of relying only on app/content transaction cadence.
+
+Seed:
+  service call SurfaceFlinger 1004
+
+(1004 exact source = force composite ahead of next VSYNC)
+
+
+============================================================
+FORCE LOOP RESULT BEFORE VDS FORCE
+============================================================
+
+Force loop increased scheduling strongly:
+
+MQ schedule:
+  ~43.46/s
+
+MQ callback:
+  ~25.61/s
+
+Scheduler signal:
+  ~24.23/s
+
+But:
+
+VDS begin:
+  570
+
+original mustRecompose true:
+  439
+
+queueBuffer:
+  439
+
+cancel:
+  131
+
+H264:
+  439 ~= 18.29 fps
+
+This proved another gate:
+
+LegacyVirtualDisplaySurface was cancelling frames when incoming
+mustRecompose=false.
+
+Therefore VDS dirty/must gate became a separate source of frame loss.
+
+
+============================================================
+FORCE VDS RECOMPOSE CONTROL
+============================================================
+
+Diagnostic property:
+
+  debug.arda.force_vds_recompose
+
+LegacyVirtualDisplaySurface::beginFrame:
+
+for ScreenRecorder only:
+
+  mMustRecompose =
+      mustRecompose ||
+      debug.arda.force_vds_recompose
+
+This is diagnostic only.
+
+
+============================================================
+LATEST AUTHORITATIVE RUNTIME TEST
+============================================================
+
+Archive:
+ARDA_H264_HWC_FORCE_VDS_RECOMPOSE_CONTROL_RESUME_V1_1_20260819_221241
+
+Latest uploaded archive:
+Archive(20260819-191840).zip
+
+Build reused successful 21:48 SurfaceFlinger build.
+
+USB transport:
+1000000028c0b59c
+
+Fresh reboot:
+PASS
+
+settle uptime:
+180s
+
+HWC:
+PASS
+
+C2 full-DMABUF:
+PASS
+
+isGpu:
+false
+
+SWIOTLB:
+0
+
+
+Exact counters:
+
+MQ_SCHEDULE=1015
+MQ_ARMED=366
+MQ_CALLBACK=651
+MQ_ACCEPTED=609
+MQ_COALESCED=42
+MQ_HANDLE=609
+MQ_ELAPSED_US=24634702
+
+MQ_SCHEDULE_RATE_FPS=41.202
+MQ_CALLBACK_RATE_FPS=26.426
+MQ_HANDLE_RATE_FPS=24.721
+
+Scheduler:
+
+PIPE_SIGNAL=609
+PIPE_COMMIT_TRUE=556
+PIPE_COMMIT_FALSE=53
+PIPE_COMPOSITE=556
+PIPE_ELAPSED_US=24631738
+
+PIPE_SIGNAL_RATE_FPS=24.724
+
+VDS:
+
+VDS_BEGIN=545
+VDS_MUST=360
+VDS_COMMITTED=545
+VDS_QUEUE_OK=545
+VDS_QUEUE_ERROR=0
+VDS_CANCEL=0
+
+VDS_BEGIN_RATE_FPS=22.718
+VDS_QUEUE_OK_RATE_FPS=22.718
+
+H264:
+
+FRAME_COUNT=543
+FPS_REQUESTED_WINDOW=22.625
+FPS_WALL=21.789
+
+CAPTURE_RC=0
+SF_VIRTUAL_IS_GPU=false
+SWIOTLB_RUNTIME_COUNT=0
+
+
+============================================================
+CRITICAL ANALYZER CORRECTION
+============================================================
+
+The test analyzer printed:
+
+FORCE_VDS_RECOMPOSE_EFFECTIVE_GATE=FAIL
+FORCE_VDS_CONTROL_STRUCTURAL_GATE=FAIL
+
+THIS IS A FALSE NEGATIVE.
+
+Reason:
+
+The existing VDS instrumentation increments its `must` counter based on the
+original `mustRecompose` argument BEFORE the new diagnostic force is applied.
+
+Therefore:
+
+VDS_MUST=360
+
+does NOT represent final:
+
+mMustRecompose = mustRecompose || ardaForceRecompose
+
+The actual force-recompose effectiveness is proven by:
+
+VDS_BEGIN      = 545
+VDS_QUEUE_OK   = 545
+VDS_CANCEL     = 0
+
+Hence every VDS begin frame reached queueBuffer.
+
+H264=543 is also essentially 1:1 with VDS queue=545.
+
+Correct classification:
+
+FORCE_VDS_RECOMPOSE=PASS
+
+VDS dirty/mustRecompose filtering is no longer the current FPS bottleneck.
+
+
+============================================================
+CURRENT FIRST MAJOR DROP
+============================================================
+
+With both controls enabled:
+
+MQ callbacks:
+  651
+
+accepted/handled:
+  609
+
+Scheduler signals:
+  609
+
+commit true:
+  556
+
+commit false:
+  53
+
+VDS begin:
+  545
+
+VDS queue:
+  545
+
+H264:
+  543
+
+
+The largest currently actionable explicit frame rejection is:
+
+Scheduler signal
+  609
+      ↓
+commit()
+  true  = 556
+  false = 53
+
+
+VDS after successful commit is effectively clean:
+
+545 begin
+545 queue
+0 cancel
+
+Encoder tracks VDS almost 1:1:
+
+545 queue
+543 H264
+
+
+============================================================
+NEXT EXPERIMENT
+============================================================
+
+Prepared script:
+
+ARDA_H264_SF_COMMIT_FALSE_REASON_COUNTER_V1_20260819.sh
+
+Purpose:
+
+Instrument exact SurfaceFlinger::commit() false exits while running the
+same:
+
+- internal force-composite control
+- HWC ScreenRecorder
+- force VDS recompose
+- full-DMABUF C2 path
+
+Reasons counted:
+
+PACESETTER_REMOVED
+MODESET_FRAME_PENDING
+MODESET_FINALIZE_PENDING
+HWC_BACKPRESSURE
+NO_MUST_COMPOSITE
+BOOT_STAGE
+
+
+Primary decision:
+
+If most commit=false are:
+
+HWC_BACKPRESSURE
+→ physical pacesetter/frame-target backpressure is the next target.
+→ likely investigate 30Hz renderRate vs 60Hz hardware VSync,
+  or decouple capture VDS from physical-display backpressure.
+
+If most are:
+
+NO_MUST_COMPOSITE
+→ duplicate/extra scheduled callbacks are arriving without a true composite need.
+→ redesign force loop as one outstanding self-schedule request,
+  rather than over-requesting.
+
+If modeset reasons:
+→ stabilize display mode handling first.
+
+Do NOT optimize encoder/C2 again before this commit-false result.
+
+
+============================================================
+CURRENT SOURCE STATE
+============================================================
+
+frameworks/native current dirty files:
+
+ M services/surfaceflinger/CompositionEngine/src/Display.cpp
+ M services/surfaceflinger/DisplayHardware/VirtualDisplay/LegacyVirtualDisplaySurface.cpp
+ M services/surfaceflinger/Scheduler/MessageQueue.cpp
+ M services/surfaceflinger/Scheduler/Scheduler.cpp
+ M services/surfaceflinger/SurfaceFlinger.cpp
+
+These collectively contain:
+
+- ARDA_SF_PIPE_TL_V1 counters
+- ARDA_MQ_REQ_TL_V1 counters
+- ARDA_FORCE_COMPOSITE_CONTROL_V1
+- debug.arda.force_composite_loop
+- debug.arda.force_vds_recompose
+- VDS force-recompose diagnostic
+
+Latest relevant backup before force-VDS modification:
+
+/home/edo/aosp-rpi-aaos16/arda-source-backups/
+20260819_214822-before-force-vds-recompose-v1
+
+Do not broad-reset these files.
+
+
+============================================================
+OTHER EXISTING DIRTY TREES TO PRESERVE
+============================================================
+
+frameworks/av likely still contains:
+
+ M cmds/screenrecord/screenrecord.cpp
+ M media/module/bqhelper/flagged_files/DeprecatedGraphicBufferSource.inc
+ M media/module/bqhelper/flagged_files/GraphicBufferSource.inc
+
+external/v4l2_codec2 contains existing project changes including:
+
+common/FormatConverter.cpp
+components/V4L2EncodeComponent.cpp
+components/V4L2EncodeInterface.cpp
+components/V4L2Encoder.cpp
+
+FormatConverter includes:
+- full-DMABUF ISP path
+- HWC IMPLEMENTATION_DEFINED direct candidate
+- ARDA_HWC_INPUT_DMABUF_PROBE_V1
+
+external/minigbm also contains reserved allocator work.
+
+Do not reset unrelated work.
+
+
+============================================================
+RUNTIME CURRENT STATE AFTER TEST
+============================================================
+
+Cleanup executed:
+
+debug.arda.force_vds_recompose=0
+debug.arda.force_composite_loop=0
+
+HWC virtual display runtime switch restored/disabled.
+
+vendor.hwc.drm.enable_virtual_display restored to previous value.
+
+Runtime deployed SurfaceFlinger still contains diagnostic code.
+
+C2 APEX still contains current:
+- HWC direct import
+- full-DMABUF
+- prior C2 instrumentation
+
+Fresh reboot may recreate stale minigbm allocator bind; every test must drain it
+after reboot before capture.
+
+
+============================================================
+PERFORMANCE INTERPRETATION
+============================================================
+
+Current 22.6fps is NOT proof that hardware encoder capacity is 22.6fps.
+
+Known isolated ISP pipeline capacity was ~49fps.
+
+Current forced VDS result shows:
+
+VDS queue:
+545
+
+H264:
+543
+
+Thus encoder is consuming almost every frame it is given at this current input
+rate.
+
+Current bottleneck remains upstream in SurfaceFlinger scheduling / commit pacing.
+
+The latest run materially improved real output:
+
+baseline HWC low-log:
+~19.58fps
+
+forced VDS/current:
+~22.63fps
+
+and eliminated VDS cancel/drop entirely.
+
+
+============================================================
+IMMEDIATE EXECUTION
+============================================================
+
+Run:
+
+cd ~/Downloads
+
+chmod +x ARDA_H264_SF_COMMIT_FALSE_REASON_COUNTER_V1_20260819.sh
+
+/bin/bash -n ARDA_H264_SF_COMMIT_FALSE_REASON_COUNTER_V1_20260819.sh \
+  || exit 1
+
+/bin/bash ARDA_H264_SF_COMMIT_FALSE_REASON_COUNTER_V1_20260819.sh
+
+Studio mirroring must remain OFF.
+
+When result ZIP is produced:
+inspect it automatically.
+
+First inspect:
+
+test/analysis.txt
+test/focused-logcat.txt
+test/logcat-live.txt
+test/sf-case.txt
+run.log
+source/status-final.txt
+
+Validate reason accounting independently:
+
+sum(commit-false reason counts)
+must equal or explain PIPE_COMMIT_FALSE.
+
+Do not trust automatic classification blindly.
+
+Then continue only at the first proven rate/drop stage.

@@ -6696,7 +6696,33 @@ impl VideoLiveSender {
         }
         self.config.width = selection.width;
         self.config.height = selection.height;
-        self.config.fps = selection.fps;
+
+        // ARDA Pi 4 H.264 workload policy:
+        // keep the SDR-advertised rate as an upper bound, preserve the
+        // configured --video-fps cap, and enforce a 1080p30-equivalent
+        // pixel-rate ceiling for the hardware encoder.
+        let sdr_fps = selection.fps.max(1);
+        let configured_fps_cap = self.config.fps.max(1).min(60);
+        let stream_pixels =
+            (selection.width.max(1) as i64) * (selection.height.max(1) as i64);
+        let h264_pixel_budget = 1920_i64 * 1080_i64 * 30_i64;
+        let hardware_fps_cap = (h264_pixel_budget / stream_pixels).clamp(1, 60) as i32;
+        self.config.fps = sdr_fps
+            .min(configured_fps_cap)
+            .min(hardware_fps_cap);
+
+        let fps_policy = format!(
+            "VIDEO_FPS_POLICY sdr_fps={} configured_cap={} hardware_cap={} effective_fps={} stream={}x{} pixel_budget=1920x1080x30",
+            selection.fps,
+            configured_fps_cap,
+            hardware_fps_cap,
+            self.config.fps,
+            selection.width,
+            selection.height
+        );
+        println!("{fps_policy}");
+        log_line(dump, &fps_policy)?;
+
         self.config.density = self.wm_density_for_selection(selection);
         let line = format!(
             "VIDEO_NATIVE configured from SDR: stream_size={}x{} fps={} bit_rate={} density={} real_density={} total_margins={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{} config_index={} codec={} resolution={}",
@@ -6785,6 +6811,7 @@ impl VideoLiveSender {
     fn spawn_screenrecord_capture_child(&self, stdout: Stdio, seconds: &str) -> io::Result<Child> {
         let size = format!("{}x{}", self.config.width, self.config.height);
         let bit_rate = self.config.bit_rate.to_string();
+        let fps = self.config.fps.to_string();
         let codec_name = preferred_codec_name();
         let stderr = OpenOptions::new()
             .create(true)
@@ -6804,6 +6831,8 @@ impl VideoLiveSender {
             .arg(&size)
             .arg("--bit-rate")
             .arg(&bit_rate)
+            .arg("--frame-rate")
+            .arg(&fps)
             .arg("--time-limit")
             .arg(seconds)
             .arg("--codec-name")

@@ -1,5 +1,7 @@
 # ARDA plan
 
+> **Current pointer (2026-08-13):** The historical `Current milestone` line below is obsolete. The canonical current checkpoint and active work are documented in the `2026-08-13 canonical private-repo checkpoint + 1080p30 H.264 performance` section at the end of this file and in `ARDA_HANDOVER_20260813_H264_1080P30.md`.
+
 Current milestone: TCP + TLS + auth + service discovery + ping response works.
 
 v24c patch:
@@ -1133,3 +1135,134 @@ Still required outside this source archive:
 - Patch phone companion to start/inspect hotspot, send INTERNET_OFFER, read INTERNET_RESULT, then connect to returned AAOS Wi-Fi endpoint.
 - No ArdaPlatform protocol change is required if it remains a transparent RFCOMM byte pump.
 - Do not close RFCOMM until the direct Wi-Fi HELLO/PING/PONG gate passes.
+
+
+## 2026-08-13 canonical private-repo checkpoint + 1080p30 H.264 performance
+
+This section supersedes older "current milestone" pointers above. The chronological history remains useful, but the canonical working state is now the checkpoint below.
+
+### Ubuntu/AOSP source checkpoint
+
+Build host and tree:
+
+```text
+edo@192.168.1.55
+/home/edo/aosp-rpi-aaos16
+```
+
+The following ARDA-owned repositories are the current remote-contained checkpoints. All GitHub repositories listed here are **PRIVATE** for the current temporary development period.
+
+```text
+packages/apps/Car/Launcher
+  branch: arda-poc-checkpoint
+  remote: github -> Deadknight/arda-aaos-car-launcher
+  commit: fe205c5870d01b395e4e3df2614e7c6d2b41c114
+
+packages/apps/Car/MediaPrebuilt
+  branch: arda-poc-checkpoint
+  remote: github -> Deadknight/android_packages_apps_Car_MediaPrebuilt
+  commit: 1342ba973e3c8e70342144c736b3a5eb94a6ddd7
+
+packages/apps/Car/SystemUI
+  branch: arda-aaos16
+  remote: arda -> Deadknight/android_packages_apps_Car_SystemUI
+  commit: c35ec54d6457c6801043838028f8ad66d422bf59
+
+device/brcm/rpi4
+  branch: arda-aaos16
+  remote: arda -> Deadknight/android_device_brcm_rpi4
+  commit: a0b6ae212be2f9815213519860ccb78d56b13734
+
+vendor/arda
+  branch: arda-aaos16
+  remote: origin -> Deadknight/android_vendor_arda
+  commit: e79d85effc39207a946825710383f2732f4d1c35
+
+vendor/arda/ardaplatform
+  branch: main
+  remote: origin -> Deadknight/android_vendor_arda_ardaplatform
+  commit: 63df5257e5667373470f97a0867607d8817cc9ba
+```
+
+Checkpoint finalization gates:
+
+```text
+ALL_SIX_PINNED_HEADS_PRESERVED=PASS
+ALL_SELECTED_GITHUB_REPOS_PRIVATE=PASS
+ALL_SIX_ARDA_TARGET_REPOS_REMOTE_CONTAINED=PASS
+UBUNTU_DIRTY_REPOS_AFTER=0
+GLOBAL_AOSP_WORKTREES_CLEAN=PASS
+AOSP_REMOTE_PUSHED=NO
+REPO_SYNC_CALLED=NO
+ARDA_FINALIZE_UNSHALLOW_PUSH_V6=PASS
+```
+
+`packages/apps/Car/Launcher` and `packages/apps/Car/MediaPrebuilt` were shallow AOSP checkouts. They were targeted with:
+
+```text
+git fetch --unshallow --no-tags aosp
+```
+
+only so their current branches could be pushed to empty/private GitHub repositories. Their HEADs and worktrees were verified unchanged. This was **not** `repo sync`.
+
+The Mac `aaos-aap` repository remains separately user-managed:
+
+```text
+/Users/edo/Documents/Code/aaos-aap
+```
+
+Do not infer its push/clean status from the Ubuntu checkpoint above.
+
+### Current platform/UI state relevant to continuation
+
+The earlier projection-insets/SystemUI bring-up is no longer the active coding task. Current runtime-validated platform work includes the projection display-profile reconcile, full multitouch, physical-key handling, and the later CarSystemUI vertical quick-control/system-bar recreation fixes. Horizontal notification/widget controls were also runtime-tested successfully before this checkpoint.
+
+The boot-settle gate for the first AAP session is present in the current `vendor/arda/ardaplatform` checkpoint, but the real-HU cold-boot validation was intentionally deferred because it requires access to the vehicle. Do not treat that real-HU gate as closed yet.
+
+### Active H.264 performance target
+
+The active performance goal is:
+
+```text
+1920x1080
+~30 real encoded fps
+Raspberry Pi 4
+hardware H.264: c2.v4l2.avc.encoder
+minimum avoidable ARM/CPU conversion cost
+```
+
+Operational policy: an SDR profile advertising 60 fps does not force ARDA to intentionally overload the Pi 4 encoder at 1080p60. For the 1080p path, use a hardware-aware effective target of 30 fps and verify that the HU accepts the lower actual frame cadence. Do not claim protocol semantics beyond runtime evidence; validate on DHU/real HU.
+
+Current `aaos-aap` source facts that matter:
+
+```text
+VideoConfigSelection.fps comes directly from SDR (30 or 60).
+LiveVideoSender::configure_from_sdr currently assigns:
+  self.config.fps = selection.fps
+
+Production video backend is platform /system/bin/screenrecord.
+The ARDA screenrecord command currently passes:
+  --output-format=h264
+  --size WIDTHxHEIGHT
+  --bit-rate BITRATE
+  --time-limit 0
+  --codec-name c2.v4l2.avc.encoder
+
+It does NOT pass a frame-rate argument.
+AAP video PTS currently uses:
+  pts_us = frame_index * 1_000_000 / self.config.fps
+```
+
+Therefore merely changing ARDA's PTS/config fps from 60 to 30 is not sufficient if platform `screenrecord` still configures MediaCodec from a 60 Hz display. The next implementation must control the actual encoder/capture cadence as well as AAP PTS.
+
+### Next H.264 work order
+
+1. Read-only audit the **actual Android 16 build-host `screenrecord` source** and current V4L2 Codec2 encoder configuration path.
+2. Confirm exactly where `KEY_FRAME_RATE`, operating rate, repeat/refresh cadence, color-format conversion, and encoder surface are configured.
+3. Measure/identify whether current 1080p path is attempting 60-fps encoder input when SDR advertises 60.
+4. Implement the narrowest hardware-aware 1080p30 control. Prefer a vendor-owned/capture-owned solution; patch generic AOSP only if the actual source proves there is no clean vendor boundary.
+5. Keep AAP PTS at the same effective fps as the actual produced cadence.
+6. Runtime gate target: stable encoded output as close to 30 fps as practical (target >=29 fps), no software codec fallback, no thermal throttling, and no avoidable CPU RGBA->NV12 bottleneck.
+7. Only after the 30-fps workload is real should GPU/dmabuf/NV12 conversion optimization be judged necessary.
+
+Do not run `repo sync`. Do not commit/push H.264 changes until runtime behavior is approved.

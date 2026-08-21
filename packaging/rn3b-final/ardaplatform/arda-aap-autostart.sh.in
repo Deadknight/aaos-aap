@@ -7,9 +7,6 @@ PLATFORM_PACKAGE="@PACKAGE@"
 VIDEO_OVERRIDE_CONFIG="/data/user_de/0/$PLATFORM_PACKAGE/files/arda-aap-video.toml"
 DEFAULT_VIDEO_POLICY="balanced"
 DEFAULT_VIDEO_CODEC="c2.v4l2.avc.encoder"
-FALLBACK_VIDEO_CODEC="c2.android.avc.encoder"
-CUSTOM_MAPPER="/vendor/lib64/arda/libminigbm_gralloc_gbm_mesa.so"
-ACTIVE_MAPPER="/apex/com.android.hardware.graphics.allocator.minigbm_gbm_mesa/lib64/libminigbm_gralloc_gbm_mesa.so"
 CERT_DIR="/data/local/tmp/arda-certs"
 USB_NODE="/dev/usb_accessory"
 LOG="/data/local/tmp/arda-aap-auto.log"
@@ -94,16 +91,8 @@ video_codec_reason="EXPLICIT_ENV"
 if [ -n "${ARDA_SCREENRECORD_CODEC:-}" ]; then
     video_codec="$ARDA_SCREENRECORD_CODEC"
 else
-    video_codec="$FALLBACK_VIDEO_CODEC"
-    video_codec_reason="CUSTOM_MAPPER_NOT_ACTIVE"
-    if [ -s "$CUSTOM_MAPPER" ] && [ -s "$ACTIVE_MAPPER" ]; then
-        custom_mapper_hash="$(sha256sum "$CUSTOM_MAPPER" | awk '{print $1}')"
-        active_mapper_hash="$(sha256sum "$ACTIVE_MAPPER" | awk '{print $1}')"
-        if [ "$custom_mapper_hash" = "$active_mapper_hash" ]; then
-            video_codec="$DEFAULT_VIDEO_CODEC"
-            video_codec_reason="CUSTOM_MAPPER_ACTIVE"
-        fi
-    fi
+    video_codec="$DEFAULT_VIDEO_CODEC"
+    video_codec_reason="PRODUCTION_HWC_DMABUF_DEFAULT"
 fi
 log_marker "ARDA_AAP_AUTOSTART_LAUNCH=YES config=$CONFIG video_override=$VIDEO_OVERRIDE_CONFIG video_policy=$video_policy video_codec=$video_codec video_codec_reason=$video_codec_reason usb_node=$USB_NODE wait_seconds=$wait_seconds"
 

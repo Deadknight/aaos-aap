@@ -198,7 +198,7 @@ fn print_help() {
 Commands:
   capture-test [--size 1280x720] [--bit-rate 6000000] [--seconds 10] [--codec-name NAME] [--out PATH|-] [--loop]
       Starts Android screenrecord in raw H264 mode and writes Annex-B H264 to PATH or stdout.
-      Default codec: c2.v4l2.avc.encoder. ARDA autostart selects c2.android.avc.encoder when the persistent mapper override is unavailable. Override with --codec-name or ARDA_SCREENRECORD_CODEC.
+      Default codec: c2.v4l2.avc.encoder. ARDA production autostart uses the hardware codec by default. Override with --codec-name or ARDA_SCREENRECORD_CODEC.
 
   nal-info FILE [--limit 80]
       Prints NAL types and summary for a raw Annex-B H264 stream.

@@ -6066,6 +6066,79 @@ fn wait_for_ui_runtime(
     Ok(false)
 }
 
+// ARDA_SYSTEMUI_RECONCILE_PRIMARY_V1
+fn wait_for_ui_runtime_after_systemui_recycle(
+    expected_width: i32,
+    expected_height: i32,
+    expected_density: u32,
+    expected_system_server_pid: &str,
+    old_systemui_pid: &str,
+    timeout: Duration,
+    dump: &mut Option<Box<dyn Write>>,
+) -> io::Result<bool> {
+    let started = Instant::now();
+    let mut last_log_sec = u64::MAX;
+
+    while started.elapsed() < timeout {
+        let system_server = pidof_process("system_server");
+        let systemui = pidof_process("com.android.systemui");
+
+        let base_ready = ui_runtime_ready(
+            expected_width,
+            expected_height,
+            expected_density,
+            None,
+        );
+        let system_server_same =
+            system_server.as_deref() == Some(expected_system_server_pid);
+        let systemui_recycled = systemui
+            .as_deref()
+            .map(|now| now != old_systemui_pid)
+            .unwrap_or(false);
+
+        if base_ready && system_server_same && systemui_recycled {
+            let line = format!(
+                "DISPLAY_PROFILE_SYSTEMUI_READY elapsed_ms={} expected={}x{}@{} system_server={:?} old_systemui={} new_systemui={:?} carlauncher={:?}",
+                started.elapsed().as_millis(),
+                expected_width,
+                expected_height,
+                expected_density,
+                system_server,
+                old_systemui_pid,
+                systemui,
+                pidof_process("com.android.car.carlauncher")
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            return Ok(true);
+        }
+
+        let sec = started.elapsed().as_secs();
+        if sec != last_log_sec && (sec == 0 || sec % 2 == 0) {
+            last_log_sec = sec;
+            let line = format!(
+                "DISPLAY_PROFILE_SYSTEMUI_WAIT elapsed_s={} expected={}x{}@{} system_server={:?} expected_system_server={} old_systemui={} current_systemui={:?} wm_size={:?} wm_density={:?}",
+                sec,
+                expected_width,
+                expected_height,
+                expected_density,
+                system_server,
+                expected_system_server_pid,
+                old_systemui_pid,
+                systemui,
+                probe_wm_size().map(|(_, t)| t),
+                probe_wm_density().map(|(_, t)| t)
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    Ok(false)
+}
+
 fn run_text_command(program: &str, args: &[&str]) -> io::Result<String> {
     let out = Command::new(program).args(args).output()?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -6589,6 +6662,75 @@ impl VideoLiveSender {
         }
 
         write_text_file_atomic(ARDA_DISPLAY_PROFILE_PENDING_PATH, &hard_profile)?;
+
+        // ARDA_SYSTEMUI_RECONCILE_PRIMARY_V1:
+        // WM geometry is already exact at this point. Recycle only SystemUI first
+        // so display resources/insets are rebuilt without tearing down
+        // system_server, zygote, USB accessory state, or the native AAP session.
+        let targeted_system_server = pidof_process("system_server");
+        let old_systemui = pidof_process("com.android.systemui");
+
+        let systemui_kill_ok = match old_systemui.as_deref() {
+            Some(pid) => Command::new("/system/bin/kill")
+                .args(["-9", pid])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false),
+            None => false,
+        };
+
+        let line = format!(
+            "DISPLAY_PROFILE_SYSTEMUI_RECYCLE requested={} system_server={:?} old_systemui={:?} target='{}'",
+            systemui_kill_ok,
+            targeted_system_server,
+            old_systemui,
+            hard_profile
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
+        let targeted_ready = if systemui_kill_ok {
+            match (
+                targeted_system_server.as_deref(),
+                old_systemui.as_deref(),
+            ) {
+                (Some(expected_system_server), Some(old_systemui_pid)) => {
+                    wait_for_ui_runtime_after_systemui_recycle(
+                        cmd_w,
+                        cmd_h,
+                        wm_density,
+                        expected_system_server,
+                        old_systemui_pid,
+                        Duration::from_secs(12),
+                        dump,
+                    )?
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        if targeted_ready {
+            write_text_file_atomic(ARDA_DISPLAY_PROFILE_APPLIED_PATH, &hard_profile)?;
+            remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
+            let line = format!(
+                "DISPLAY_PROFILE_RECONCILE=PASS mode=systemui target='{}'",
+                hard_profile
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+            self.wm_settled = true;
+            return Ok(());
+        }
+
+        let line = format!(
+            "DISPLAY_PROFILE_SYSTEMUI_FALLBACK reason=targeted-reconcile-not-ready target='{}'",
+            hard_profile
+        );
+        println!("{line}");
+        log_line(dump, &line)?;
+
         let old_system_server = pidof_process("system_server");
         let restart_status = Command::new("/system/bin/setprop")
             .args(["ctl.restart", "zygote"])
@@ -6599,7 +6741,7 @@ impl VideoLiveSender {
             .map(|status| status.success())
             .unwrap_or(false);
         let line = format!(
-            "DISPLAY_PROFILE_RECONCILE_RESTART requested={} old_system_server={:?} target='{}'",
+            "DISPLAY_PROFILE_RECONCILE_RESTART requested={} old_system_server={:?} target='{}' reason=systemui-fallback",
             restart_ok,
             old_system_server,
             hard_profile
@@ -6620,7 +6762,7 @@ impl VideoLiveSender {
             write_text_file_atomic(ARDA_DISPLAY_PROFILE_APPLIED_PATH, &hard_profile)?;
             remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
             let line = format!(
-                "DISPLAY_PROFILE_RECONCILE=PASS mode=zygote target='{}'",
+                "DISPLAY_PROFILE_RECONCILE=PASS mode=zygote-fallback target='{}'",
                 hard_profile
             );
             println!("{line}");

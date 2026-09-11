@@ -1209,7 +1209,7 @@ fn select_video_config(configs: &[VideoConfiguration], policy: &str) -> Option<V
         }
         // A forced resolution missing from the HU response falls back to the
         // highest locally compatible quality rather than accidentally taking
-        // an expensive 1080p/4K profile.
+        // an expensive 1440p/4K profile. Balanced currently caps at Full HD.
         return select_video_config(configs, "balanced");
     }
 
@@ -1220,7 +1220,17 @@ fn select_video_config(configs: &[VideoConfiguration], policy: &str) -> Option<V
             let mut candidates: Vec<VideoConfigSelection> = selections
                 .iter()
                 .cloned()
-                .filter(|s| s.width <= 1280 && s.height <= 720)
+                .filter(|s| {
+                    // "Auto · best compatible" is intentionally capped at
+                    // Full HD. Prefer the best advertised profile up to
+                    // 1920x1080, but never auto-select 1440p/4K.
+                    //
+                    // Normalize orientation so 1080x1920 is treated the same
+                    // as 1920x1080 when a portrait video config is advertised.
+                    let long_edge = s.width.max(s.height);
+                    let short_edge = s.width.min(s.height);
+                    long_edge <= 1920 && short_edge <= 1080
+                })
                 .collect();
             if candidates.is_empty() {
                 selections.into_iter().next()

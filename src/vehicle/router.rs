@@ -17,11 +17,10 @@ use protobuf::Enum;
 
 use super::model::{
     property_name, validate_vehicle_command, validate_vehicle_signal, Capability,
-    VehicleCommand, VehicleSignal, VhalSetRequest,
 };
 use super::policy::{ready_line, VehiclePolicyEngine};
 use super::wire::{
-    self, envelope, pb, peer_credentials, read_envelope, vehicle_command_to_pb,
+    envelope, pb, peer_credentials, read_envelope, vehicle_command_to_pb,
     vehicle_signal_from_pb, vhal_event_to_pb, vhal_set_from_pb, write_envelope,
     DEFAULT_ROUTER_SOCKET, ROUTER_PROTOCOL_VERSION,
 };

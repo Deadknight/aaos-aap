@@ -447,10 +447,22 @@ fn activate_candidate(sha: &str, candidate: &CandidateKeys) -> io::Result<()> {
         fs::rename(&temp_dir, &version_dir)?;
     }
 
-    let previous_target = capture_current_target()?;
-    write_text_atomic(&state_path("previous.target"), &previous_target)?;
-    let previous_sha = read_trimmed(&state_path("active.sha")).unwrap_or_else(|| "legacy".into());
-    write_text_atomic(&state_path("previous.sha"), &previous_sha)?;
+    match capture_current_target()? {
+        Some(previous_target) => {
+            write_text_atomic(&state_path("previous.target"), &previous_target)?;
+            let previous_sha =
+                read_trimmed(&state_path("active.sha")).unwrap_or_else(|| "legacy".into());
+            write_text_atomic(&state_path("previous.sha"), &previous_sha)?;
+        }
+        None => {
+            // Genuine first install: there is no working certificate pair to preserve.
+            // Keep the candidate pending until AAP authentication confirms it, but do not
+            // invent a rollback target.
+            let _ = fs::remove_file(state_path("previous.target"));
+            let _ = fs::remove_file(state_path("previous.sha"));
+            println!("ARDA_AAP_KEY_UPDATE_FIRST_INSTALL=YES sha={sha}");
+        }
+    }
 
     switch_active_link(&version_dir)?;
     write_text_atomic(&state_path("pending.sha"), sha)?;
@@ -463,20 +475,28 @@ fn activate_candidate(sha: &str, candidate: &CandidateKeys) -> io::Result<()> {
     Ok(())
 }
 
-fn capture_current_target() -> io::Result<String> {
+fn capture_current_target() -> io::Result<Option<String>> {
     let active = active_link_path();
     if let Ok(target) = fs::read_link(&active) {
-        return Ok(target.to_string_lossy().into_owned());
+        return Ok(Some(target.to_string_lossy().into_owned()));
     }
 
     let legacy_cert = Path::new(DEFAULT_CERT_DIR).join("md_cert.pem");
     let legacy_key = Path::new(DEFAULT_CERT_DIR).join("md_key.pem");
-    if !legacy_cert.is_file() || !legacy_key.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no existing AAP certificate pair to preserve",
-        ));
+    let legacy_cert_exists = legacy_cert.is_file();
+    let legacy_key_exists = legacy_key.is_file();
+
+    match (legacy_cert_exists, legacy_key_exists) {
+        (false, false) => return Ok(None),
+        (true, true) => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing AAP certificate pair is incomplete",
+            ));
+        }
     }
+
     let cert = fs::read(&legacy_cert)?;
     let key = fs::read(&legacy_key)?;
     validate_cert_key_pair(&cert, &key)?;
@@ -489,7 +509,7 @@ fn capture_current_target() -> io::Result<String> {
         write_secure_file(&legacy_dir.join("md_cert.pem"), &cert)?;
         write_secure_file(&legacy_dir.join("md_key.pem"), &key)?;
     }
-    Ok(legacy_dir.to_string_lossy().into_owned())
+    Ok(Some(legacy_dir.to_string_lossy().into_owned()))
 }
 
 fn switch_active_link(target: &Path) -> io::Result<()> {
@@ -581,9 +601,20 @@ fn rollback_if_attempts_exhausted() -> io::Result<()> {
     if attempts < MAX_PENDING_ATTEMPTS {
         return Ok(());
     }
-    let previous_target = read_trimmed(&state_path("previous.target")).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "pending update has no previous.target")
-    })?;
+
+    let previous_target = match read_trimmed(&state_path("previous.target")) {
+        Some(previous_target) => previous_target,
+        None => {
+            // A first install has no prior working pair. There is nothing safe to roll
+            // back to, so keep the validated candidate pending for later AAP auth.
+            println!(
+                "ARDA_AAP_KEY_UPDATE_ROLLBACK=SKIP rejected_sha={} attempts={} reason=first_install_no_previous_target",
+                pending, attempts
+            );
+            return Ok(());
+        }
+    };
+
     let previous_path = PathBuf::from(previous_target);
     if !previous_path.join("md_cert.pem").is_file()
         || !previous_path.join("md_key.pem").is_file()
@@ -641,7 +672,7 @@ fn https_request_once(
     max_bytes: usize,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let mut socket = if let Some(proxy) = proxy {
+    let socket = if let Some(proxy) = proxy {
         let proxy_addr = SocketAddr::new(proxy.ip, proxy.port);
         let mut socket = TcpStream::connect_timeout(&proxy_addr, timeout)?;
         socket.set_read_timeout(Some(timeout))?;

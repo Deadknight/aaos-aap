@@ -5931,6 +5931,50 @@ fn run_settings_put_global(key: &str, value: &str) -> io::Result<bool> {
         .success())
 }
 
+// ARDA_SYSTEMUI_BAR_FRAME_LIVE_GATE_V1_20260913
+fn arda_insets_frame_right(line: &str) -> Option<i32> {
+    let frame_start = line.find("frame=[")?;
+    let rest = &line[frame_start + "frame=[".len()..];
+    let second_rect = rest.find("][")?;
+    let right_and_bottom = &rest[second_rect + 2..];
+    let comma = right_and_bottom.find(',')?;
+    right_and_bottom[..comma].trim().parse::<i32>().ok()
+}
+
+fn arda_systemui_bar_frames_match(expected_right: i32) -> bool {
+    let output = match std::process::Command::new("/system/bin/dumpsys")
+        .args(["window", "displays"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut status_match = false;
+    let mut navigation_match = false;
+
+    for line in text.lines() {
+        if line.contains("statusBars")
+            && arda_insets_frame_right(line) == Some(expected_right)
+        {
+            status_match = true;
+        }
+
+        if line.contains("navigationBars")
+            && arda_insets_frame_right(line) == Some(expected_right)
+        {
+            navigation_match = true;
+        }
+
+        if status_match && navigation_match {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn apply_projection_content_insets(
     selection: &proto::VideoConfigSelection,
     dump: &mut Option<Box<dyn Write>>,
@@ -6505,8 +6549,6 @@ impl VideoLiveSender {
         selection: &proto::VideoConfigSelection,
         dump: &mut Option<Box<dyn Write>>,
     ) -> io::Result<()> {
-        apply_projection_content_insets(selection, dump)?;
-
         if !self.config.apply_wm_config {
             let line = format!(
                 "WM_CONFIG not applied: stream={}x{} density={} real_density={} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
@@ -6586,43 +6628,86 @@ impl VideoLiveSender {
         println!("{line}");
         log_line(dump, &line)?;
 
+        // ARDA_DISPLAY_IDEMPOTENT_WM_INSETS_V2_20260912
+        //
+        // Geometry and profile reconciliation are intentionally separated:
+        // - size/density writes are needed only when runtime geometry differs;
+        // - profile changes with already-correct geometry still reconcile UI/insets;
+        // - projection insets are applied only after any geometry write;
+        // - an identical profile + identical runtime performs zero WM/inset writes.
+        let runtime_geometry_changed = size_mismatch_before || density_mismatch_before;
+
+        if runtime_geometry_changed {
+            let line = format!(
+                "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density_base={} density_scale={}.{}x density_unclamped={} density={} density_min_clamped={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
+                wm_width,
+                wm_height,
+                cmd_w,
+                cmd_h,
+                size_mode,
+                orientation_mode,
+                wm_density_base,
+                wm_density_scale_tenths / 10,
+                wm_density_scale_tenths % 10,
+                wm_density_unclamped,
+                wm_density,
+                wm_density_min_clamped,
+                self.config.wm_density_mode,
+                self.config.wm_force_geometry,
+                selection.width,
+                selection.height,
+                selection.margin_left,
+                selection.margin_right,
+                selection.margin_top,
+                selection.margin_bottom,
+                selection.content_width,
+                selection.content_height,
+                selection.safe_width,
+                selection.safe_height
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+
+            let size_arg = format!("{}x{}", cmd_w, cmd_h);
+            let density_arg = wm_density.to_string();
+            self.apply_wm_size_and_density(&size_arg, &density_arg, dump)?;
+            let _ = self.log_display_probe("after", dump)?;
+        } else {
+            let line = format!(
+                "WM_CONFIG=SKIP reason=runtime-already-exact command_size={}x{} density={}",
+                cmd_w, cmd_h, wm_density
+            );
+            println!("{line}");
+            log_line(dump, &line)?;
+        }
+
+        // ARDA_WM_APPLIED_SEMANTIC_FIX_V1_1_20260913
+        // `wm_applied` means the SDR-selected display configuration has been
+        // handled for this session, not that a physical WM write was required.
+        // Keeping this true on the zero-write fast path prevents the later
+        // native-video fallback from incorrectly forcing 720x1280.
+        self.wm_applied = true;
+
+        // ARDA_INSETS_SYSTEMUI_BAR_RECONCILE_V1_20260913
+        //
+        // The persisted display profile and WM geometry are not sufficient proof
+        // that live ProjectionInsets/SystemUI windows are current. Always refresh
+        // projection insets after geometry has settled, then include the live
+        // SystemUI bar-window width in the reconcile decision.
+        apply_projection_content_insets(selection, dump)?;
+
+        let systemui_bars_match_before =
+            arda_systemui_bar_frames_match(selection.content_width);
         let line = format!(
-            "WM_CONFIG applying: logical_size={}x{} command_size={}x{} size_mode={} size_orientation={} density_base={} density_scale={}.{}x density_unclamped={} density={} density_min_clamped={} density_mode={} force_geometry={} stream={}x{} margins=L{} R{} T{} B{} content={}x{} safe={}x{}",
-            wm_width,
-            wm_height,
-            cmd_w,
-            cmd_h,
-            size_mode,
-            orientation_mode,
-            wm_density_base,
-            wm_density_scale_tenths / 10,
-            wm_density_scale_tenths % 10,
-            wm_density_unclamped,
-            wm_density,
-            wm_density_min_clamped,
-            self.config.wm_density_mode,
-            self.config.wm_force_geometry,
-            selection.width,
-            selection.height,
-            selection.margin_left,
-            selection.margin_right,
-            selection.margin_top,
-            selection.margin_bottom,
-            selection.content_width,
-            selection.content_height,
-            selection.safe_width,
-            selection.safe_height
+            "DISPLAY_PROFILE_BAR_FRAME_COMPARE expected_right={} match={}",
+            selection.content_width, systemui_bars_match_before
         );
         println!("{line}");
         log_line(dump, &line)?;
 
-        let size_arg = format!("{}x{}", cmd_w, cmd_h);
-        let density_arg = wm_density.to_string();
-        self.apply_wm_size_and_density(&size_arg, &density_arg, dump)?;
-        let _ = self.log_display_probe("after", dump)?;
-        self.wm_applied = true;
+        let reset_needed =
+            profile_changed || runtime_geometry_changed || !systemui_bars_match_before;
 
-        let reset_needed = profile_changed || size_mismatch_before || density_mismatch_before;
         if !reset_needed {
             if pending_profile.is_some() {
                 remove_file_if_present(ARDA_DISPLAY_PROFILE_PENDING_PATH);
@@ -6672,7 +6757,8 @@ impl VideoLiveSender {
 
         let systemui_kill_ok = match old_systemui.as_deref() {
             Some(pid) => Command::new("/system/bin/kill")
-                .args(["-9", pid])
+                .arg("-9")
+                .args(pid.split_whitespace())
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false),

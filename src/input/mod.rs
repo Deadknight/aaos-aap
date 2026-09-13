@@ -721,7 +721,7 @@ impl AppProcessAudioCapture {
         report.push_str(&format!("rate={} channels={} source={} chunk_ms={} launch_as={} package={}\n", sample_rate, channels, source, chunk_ms, launch_as, package_name));
         append_audio_capture_permission_prep(&mut report, package_name);
 
-        let mut base_args = vec![
+        let base_args = vec![
             "/".to_string(),
             "com.arda.input.AudioCaptureServer".to_string(),
             "--rate".to_string(),

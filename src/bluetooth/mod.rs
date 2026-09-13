@@ -732,7 +732,6 @@ fn serve_bridge<S: Read + Write>(
             OP_SESSION_STOP => {
                 if proxy_endpoint.is_some() {
                     clear_android_proxy();
-                    proxy_endpoint = None;
                     if let Some(updater) = key_updater {
                         updater.proxy_gone();
                     }

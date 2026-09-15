@@ -6925,25 +6925,20 @@ impl VideoLiveSender {
         self.config.width = selection.width;
         self.config.height = selection.height;
 
-        // ARDA Pi 4 H.264 workload policy:
-        // keep the SDR-advertised rate as an upper bound, preserve the
-        // configured --video-fps cap, and enforce a 1080p30-equivalent
-        // pixel-rate ceiling for the hardware encoder.
-        let sdr_fps = selection.fps.max(1);
+        // ARDA FPS policy V2:
+        // - SDR/HU advertised FPS is always the source upper bound.
+        // - --video-fps is the user/profile cap supplied by autostart.
+        // - Auto is represented by cap=60, so it follows SDR up to the
+        //   current AAP engine maximum without an extra Pi 4 pixel budget.
+        // - Optimal/manual board policy is resolved before launch.
+        let sdr_fps = selection.fps.max(1).min(60);
         let configured_fps_cap = self.config.fps.max(1).min(60);
-        let stream_pixels =
-            (selection.width.max(1) as i64) * (selection.height.max(1) as i64);
-        let h264_pixel_budget = 1920_i64 * 1080_i64 * 30_i64;
-        let hardware_fps_cap = (h264_pixel_budget / stream_pixels).clamp(1, 60) as i32;
-        self.config.fps = sdr_fps
-            .min(configured_fps_cap)
-            .min(hardware_fps_cap);
+        self.config.fps = sdr_fps.min(configured_fps_cap);
 
         let fps_policy = format!(
-            "VIDEO_FPS_POLICY sdr_fps={} configured_cap={} hardware_cap={} effective_fps={} stream={}x{} pixel_budget=1920x1080x30",
+            "VIDEO_FPS_POLICY_V2 sdr_fps={} configured_cap={} effective_fps={} stream={}x{}",
             selection.fps,
             configured_fps_cap,
-            hardware_fps_cap,
             self.config.fps,
             selection.width,
             selection.height

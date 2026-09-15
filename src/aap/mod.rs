@@ -7039,7 +7039,13 @@ impl VideoLiveSender {
     fn spawn_screenrecord_capture_child(&self, stdout: Stdio, seconds: &str) -> io::Result<Child> {
         let size = format!("{}x{}", self.config.width, self.config.height);
         let bit_rate = self.config.bit_rate.to_string();
+        let fps = self.config.fps.max(1).min(60).to_string();
         let codec_name = preferred_codec_name();
+
+        println!(
+            "ARDA_SCREENRECORD_DYNAMIC_FPS_V1 fps={} size={} bit_rate={} codec={}",
+            fps, size, bit_rate, codec_name
+        );
         let stderr = OpenOptions::new()
             .create(true)
             .write(true)
@@ -7058,6 +7064,8 @@ impl VideoLiveSender {
             .arg(&size)
             .arg("--bit-rate")
             .arg(&bit_rate)
+            .arg("--frame-rate")
+            .arg(&fps)
             .arg("--time-limit")
             .arg(seconds)
             .arg("--codec-name")

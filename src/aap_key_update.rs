@@ -15,8 +15,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_CONTROL_URL: &str = "https://aap.opencharge.top/control.php";
-pub const DEFAULT_STATE_DIR: &str = "/data/local/tmp/arda-aap-key-update";
-pub const DEFAULT_CERT_DIR: &str = "/data/local/tmp/arda-certs";
+pub const DEFAULT_STATE_DIR: &str = "/data/local/arda/aap-key-update";
+pub const DEFAULT_CERT_DIR: &str = "/data/local/arda/aap-certs";
 const ANDROID_CA_DIR: &str = "/system/etc/security/cacerts";
 const ACTIVE_LINK_NAME: &str = "active";
 const MAX_CERT_BYTES: usize = 512 * 1024;

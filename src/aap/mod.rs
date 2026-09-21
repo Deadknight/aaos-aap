@@ -1361,7 +1361,7 @@ impl Default for TlsHandshakeProbeConfig {
             response_major: 1,
             response_minor: 7,
             response_status: 0,
-            keys_path: PathBuf::from("/data/local/tmp/arda-certs"),
+            keys_path: PathBuf::from("/data/local/arda/aap-certs"),
             video_file_path: None,
             video_frame_limit: 30,
             video_native: false,

@@ -603,6 +603,17 @@ fn serve_bridge<S: Read + Write>(
                     write_error(stream, frame.request_id, "hello_required")?;
                     continue;
                 }
+                let rn4_socks_port = match parse_rn4_socks_port(&frame.payload) {
+                    Ok(port) => port,
+                    Err(err) => {
+                        write_error(
+                            stream,
+                            frame.request_id,
+                            &format!("invalid_rn4_socks_metadata:{err}"),
+                        )?;
+                        continue;
+                    }
+                };
                 match parse_proxy_ready(&frame.payload) {
                     Ok((endpoint, test_url)) => {
                         println!(
@@ -636,40 +647,47 @@ fn serve_bridge<S: Read + Write>(
                                         continue;
                                     }
                                 };
-                                crate::net_proxy(vec![
-                                    "--host".to_string(),
-                                    endpoint.phone_ip.to_string(),
-                                    "--port".to_string(),
-                                    endpoint.port.to_string(),
-                                ])?;
-                                let expected_proxy =
-                                    format!("{}:{}", endpoint.phone_ip, endpoint.port);
-                                let applied_proxy = read_android_proxy();
-                                if applied_proxy != expected_proxy {
+                                if let Some(socks_port) = rn4_socks_port {
+                                    // ARDA_RN4_SUPPRESS_LEGACY_GLOBAL_PROXY_V1
+                                    // :5285 remains an egress probe only.
+                                    // RN4 app traffic belongs to VpnService/HEV -> SOCKS5 :5286.
                                     clear_android_proxy();
-                                    let error = format!(
-                                        "Android global proxy verification failed: expected {expected_proxy}, got {applied_proxy}"
-                                    );
-                                    let response = format!(
-                                        "{{\"status\":\"error\",\"error\":\"{}\",\"global_proxy_applied\":false}}",
-                                        json_escape(&error)
-                                    );
-                                    write_frame(
-                                        stream,
-                                        OP_PROXY_RESULT,
-                                        frame.request_id,
-                                        response.as_bytes(),
-                                    )?;
-                                    eprintln!("ARDA_RN3B_REVERSE_PROXY_GATE=FAIL error={error}");
-                                } else {
+                                    let android_proxy = read_android_proxy();
+                                    let proxy_cleared = android_proxy.is_empty()
+                                        || android_proxy == "null"
+                                        || android_proxy == ":0";
+
+                                    if !proxy_cleared {
+                                        let error = format!(
+                                            "RN4 failed to clear legacy Android global proxy: {android_proxy}"
+                                        );
+                                        let response = format!(
+                                            "{{\"status\":\"error\",\"error\":\"{}\",\"global_proxy_applied\":false}}",
+                                            json_escape(&error)
+                                        );
+                                        write_frame(
+                                            stream,
+                                            OP_PROXY_RESULT,
+                                            frame.request_id,
+                                            response.as_bytes(),
+                                        )?;
+                                        eprintln!(
+                                            "ARDA_RN4_GLOBAL_PROXY_SUPPRESSED=FAIL error={error}"
+                                        );
+                                        continue;
+                                    }
+
                                     proxy_endpoint = Some(endpoint.clone());
                                     if let Some(updater) = key_updater {
                                         updater.proxy_ready(endpoint.phone_ip, endpoint.port);
                                     }
+
                                     let response = format!(
-                                        "{{\"status\":\"ready\",\"proxy\":\"{}:{}\",\"test_url\":\"{}\",\"test_status\":\"{}\",\"connect_test_status\":\"{}\",\"global_proxy_applied\":true}}",
+                                        "{{\"status\":\"ready\",\"mode\":\"rn4_socks_tun\",\"proxy\":\"{}:{}\",\"socks\":\"{}:{}\",\"test_url\":\"{}\",\"test_status\":\"{}\",\"connect_test_status\":\"{}\",\"global_proxy_applied\":false}}",
                                         endpoint.phone_ip,
                                         endpoint.port,
+                                        endpoint.phone_ip,
+                                        socks_port,
                                         json_escape(&test_url),
                                         json_escape(&status_line),
                                         json_escape(&connect_status)
@@ -680,7 +698,64 @@ fn serve_bridge<S: Read + Write>(
                                         frame.request_id,
                                         response.as_bytes(),
                                     )?;
-                                    println!("ARDA_RN3B_REVERSE_PROXY_GATE=PASS");
+                                    println!(
+                                        "ARDA_RN4_GLOBAL_PROXY_SUPPRESSED=PASS socks={}:{} http_probe={}:{}",
+                                        endpoint.phone_ip,
+                                        socks_port,
+                                        endpoint.phone_ip,
+                                        endpoint.port
+                                    );
+                                    println!("ARDA_RN4_REVERSE_PROXY_GATE=PASS");
+                                } else {
+                                    // Legacy RN3B payload: preserve old global HTTP proxy behavior.
+                                    crate::net_proxy(vec![
+                                        "--host".to_string(),
+                                        endpoint.phone_ip.to_string(),
+                                        "--port".to_string(),
+                                        endpoint.port.to_string(),
+                                    ])?;
+                                    let expected_proxy =
+                                        format!("{}:{}", endpoint.phone_ip, endpoint.port);
+                                    let applied_proxy = read_android_proxy();
+                                    if applied_proxy != expected_proxy {
+                                        clear_android_proxy();
+                                        let error = format!(
+                                            "Android global proxy verification failed: expected {expected_proxy}, got {applied_proxy}"
+                                        );
+                                        let response = format!(
+                                            "{{\"status\":\"error\",\"error\":\"{}\",\"global_proxy_applied\":false}}",
+                                            json_escape(&error)
+                                        );
+                                        write_frame(
+                                            stream,
+                                            OP_PROXY_RESULT,
+                                            frame.request_id,
+                                            response.as_bytes(),
+                                        )?;
+                                        eprintln!(
+                                            "ARDA_RN3B_REVERSE_PROXY_GATE=FAIL error={error}"
+                                        );
+                                    } else {
+                                        proxy_endpoint = Some(endpoint.clone());
+                                        if let Some(updater) = key_updater {
+                                            updater.proxy_ready(endpoint.phone_ip, endpoint.port);
+                                        }
+                                        let response = format!(
+                                            "{{\"status\":\"ready\",\"proxy\":\"{}:{}\",\"test_url\":\"{}\",\"test_status\":\"{}\",\"connect_test_status\":\"{}\",\"global_proxy_applied\":true}}",
+                                            endpoint.phone_ip,
+                                            endpoint.port,
+                                            json_escape(&test_url),
+                                            json_escape(&status_line),
+                                            json_escape(&connect_status)
+                                        );
+                                        write_frame(
+                                            stream,
+                                            OP_PROXY_RESULT,
+                                            frame.request_id,
+                                            response.as_bytes(),
+                                        )?;
+                                        println!("ARDA_RN3B_REVERSE_PROXY_GATE=PASS");
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -794,6 +869,29 @@ fn validate_bssid(value: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn parse_rn4_socks_port(
+    payload: &[u8],
+) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    let object = parse_json_object(std::str::from_utf8(payload)?)?;
+    let socks_type = optional_json_string(&object, "socks_type")?;
+    let socks_port_value = optional_json_number(&object, "socks_port")?;
+
+    match (socks_type.as_deref(), socks_port_value) {
+        (Some("socks5"), Some(value)) => {
+            let port = u16::try_from(value).map_err(|_| "socks_port must fit u16")?;
+            if port == 0 {
+                return Err("socks_port must be non-zero".into());
+            }
+            Ok(Some(port))
+        }
+        (None, None) => Ok(None),
+        (Some(kind), _) if kind != "socks5" => {
+            Err(format!("unsupported socks_type '{kind}'").into())
+        }
+        _ => Err("socks_type=socks5 and socks_port must be provided together".into()),
+    }
 }
 
 fn parse_proxy_ready(
@@ -1266,6 +1364,24 @@ mod tests {
         .unwrap();
         assert_eq!(endpoint.port, 5285);
         assert_eq!(url, "http://example.com/");
+        assert_eq!(
+            parse_rn4_socks_port(
+                br#"{"phone_ip":"192.168.43.2","proxy_port":5285,"test_url":"http://example.com/"}"#,
+            )
+            .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn parses_rn4_socks_metadata() {
+        assert_eq!(
+            parse_rn4_socks_port(
+                br#"{"phone_ip":"192.168.43.2","proxy_port":5285,"proxy_type":"http_connect","socks_port":5286,"socks_type":"socks5","socks_udp":"udp","test_url":"http://example.com/"}"#,
+            )
+            .unwrap(),
+            Some(5286),
+        );
     }
 
     #[test]

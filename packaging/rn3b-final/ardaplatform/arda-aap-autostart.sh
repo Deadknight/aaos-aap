@@ -8,6 +8,11 @@ VIDEO_OVERRIDE_CONFIG="/data/user_de/0/$PLATFORM_PACKAGE/files/arda-aap-video.to
 DEFAULT_VIDEO_POLICY="balanced"
 DEFAULT_VIDEO_HW_PROFILE="auto"
 DEFAULT_VIDEO_FPS_MODE="auto"
+
+# ARDA_AAP_C2_ENCODER_TUNING_V1
+DEFAULT_VIDEO_GPU_I420=0
+DEFAULT_VIDEO_IVE_SPEED="fastest"
+DEFAULT_VIDEO_BITRATE_BPS=0
 PI4_OPTIMAL_FPS_CAP=30
 PI5_OPTIMAL_FPS_CAP=60
 PI4_DEFAULT_VIDEO_CODEC="c2.v4l2.avc.encoder"
@@ -140,6 +145,103 @@ video_fps_mode="$(
 )"
 [ "$video_fps_mode" = "null" ] && video_fps_mode=""
 video_fps_mode="$(normalize_fps_mode "$video_fps_mode")"
+
+# ARDA_AAP_C2_ENCODER_TUNING_V1
+normalize_gpu_i420() {
+    case "${1:-}" in
+        1|true|on|yes)
+            echo 1
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+normalize_ive_speed() {
+    case "${1:-}" in
+        slowest|normal|fast|high_speed|fastest)
+            echo "$1"
+            ;;
+        1)
+            echo slowest
+            ;;
+        2)
+            echo normal
+            ;;
+        3)
+            echo fast
+            ;;
+        4)
+            echo high_speed
+            ;;
+        5)
+            echo fastest
+            ;;
+        *)
+            echo "$DEFAULT_VIDEO_IVE_SPEED"
+            ;;
+    esac
+}
+
+normalize_bitrate_bps() {
+    value="${1:-0}"
+    case "$value" in
+        ''|*[!0-9]*)
+            echo 0
+            return
+            ;;
+    esac
+
+    if [ "$value" -eq 0 ]; then
+        echo 0
+    elif [ "$value" -ge 4096 ] && [ "$value" -le 12000000 ]; then
+        echo "$value"
+    else
+        echo 0
+    fi
+}
+
+video_gpu_i420="$(
+    /system/bin/settings get global arda_video_gpu_i420 2>/dev/null || echo null
+)"
+[ "$video_gpu_i420" = "null" ] && video_gpu_i420=""
+video_gpu_i420="$(normalize_gpu_i420 "$video_gpu_i420")"
+
+video_ive_speed="$(
+    /system/bin/settings get global arda_video_ive_speed 2>/dev/null || echo null
+)"
+[ "$video_ive_speed" = "null" ] && video_ive_speed=""
+video_ive_speed="$(normalize_ive_speed "$video_ive_speed")"
+
+video_bitrate_bps="$(
+    /system/bin/settings get global arda_video_bitrate_bps 2>/dev/null || echo null
+)"
+[ "$video_bitrate_bps" = "null" ] && video_bitrate_bps=""
+video_bitrate_bps="$(normalize_bitrate_bps "$video_bitrate_bps")"
+
+# ARDA_AAP_C2_ENCODER_TUNING_V2
+# The UI stores tuning values unconditionally. Runtime application is based
+# only on the resolved profile, so both explicit Pi5 and Auto on a Pi5 board
+# use the same path. Pi4/HDMI and every non-Pi5 resolved profile force exact
+# production defaults.
+if [ "$resolved_hw_profile" = "pi5_hwc_vds" ]; then
+    c2_gpu_i420="$video_gpu_i420"
+    c2_ive_speed="$video_ive_speed"
+    c2_bitrate_bps="$video_bitrate_bps"
+    c2_tuning_reason="RESOLVED_PI5_HWC_VDS"
+else
+    c2_gpu_i420="$DEFAULT_VIDEO_GPU_I420"
+    c2_ive_speed="$DEFAULT_VIDEO_IVE_SPEED"
+    c2_bitrate_bps="$DEFAULT_VIDEO_BITRATE_BPS"
+    c2_tuning_reason="PRODUCTION_DEFAULT_NON_PI5_RESOLVED_PROFILE"
+fi
+
+setprop debug.arda.c2.gpu_i420 "$c2_gpu_i420"
+setprop debug.arda.c2.ive_speed "$c2_ive_speed"
+setprop debug.arda.c2.bitrate "$c2_bitrate_bps"
+
+log_marker "ARDA_C2_ENCODER_TUNING requested_profile=$requested_hw_profile resolved_profile=$resolved_hw_profile gpu_i420=$c2_gpu_i420 ive_speed=$c2_ive_speed bitrate_bps=$c2_bitrate_bps reason=$c2_tuning_reason"
 
 case "$video_fps_mode" in
     auto)

@@ -307,16 +307,16 @@ Commands:
   aap-ssl-frame-probe [--addr 0.0.0.0:5277] [--dump PATH] [--response 1.7] [--max-frames 8]
       Accepts one AAP TCP client, replies to VERSION_REQUEST, then reads MESSAGE_ENCAPSULATED_SSL frames and prints TLS record hints.
 
-  aap-tls-handshake-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 64]
+  aap-tls-handshake-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/arda/aap-certs] [--response 1.7] [--max-frames 64]
       Runs phone-like AAP VERSION_RESPONSE, then TLS server handshake over MESSAGE_ENCAPSULATED_SSL using md_cert/md_key. Peer cert is accepted.
 
-  aap-tls-plain-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 128]
+  aap-tls-plain-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/arda/aap-certs] [--response 1.7] [--max-frames 128]
       Runs VERSION + TLS, then keeps reading encrypted post-TLS AA frames and logs decrypted plaintext messages.
 
-  aap-service-discovery-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256]
+  aap-service-discovery-probe [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/arda/aap-certs] [--response 1.7] [--max-frames 256]
       Runs VERSION + TLS, waits for AUTH_COMPLETE, sends encrypted protobuf ServiceDiscoveryRequest, and replies to PING_REQUEST.
 
-  aap-session-probe [--config PATH] [--transport tcp|usb-accessory] [--usb-path /dev/usb_accessory] [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/tmp/arda-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
+  aap-session-probe [--config PATH] [--transport tcp|usb-accessory] [--usb-path /dev/usb_accessory] [--addr 0.0.0.0:5277] [--dump PATH] [--keys /data/local/arda/aap-certs] [--response 1.7] [--max-frames 256] [--video-file PATH] [--video-frames 30]
       Full AAP session probe. TCP remains available for debugging; usb-accessory is the HU-side AAOS gadget stream at /dev/usb_accessory.
 
   native-capture-repeat-test [--runs 3] [--run-ms 1500] [--pause-ms 500] [--size 1280x720] [--bit-rate 6000000] [--fps 30]
@@ -3428,7 +3428,7 @@ fn parse_aap_tls_handshake_probe_args(argv: Vec<String>) -> Result<AapTlsHandsha
     let mut response_major = 1u16;
     let mut response_minor = 7u16;
     let mut response_status = 0u16;
-    let mut keys = PathBuf::from("/data/local/tmp/arda-certs");
+    let mut keys = PathBuf::from("/data/local/arda/aap-certs");
     let mut video_file: Option<PathBuf> = None;
     let mut video_frame_limit = 30usize;
     let mut video_native = false;
